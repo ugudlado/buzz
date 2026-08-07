@@ -33,9 +33,8 @@ import {
 import { canReviewProjectPullRequest } from "@/features/projects/pullRequestReviews";
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
 import { useIdentityQuery } from "@/shared/api/hooks";
-import type { ChannelMember } from "@/shared/api/types";
 import { cn } from "@/shared/lib/cn";
-import { normalizePubkey, truncatePubkey } from "@/shared/lib/pubkey";
+import { normalizePubkey } from "@/shared/lib/pubkey";
 import {
   ProjectFeedRow,
   ProjectFeedRowCluster,
@@ -45,124 +44,23 @@ import { CopyCommitHashButton } from "./ProjectCommitCopyButton";
 import type { OpenMergeRecoveryTerminal } from "./MergePullRequestButton";
 import { OverviewRailSection } from "./ProjectOverviewPanel";
 import {
+  AuthorIdentity,
+  CommitHashChip,
+  labelForPubkey,
+  pluralize,
+  profileForPubkey,
+  pullRequestMembers,
+  pullRequestStatusBadgeClassName,
+  pullRequestStatusClassName,
+} from "./pullRequestPresentation";
+import { PullRequestsFilterBar } from "./PullRequestsFilterBar";
+import {
   ProfileAuthorName,
   ProfileIdentityButton,
 } from "./ProjectProfileIdentity";
 import { ProjectRichContent } from "./ProjectRichContent";
 import { PullRequestReviewersRow } from "./PullRequestReviewersRow";
 import { PullRequestReviewCard } from "./PullRequestReviewCard";
-
-function profileForPubkey(pubkey: string, profiles?: UserProfileLookup) {
-  return profiles?.[normalizePubkey(pubkey)] ?? null;
-}
-
-function labelForPubkey(pubkey: string, profiles?: UserProfileLookup) {
-  const profile = profileForPubkey(pubkey, profiles);
-  return (
-    profile?.displayName?.trim() ||
-    profile?.nip05Handle?.trim() ||
-    truncatePubkey(pubkey)
-  );
-}
-
-function pluralize(count: number, singular: string, plural = `${singular}s`) {
-  return `${count} ${count === 1 ? singular : plural}`;
-}
-
-function pullRequestStatusClassName(status: ProjectPullRequest["status"]) {
-  if (status === "Closed") return "text-destructive";
-  if (status === "Draft") return "text-muted-foreground";
-  if (status === "Merged") return "text-purple-400";
-  return "text-green-500";
-}
-
-function pullRequestStatusBadgeClassName(status: ProjectPullRequest["status"]) {
-  if (status === "Closed") return "bg-destructive";
-  if (status === "Draft") return "bg-muted-foreground/80";
-  if (status === "Merged") return "bg-purple-600";
-  return "bg-green-600";
-}
-
-function pullRequestMembers(
-  project: Project,
-  pullRequest: ProjectPullRequest,
-  profiles?: UserProfileLookup,
-): ChannelMember[] {
-  return [
-    ...new Set([
-      project.owner,
-      pullRequest.author,
-      ...project.contributors,
-      ...pullRequest.recipients,
-    ]),
-  ].map((pubkey) => {
-    const profile = profileForPubkey(pubkey, profiles);
-    return {
-      pubkey,
-      role: "member" as const,
-      isAgent: profile?.isAgent === true,
-      joinedAt: new Date(0).toISOString(),
-      displayName:
-        profile?.displayName?.trim() || profile?.nip05Handle?.trim() || null,
-    };
-  });
-}
-
-function AuthorIdentity({
-  avatarSize = "md",
-  profiles,
-  pubkey,
-  role,
-  showLabel = true,
-}: {
-  avatarSize?: "xs" | "sm" | "md";
-  profiles?: UserProfileLookup;
-  pubkey: string;
-  role?: React.ReactNode;
-  showLabel?: boolean;
-}) {
-  const profile = profileForPubkey(pubkey, profiles);
-  return (
-    <ProfileIdentityButton
-      align="center"
-      avatarSize={avatarSize}
-      avatarUrl={profile?.avatarUrl ?? null}
-      isAgent={profile?.isAgent === true}
-      label={labelForPubkey(pubkey, profiles)}
-      pubkey={pubkey}
-      role={role}
-      showLabel={showLabel}
-    />
-  );
-}
-
-/** Commit hash chip that jumps to the commit detail when a handler is given. */
-function CommitHashChip({
-  hash,
-  onOpenCommit,
-}: {
-  hash: string;
-  onOpenCommit?: (commitHash: string) => void;
-}) {
-  const short = hash.slice(0, 7);
-  if (!onOpenCommit) {
-    return (
-      <code className="shrink-0 rounded-md bg-background/55 px-2 py-1 text-xs text-muted-foreground">
-        {short}
-      </code>
-    );
-  }
-  return (
-    <button
-      aria-label={`View commit ${short}`}
-      className="shrink-0 rounded-md bg-background/55 px-2 py-1 font-mono text-xs text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground hover:underline focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
-      onClick={() => onOpenCommit(hash)}
-      type="button"
-    >
-      {short}
-    </button>
-  );
-}
 
 function PullRequestCommitRow({
   author,
@@ -906,6 +804,65 @@ export function PullRequestsPanel({
   const selectedPullRequest =
     pullRequests.find((item) => item.id === selectedPullRequestId) ?? null;
 
+  const [statusFilter, setStatusFilter] = React.useState<
+    ProjectPullRequest["status"][]
+  >([]);
+  const [labelFilter, setLabelFilter] = React.useState<string[]>([]);
+  const [authorFilter, setAuthorFilter] = React.useState<string[]>([]);
+
+  const labelOptions = React.useMemo(() => {
+    const distinct = new Set<string>();
+    for (const pullRequest of pullRequests) {
+      for (const label of pullRequest.labels) distinct.add(label);
+    }
+    return [...distinct]
+      .sort((a, b) => a.localeCompare(b))
+      .map((label) => ({ label, value: label }));
+  }, [pullRequests]);
+
+  const authorOptions = React.useMemo(() => {
+    const distinct = new Set<string>();
+    for (const pullRequest of pullRequests) {
+      distinct.add(normalizePubkey(pullRequest.author));
+    }
+    return [...distinct]
+      .map((pubkey) => ({
+        label: labelForPubkey(pubkey, profiles),
+        value: pubkey,
+      }))
+      .sort((a, b) => a.label.localeCompare(b.label));
+  }, [profiles, pullRequests]);
+
+  const filteredPullRequests = React.useMemo(() => {
+    return pullRequests.filter((pullRequest) => {
+      if (
+        statusFilter.length > 0 &&
+        !statusFilter.includes(pullRequest.status)
+      ) {
+        return false;
+      }
+      if (
+        labelFilter.length > 0 &&
+        !pullRequest.labels.some((label) => labelFilter.includes(label))
+      ) {
+        return false;
+      }
+      if (
+        authorFilter.length > 0 &&
+        !authorFilter.includes(normalizePubkey(pullRequest.author))
+      ) {
+        return false;
+      }
+      return true;
+    });
+  }, [authorFilter, labelFilter, pullRequests, statusFilter]);
+
+  const handleClearFilters = React.useCallback(() => {
+    setStatusFilter([]);
+    setLabelFilter([]);
+    setAuthorFilter([]);
+  }, []);
+
   React.useEffect(() => {
     if (
       selectedPullRequestId &&
@@ -948,15 +905,34 @@ export function PullRequestsPanel({
   }
 
   return (
-    <div className="divide-y divide-border/50">
-      {pullRequests.map((pullRequest) => (
-        <PullRequestRow
-          key={pullRequest.id}
-          onOpen={() => onSelectedPullRequestIdChange(pullRequest.id)}
-          profiles={profiles}
-          pullRequest={pullRequest}
-        />
-      ))}
+    <div>
+      <PullRequestsFilterBar
+        authorOptions={authorOptions}
+        authors={authorFilter}
+        labelOptions={labelOptions}
+        labels={labelFilter}
+        onAuthorsChange={setAuthorFilter}
+        onClear={handleClearFilters}
+        onLabelsChange={setLabelFilter}
+        onStatusesChange={setStatusFilter}
+        statuses={statusFilter}
+      />
+      {filteredPullRequests.length === 0 ? (
+        <p className="p-4 text-sm text-muted-foreground">
+          No pull requests match these filters.
+        </p>
+      ) : (
+        <div className="divide-y divide-border/50">
+          {filteredPullRequests.map((pullRequest) => (
+            <PullRequestRow
+              key={pullRequest.id}
+              onOpen={() => onSelectedPullRequestIdChange(pullRequest.id)}
+              profiles={profiles}
+              pullRequest={pullRequest}
+            />
+          ))}
+        </div>
+      )}
     </div>
   );
 }

@@ -17,6 +17,7 @@ import { relativeTime } from "@/features/projects/lib/projectsViewHelpers";
 import type { ChannelMember } from "@/shared/api/types";
 import { cn } from "@/shared/lib/cn";
 import { normalizePubkey } from "@/shared/lib/pubkey";
+import { ClearFiltersChip, FilterChip } from "@/shared/ui/filter-chip-bar";
 import {
   ProjectFeedRow,
   ProjectFeedRowCluster,
@@ -27,6 +28,15 @@ import { ProjectOriginReference } from "./ProjectOriginReference";
 import { OverviewRailSection } from "./ProjectOverviewPanel";
 import { ProfileIdentityButton } from "./ProjectProfileIdentity";
 import { ProjectRichContent } from "./ProjectRichContent";
+
+const PROJECT_ISSUE_STATUSES: ProjectIssue["status"][] = [
+  "Triage",
+  "Backlog",
+  "In Progress",
+  "In Review",
+  "Done",
+  "Closed",
+];
 
 export function issueStatusClassName(status: ProjectIssue["status"]) {
   if (status === "Done") return "text-purple-400";
@@ -322,6 +332,74 @@ function IssueMetaRail({
   );
 }
 
+/** Filter bar shown above the flat issue list: status, label, and author
+ * chips, plus a "Clear filters" affordance when any filter is active. This
+ * is intentionally basic client-side filtering — no URL persistence or
+ * grouping. */
+function IssuesFilterBar({
+  authorOptions,
+  authors,
+  labelOptions,
+  labels,
+  onAuthorsChange,
+  onClear,
+  onLabelsChange,
+  onStatusesChange,
+  statuses,
+}: {
+  authorOptions: Array<{ label: string; value: string }>;
+  authors: string[];
+  labelOptions: Array<{ label: string; value: string }>;
+  labels: string[];
+  onAuthorsChange: (value: string[]) => void;
+  onClear: () => void;
+  onLabelsChange: (value: string[]) => void;
+  onStatusesChange: (value: ProjectIssue["status"][]) => void;
+  statuses: ProjectIssue["status"][];
+}) {
+  const hasActiveFilters =
+    statuses.length > 0 || labels.length > 0 || authors.length > 0;
+
+  return (
+    <div className="flex flex-wrap items-center gap-1.5 border-b border-border/50 px-4 py-2.5">
+      <FilterChip
+        label="Status"
+        onChange={onStatusesChange}
+        options={PROJECT_ISSUE_STATUSES.map((status) => ({
+          label: status,
+          value: status,
+        }))}
+        testId="project-issues-filter-status"
+        value={statuses}
+      />
+      {labelOptions.length > 0 ? (
+        <FilterChip
+          label="Label"
+          onChange={onLabelsChange}
+          options={labelOptions}
+          testId="project-issues-filter-label"
+          value={labels}
+        />
+      ) : null}
+      {authorOptions.length > 0 ? (
+        <FilterChip
+          label="Author"
+          onChange={onAuthorsChange}
+          options={authorOptions}
+          testId="project-issues-filter-author"
+          value={authors}
+        />
+      ) : null}
+      {hasActiveFilters ? (
+        <ClearFiltersChip
+          onClear={onClear}
+          testId="project-issues-filter-clear"
+        />
+      ) : null}
+    </div>
+  );
+}
+
 export function ProjectIssuesPanel({
   onSelectedIssueIdChange,
   profiles,
@@ -337,6 +415,60 @@ export function ProjectIssuesPanel({
   const issues = issuesQuery.data ?? [];
   const selectedIssue =
     issues.find((issue) => issue.id === selectedIssueId) ?? null;
+
+  const [statusFilter, setStatusFilter] = React.useState<
+    ProjectIssue["status"][]
+  >([]);
+  const [labelFilter, setLabelFilter] = React.useState<string[]>([]);
+  const [authorFilter, setAuthorFilter] = React.useState<string[]>([]);
+
+  const labelOptions = React.useMemo(() => {
+    const distinct = new Set<string>();
+    for (const issue of issues) {
+      for (const label of issue.labels) distinct.add(label);
+    }
+    return [...distinct]
+      .sort((a, b) => a.localeCompare(b))
+      .map((label) => ({ label, value: label }));
+  }, [issues]);
+
+  const authorOptions = React.useMemo(() => {
+    const distinct = new Set<string>();
+    for (const issue of issues) distinct.add(normalizePubkey(issue.author));
+    return [...distinct]
+      .map((pubkey) => ({
+        label: resolveUserLabel({ profiles, pubkey }),
+        value: pubkey,
+      }))
+      .sort((a, b) => a.label.localeCompare(b.label));
+  }, [issues, profiles]);
+
+  const filteredIssues = React.useMemo(() => {
+    return issues.filter((issue) => {
+      if (statusFilter.length > 0 && !statusFilter.includes(issue.status)) {
+        return false;
+      }
+      if (
+        labelFilter.length > 0 &&
+        !issue.labels.some((label) => labelFilter.includes(label))
+      ) {
+        return false;
+      }
+      if (
+        authorFilter.length > 0 &&
+        !authorFilter.includes(normalizePubkey(issue.author))
+      ) {
+        return false;
+      }
+      return true;
+    });
+  }, [authorFilter, issues, labelFilter, statusFilter]);
+
+  const handleClearFilters = React.useCallback(() => {
+    setStatusFilter([]);
+    setLabelFilter([]);
+    setAuthorFilter([]);
+  }, []);
 
   if (issuesQuery.isLoading) {
     return <p className="p-4 text-sm text-muted-foreground">Loading issues…</p>;
@@ -363,15 +495,34 @@ export function ProjectIssuesPanel({
   }
 
   return (
-    <div className="divide-y divide-border/50">
-      {issues.map((issue) => (
-        <IssueRow
-          issue={issue}
-          key={issue.id}
-          onOpen={() => onSelectedIssueIdChange(issue.id)}
-          profiles={profiles}
-        />
-      ))}
+    <div>
+      <IssuesFilterBar
+        authorOptions={authorOptions}
+        authors={authorFilter}
+        labelOptions={labelOptions}
+        labels={labelFilter}
+        onAuthorsChange={setAuthorFilter}
+        onClear={handleClearFilters}
+        onLabelsChange={setLabelFilter}
+        onStatusesChange={setStatusFilter}
+        statuses={statusFilter}
+      />
+      {filteredIssues.length === 0 ? (
+        <p className="p-4 text-sm text-muted-foreground">
+          No issues match these filters.
+        </p>
+      ) : (
+        <div className="divide-y divide-border/50">
+          {filteredIssues.map((issue) => (
+            <IssueRow
+              issue={issue}
+              key={issue.id}
+              onOpen={() => onSelectedIssueIdChange(issue.id)}
+              profiles={profiles}
+            />
+          ))}
+        </div>
+      )}
     </div>
   );
 }
