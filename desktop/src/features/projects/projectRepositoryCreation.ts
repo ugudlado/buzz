@@ -3,6 +3,7 @@ import type { Repository } from "@/features/projects/hooks";
 import {
   isValidProjectChannelId,
   MAX_PROJECT_MEMBERS,
+  type RepositoryIssueTracker,
   validateProjectEventEnvelope,
 } from "@/features/projects/projectModels";
 import {
@@ -124,6 +125,44 @@ export function buildRepositoryChannelBindingTemplate({
         .map((tag) => [...tag]),
       ["buzz-channel", normalizedChannelId],
     ],
+  };
+}
+
+/**
+ * Rebuilds a repository announcement with its `buzz-issue-tracker` tag set (or
+ * removed for Buzz-native issues), preserving every other tag verbatim.
+ */
+export function buildRepositoryIssueTrackerTemplate({
+  issueTracker,
+  ownerPubkey,
+  repository,
+}: {
+  issueTracker: RepositoryIssueTracker;
+  ownerPubkey: string;
+  repository: Repository;
+}): ProjectEventTemplate {
+  if (ownerPubkey.trim().toLowerCase() !== repository.owner.toLowerCase()) {
+    throw new Error("Only the repository owner can change its issue tracker.");
+  }
+  if (!repository.eventTags) {
+    throw new Error(
+      "Repository metadata is unavailable. Refresh and try again.",
+    );
+  }
+  if (issueTracker.kind === "backlog" && !issueTracker.project.trim()) {
+    throw new Error("A Backlog project id is required.");
+  }
+
+  const tags = repository.eventTags
+    .filter((tag) => tag[0] !== "buzz-issue-tracker")
+    .map((tag) => [...tag]);
+  if (issueTracker.kind === "backlog") {
+    tags.push(["buzz-issue-tracker", "backlog", issueTracker.project.trim()]);
+  }
+  return {
+    kind: KIND_REPO_ANNOUNCEMENT,
+    content: repository.eventContent ?? repository.description,
+    tags,
   };
 }
 

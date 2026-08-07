@@ -1,5 +1,5 @@
 import * as React from "react";
-import { Check, ShieldCheck } from "lucide-react";
+import { Check, ListTodo, ShieldCheck } from "lucide-react";
 import { toast } from "sonner";
 
 import { useChannelsQuery } from "@/features/channels/hooks";
@@ -18,6 +18,7 @@ import {
 import { AddProjectRepositoryDialog } from "./AddProjectRepositoryDialog";
 import { AttachProjectRepositoryDialog } from "./AttachProjectRepositoryDialog";
 import { ProjectRepositoryPicker } from "./ProjectRepositoryPicker";
+import { RepositoryIssueTrackerDialog } from "./RepositoryIssueTrackerDialog";
 
 export function ProjectRepositoryManagement({
   identityPubkey,
@@ -34,6 +35,7 @@ export function ProjectRepositoryManagement({
 }) {
   const [createOpen, setCreateOpen] = React.useState(false);
   const [attachOpen, setAttachOpen] = React.useState(false);
+  const [issueTrackerOpen, setIssueTrackerOpen] = React.useState(false);
   const channelsQuery = useChannelsQuery();
   const createMutation = useAddProjectRepositoryMutation();
   const attachMutation = useAttachProjectRepositoryMutation();
@@ -114,6 +116,26 @@ export function ProjectRepositoryManagement({
         project={project}
         repository={repository}
       />
+      {identityPubkey?.toLowerCase() === repository.owner.toLowerCase() ? (
+        <>
+          <RepositoryIssueTrackerDialog
+            onOpenChange={setIssueTrackerOpen}
+            open={issueTrackerOpen}
+            repository={repository}
+          />
+          <Button
+            className="h-8 shrink-0 gap-1.5"
+            data-testid="repository-issue-tracker"
+            onClick={() => setIssueTrackerOpen(true)}
+            size="sm"
+            type="button"
+            variant="outline"
+          >
+            <ListTodo className="h-3.5 w-3.5" />
+            Issues
+          </Button>
+        </>
+      ) : null}
       {canManageAccess ? (
         <DropdownMenu>
           <DropdownMenuTrigger asChild>

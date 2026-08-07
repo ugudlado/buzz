@@ -3,6 +3,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { relayClient } from "@/shared/api/relayClient";
 import { signRelayEvent } from "@/shared/api/tauri";
 import { KIND_GIT_ISSUE } from "@/shared/constants/kinds";
+import { createBacklogIssue } from "./backlogIssues";
 import type { Repository as Project } from "./hooks";
 import { buildGitIssueTags } from "./projectIssues.mjs";
 
@@ -15,6 +16,9 @@ export async function publishProjectIssue(
   project: Project,
   input: CreateProjectIssueInput,
 ) {
+  if (project.issueTracker.kind === "backlog") {
+    return createBacklogIssue(project.issueTracker.project, input);
+  }
   const event = await signRelayEvent({
     kind: KIND_GIT_ISSUE,
     content: input.body.trim(),

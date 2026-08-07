@@ -20,8 +20,12 @@ import {
   projectPullRequestEventsToPullRequests,
 } from "./projectPullRequests.mjs";
 
+import { fetchBacklogIssuesForRepos } from "./backlogIssues";
+import type { RepositoryIssueTracker } from "./projectModels";
+
 type RepositoryReference = {
   repoAddress: string;
+  issueTracker?: RepositoryIssueTracker;
 };
 
 type ProjectReference = {
@@ -33,6 +37,7 @@ type ProjectRepository<TProject extends ProjectReference> =
 
 /** Optional event groups that can fail without discarding root work items. */
 export type ProjectWorkItemSection =
+  | "backlog-issues"
   | "comments"
   | "pull-request-updates"
   | "statuses";
@@ -77,6 +82,7 @@ export async function fetchProjectsWorkItems<TProject extends ProjectReference>(
   fetchEvents: (
     filter: FetchEventsInput,
   ) => Promise<RelayEvent[]> = relayClient.fetchEvents.bind(relayClient),
+  fetchBacklogIssues: typeof fetchBacklogIssuesForRepos = fetchBacklogIssuesForRepos,
 ): Promise<ProjectsWorkItemsResult<TProject>> {
   const repoAddresses = [
     ...new Set(
@@ -85,7 +91,29 @@ export async function fetchProjectsWorkItems<TProject extends ProjectReference>(
       ),
     ),
   ];
-  const [rootResult, updateResult, commentResult, statusResult] =
+  // Repos tracked in Backlog get issues from the Backlog provider instead of
+  // relay kind:1621 events; their pull requests stay relay-native.
+  const backlogRepos = new Map<string, string>();
+  for (const project of projects) {
+    for (const repository of project.repositories) {
+      if (repository.issueTracker?.kind === "backlog") {
+        backlogRepos.set(
+          repository.repoAddress,
+          repository.issueTracker.project,
+        );
+      }
+    }
+  }
+  const backlogIssuesPromise: Promise<Map<string, ProjectIssue[]>> =
+    backlogRepos.size
+      ? fetchBacklogIssues(
+          [...backlogRepos.entries()].map(([repoAddress, backlogProject]) => ({
+            repoAddress,
+            backlogProject,
+          })),
+        )
+      : Promise.resolve(new Map());
+  const [rootResult, updateResult, commentResult, statusResult, backlogResult] =
     await Promise.allSettled([
       fetchEvents({
         kinds: [KIND_GIT_ISSUE, KIND_GIT_PULL_REQUEST],
@@ -112,6 +140,7 @@ export async function fetchProjectsWorkItems<TProject extends ProjectReference>(
         "#a": repoAddresses,
         limit: 2_000,
       }),
+      backlogIssuesPromise,
     ]);
 
   if (rootResult.status === "rejected") {
@@ -165,15 +194,22 @@ export async function fetchProjectsWorkItems<TProject extends ProjectReference>(
     .sort(
       (left, right) => right.pullRequest.updatedAt - left.pullRequest.updatedAt,
     );
+  const backlogIssuesByRepo =
+    backlogResult.status === "fulfilled"
+      ? backlogResult.value
+      : new Map<string, ProjectIssue[]>();
   const issues = projects
     .flatMap((project) =>
       project.repositories.flatMap((repository) =>
-        projectIssueEventsToIssues(
-          (rootsByRepo.get(repository.repoAddress) ?? []).filter(
-            (event) => event.kind === KIND_GIT_ISSUE,
-          ),
-          statusesByRepo.get(repository.repoAddress) ?? [],
-          commentsByRepo.get(repository.repoAddress) ?? [],
+        (repository.issueTracker?.kind === "backlog"
+          ? (backlogIssuesByRepo.get(repository.repoAddress) ?? [])
+          : projectIssueEventsToIssues(
+              (rootsByRepo.get(repository.repoAddress) ?? []).filter(
+                (event) => event.kind === KIND_GIT_ISSUE,
+              ),
+              statusesByRepo.get(repository.repoAddress) ?? [],
+              commentsByRepo.get(repository.repoAddress) ?? [],
+            )
         ).map((issue) => ({ issue, project, repository })),
       ),
     )
@@ -204,11 +240,15 @@ export async function fetchProjectsWorkItems<TProject extends ProjectReference>(
   if (updateResult.status === "rejected") {
     pullRequestFailedSections.unshift("pull-request-updates");
   }
+  const issueFailedSections = [...sharedFailedSections];
+  if (backlogRepos.size > 0 && backlogResult.status === "rejected") {
+    issueFailedSections.unshift("backlog-issues");
+  }
 
   return {
     issues: {
       items: issues,
-      failedSections: sharedFailedSections,
+      failedSections: issueFailedSections,
     },
     pullRequests: {
       items: pullRequests,
