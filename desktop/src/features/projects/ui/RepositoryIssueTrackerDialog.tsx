@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import * as React from "react";
 import { toast } from "sonner";
 
+import { useAppNavigation } from "@/app/navigation/useAppNavigation";
 import { migrateLegacyBacklogConnection } from "@/features/projects/backlogIssues";
 import type { Repository } from "@/features/projects/hooks";
 import { PROJECT_FORM_FIELD_CLASS } from "@/features/projects/ui/projectPanelStyles";
@@ -45,6 +46,7 @@ export function RepositoryIssueTrackerDialog({
   repository: Repository;
 }) {
   const queryClient = useQueryClient();
+  const { goSettings } = useAppNavigation();
   const mutation = useSetRepositoryIssueTrackerMutation();
   const [kind, setKind] = React.useState<"buzz" | "backlog">("buzz");
   const [backlogProject, setBacklogProject] = React.useState("");
@@ -244,6 +246,17 @@ export function RepositoryIssueTrackerDialog({
                     Disconnect
                   </Button>
                 </div>
+                <button
+                  className="text-xs font-medium text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+                  data-testid="backlog-manage-in-settings"
+                  onClick={() => {
+                    onOpenChange(false);
+                    void goSettings("integrations");
+                  }}
+                  type="button"
+                >
+                  Manage connection in Settings →
+                </button>
                 <label className="block space-y-1.5 text-sm font-medium">
                   <span>Backlog project</span>
                   <select
@@ -339,6 +352,17 @@ export function RepositoryIssueTrackerDialog({
                 >
                   {connectMutation.isPending ? "Connecting…" : "Connect"}
                 </Button>
+                <button
+                  className="text-xs font-medium text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+                  data-testid="backlog-manage-in-settings"
+                  onClick={() => {
+                    onOpenChange(false);
+                    void goSettings("integrations");
+                  }}
+                  type="button"
+                >
+                  Manage connection in Settings →
+                </button>
               </div>
             )
           ) : null}
