@@ -6,7 +6,9 @@
 
 use crate::archive;
 use crate::builderlab::*;
+use crate::commands;
 use crate::commands::*;
+use crate::deep_link;
 use crate::huddle;
 use crate::huddle::audio_output::{
     get_audio_output_device, list_audio_output_devices, set_audio_output_device,
@@ -23,6 +25,7 @@ use crate::huddle::{
 use crate::initial_window::*;
 #[cfg(target_os = "macos")]
 use crate::macos_notifications;
+use crate::managed_agents;
 use crate::managed_agents::{
     backfill_persona_snapshots, list_managed_agent_runtimes, put_managed_agent_runtime_lifecycle,
     reconcile_managed_agent_runtimes, restart_managed_agent_runtime, start_managed_agent_runtime,
@@ -36,8 +39,12 @@ use crate::terminal_runtime;
 use crate::tray_menu;
 
 /// The generated invoke handler for every registered command.
-pub fn invoke_handler<R: tauri::Runtime>(
-) -> impl Fn(tauri::ipc::Invoke<R>) -> bool + Send + Sync + 'static {
+///
+/// Pinned to `tauri::Wry`, not generic: commands take concrete `AppHandle`/
+/// `Window` (i.e. `<Wry>`), which only implement `CommandArg<'_, Wry>` — a
+/// generic `R: tauri::Runtime` here breaks `CommandArg` resolution for every
+/// command taking either type.
+pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sync + 'static {
     tauri::generate_handler![
         terminal_runtime::terminal_attach,
         terminal_runtime::terminal_detach,
@@ -48,8 +55,8 @@ pub fn invoke_handler<R: tauri::Runtime>(
         terminal_runtime::terminal_ack,
         terminal_runtime::terminal_viewport_ready,
         terminal_runtime::terminal_focus,
-        take_pending_community_deep_link,
-        acknowledge_pending_community_deep_link,
+        deep_link::take_pending_community_deep_link,
+        deep_link::acknowledge_pending_community_deep_link,
         start_builderlab_login,
         cancel_builderlab_login,
         get_builderlab_auth,
@@ -205,12 +212,12 @@ pub fn invoke_handler<R: tauri::Runtime>(
         resolve_oa_owner,
         list_relay_agents,
         list_managed_agents,
-        list_managed_agent_runtimes,
-        start_managed_agent_runtime,
-        stop_managed_agent_runtime,
-        restart_managed_agent_runtime,
-        reconcile_managed_agent_runtimes,
-        put_managed_agent_runtime_lifecycle,
+        managed_agents::list_managed_agent_runtimes,
+        managed_agents::start_managed_agent_runtime,
+        managed_agents::stop_managed_agent_runtime,
+        managed_agents::restart_managed_agent_runtime,
+        managed_agents::reconcile_managed_agent_runtimes,
+        managed_agents::put_managed_agent_runtime_lifecycle,
         create_managed_agent,
         start_managed_agent,
         stop_managed_agent,
@@ -290,20 +297,20 @@ pub fn invoke_handler<R: tauri::Runtime>(
         get_note,
         get_note_reactions,
         get_liked_notes,
-        start_huddle,
-        join_huddle,
-        leave_huddle,
-        end_huddle,
-        get_huddle_state,
-        close_huddle_companion,
-        open_huddle_window,
-        push_audio_pcm,
-        reconnect_huddle_audio,
-        start_stt_pipeline,
-        set_huddle_transcription_enabled,
-        download_voice_models,
-        get_model_status,
-        set_tts_enabled,
+        huddle::start_huddle,
+        huddle::join_huddle,
+        huddle::leave_huddle,
+        huddle::end_huddle,
+        huddle::get_huddle_state,
+        huddle::window::close_huddle_companion,
+        huddle::window::open_huddle_window,
+        huddle::push_audio_pcm,
+        huddle::reconnect::reconnect_huddle_audio,
+        huddle::transcription::start_stt_pipeline,
+        huddle::transcription::set_huddle_transcription_enabled,
+        huddle::download_voice_models,
+        huddle::get_model_status,
+        huddle::tts_settings::set_tts_enabled,
         huddle::tts_settings::get_tts_settings,
         huddle::tts_settings::list_voice_registry,
         huddle::tts_settings::set_pocket_voice,
@@ -313,21 +320,21 @@ pub fn invoke_handler<R: tauri::Runtime>(
         huddle::agent_voice::ensure_huddle_agent_voice_settings,
         huddle::agent_voice::set_huddle_agent_tts_enabled,
         huddle::agent_voice::set_huddle_agent_voice,
-        speak_agent_message,
+        huddle::speak_agent_message,
         interrupt_huddle_speech,
-        add_agent_to_huddle,
+        huddle::add_agent_to_huddle,
         remove_agent_from_huddle,
         huddle::agents::sync_agents_to_active_huddle,
-        check_pipeline_hotstart,
-        confirm_huddle_active,
+        huddle::pipeline::check_pipeline_hotstart,
+        huddle::confirm_huddle_active,
         perform_sidebar_default_haptic,
-        get_huddle_agent_pubkeys,
-        set_voice_input_mode,
-        get_voice_input_mode,
+        huddle::get_huddle_agent_pubkeys,
+        huddle::set_voice_input_mode,
+        huddle::get_voice_input_mode,
         set_huddle_manual_mic_unmuted,
-        list_audio_output_devices,
-        set_audio_output_device,
-        get_audio_output_device,
+        huddle::audio_output::list_audio_output_devices,
+        huddle::audio_output::set_audio_output_device,
+        huddle::audio_output::get_audio_output_device,
         start_pairing,
         start_identity_recovery_pairing,
         confirm_pairing_sas,
