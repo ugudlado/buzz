@@ -1,6 +1,6 @@
 # Design: Backlog connect — automated token minting + project binding
 
-**Status:** Design only — implement next session
+**Status:** Shipped (slices 1-3; CLI parity deferred)
 **Date:** 2026-08-07
 **Builds on:** [projects-issue-tracker-providers.md](projects-issue-tracker-providers.md) (Slice 1 shipped: manual URL/token/guid in `RepositoryIssueTrackerDialog`)
 
@@ -79,6 +79,18 @@ right blast-radius: revoking one agent token doesn't kill the user session.
 3. Agent provisioning (`backlog_provision_agent_token` + persona env write).
 4. Optional: `buzz` CLI parity (`buzz backlog connect|provision`) for
    headless agent setup.
+
+## Implementation notes (as shipped)
+
+- Guid-only addressing everywhere (server's `resolveProjectRef` accepts guid
+  strings on grants/tokens); numeric project ids are never surfaced.
+- Provisioning rotates: `DELETE /api/agents/{id}/tokens` before minting —
+  the `buzz-orchestrator` agent is Buzz-managed, so all its tokens are ours.
+- The minted agent token passes through the webview into persona `env_vars`
+  (already-plaintext local config; the *user* token never crosses). A future
+  cut: a single Rust command that also writes the persona store directly.
+- Migration shim (`migrateLegacyBacklogConnection`) runs on provider fetch +
+  dialog open; delete it once Slice-1 installs age out.
 
 ## Open questions (decide at implementation)
 

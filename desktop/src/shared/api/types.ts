@@ -725,11 +725,10 @@ export type AgentPersona = {
   shared: boolean;
   /** Team ID if this persona was imported from a team directory. Team personas are non-editable. */
   sourceTeam?: string | null;
-  /**
-   * Set only on a local copy of another owner's shared catalog entry. A copy
-   * carries a fresh local `id`, so this coordinate is the only thing that can
-   * answer "is this catalog entry already added" without minting a duplicate.
-   */
+  /** Stable slug within the source team/pack (e.g. orchestrator step id). */
+  sourceTeamPersonaSlug?: string | null;
+  /** Set only on a local copy of another owner's shared catalog entry — the
+   * coordinate that answers "already added?" without minting a duplicate. */
   catalogSource?: CatalogSourceCoordinate | null;
   /** Agent environment variables, layered after desktop parent and persona values. */
   envVars: Record<string, string>;

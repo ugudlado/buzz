@@ -10416,6 +10416,11 @@ export function maybeInstallE2eTauriMocks() {
   let mockGithubConnection: { connected: boolean; login?: string } = {
     connected: false,
   };
+  let mockBacklogConnection: {
+    connected: boolean;
+    baseUrl?: string;
+    userName?: string;
+  } = { connected: false };
   let mockImportedVoices: Array<{
     key: string;
     displayName: string;
@@ -11874,6 +11879,47 @@ export function maybeInstallE2eTauriMocks() {
         return handleCreatePersona(
           payload as Parameters<typeof handleCreatePersona>[0],
         );
+      case "backlog_status":
+        return mockBacklogConnection;
+      case "backlog_connect":
+        mockBacklogConnection = {
+          connected: true,
+          baseUrl: (payload as { input: { baseUrl: string } }).input.baseUrl,
+          userName: "mock-backlog-user",
+        };
+        return mockBacklogConnection;
+      case "backlog_disconnect":
+        mockBacklogConnection = { connected: false };
+        return null;
+      case "backlog_list_projects":
+        return [
+          { guid: "mock-guid-1", path: "buzz" },
+          { guid: "mock-guid-2", path: "orchestrator" },
+        ];
+      case "backlog_list_tasks":
+        return [
+          {
+            id: "task-1",
+            displayId: "MOCK-1",
+            title: "Mock backlog task",
+            status: "In Progress",
+            assignee: { name: "mock-backlog-user" },
+            createdDate: "2026-08-01T00:00:00Z",
+            updatedDate: "2026-08-02T00:00:00Z",
+            labels: [],
+            description: "Mocked task",
+          },
+        ];
+      case "backlog_create_task":
+        return { id: "task-created" };
+      case "backlog_create_task_comment":
+        return null;
+      case "backlog_provision_agent_env":
+        return {
+          BACKLOG_URL: mockBacklogConnection.baseUrl ?? "http://localhost:4321",
+          BACKLOG_TOKEN: "bklg_mock",
+          BACKLOG_PROJECT_ID: (payload as { projectGuid: string }).projectGuid,
+        };
       case "github_connection_status":
         return mockGithubConnection;
       case "github_connect":

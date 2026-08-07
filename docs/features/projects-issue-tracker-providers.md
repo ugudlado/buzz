@@ -79,9 +79,10 @@ Orca consumes it: plain REST, bearer token, no polymorphic provider interface).
 
 ## Security notes (flagged, deliberate for Slice 1)
 
-- The Backlog bearer token lives in webview localStorage
-  (`buzz-backlog-connection.v1`). The GitHub token already uses the OS
-  keyring — move the Backlog token to the same mechanism next.
+- ~~Backlog bearer token in webview localStorage~~ **Resolved**: the user
+  token now lives in the OS keyring with all HTTP on the Rust side
+  (`commands/backlog.rs`); legacy localStorage values are migrated and
+  deleted on first use (see backlog-connect-automation.md).
 - The `buzz-issue-tracker` tag publishes shared state whose resolution
   depends on per-device connection config; other collaborators see a
   "backlog-issues" failed section until they connect. Consider carrying the
