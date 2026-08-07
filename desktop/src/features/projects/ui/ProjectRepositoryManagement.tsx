@@ -1,5 +1,6 @@
+import { useQuery } from "@tanstack/react-query";
 import * as React from "react";
-import { Check, ListTodo, ShieldCheck } from "lucide-react";
+import { Check, ExternalLink, ShieldCheck } from "lucide-react";
 import { toast } from "sonner";
 
 import { useChannelsQuery } from "@/features/channels/hooks";
@@ -7,6 +8,10 @@ import type { Project, Repository } from "@/features/projects/hooks";
 import { useAddProjectRepositoryMutation } from "@/features/projects/useAddProjectRepository";
 import { useAttachProjectRepositoryMutation } from "@/features/projects/useAttachProjectRepository";
 import { useBindProjectRepositoryChannelMutation } from "@/features/projects/useBindProjectRepositoryChannel";
+import {
+  getBacklogStatus,
+  listBacklogProjects,
+} from "@/shared/api/tauriBacklog";
 import { Button } from "@/shared/ui/button";
 import {
   DropdownMenu,
@@ -17,13 +22,8 @@ import {
 } from "@/shared/ui/dropdown-menu";
 import { AddProjectRepositoryDialog } from "./AddProjectRepositoryDialog";
 import { AttachProjectRepositoryDialog } from "./AttachProjectRepositoryDialog";
-import {
-  GithubConnectionDialog,
-  useGithubConnectionQuery,
-} from "./GithubConnectionDialog";
 import { GitHubMark } from "./GitHubMark";
 import { ProjectRepositoryPicker } from "./ProjectRepositoryPicker";
-import { RepositoryIssueTrackerDialog } from "./RepositoryIssueTrackerDialog";
 
 export function ProjectRepositoryManagement({
   identityPubkey,
@@ -40,10 +40,31 @@ export function ProjectRepositoryManagement({
 }) {
   const [createOpen, setCreateOpen] = React.useState(false);
   const [attachOpen, setAttachOpen] = React.useState(false);
-  const [issueTrackerOpen, setIssueTrackerOpen] = React.useState(false);
-  const [githubOpen, setGithubOpen] = React.useState(false);
-  const githubConnection = useGithubConnectionQuery();
   const channelsQuery = useChannelsQuery();
+  const issueTracker = repository.issueTracker;
+  const backlogStatusQuery = useQuery({
+    enabled: issueTracker.kind === "backlog",
+    queryFn: getBacklogStatus,
+    queryKey: ["backlog-status"],
+  });
+  const backlogProjectsQuery = useQuery({
+    enabled: issueTracker.kind === "backlog",
+    queryFn: listBacklogProjects,
+    queryKey: ["backlog-projects"],
+  });
+  const backlogProjectPath =
+    issueTracker.kind === "backlog"
+      ? (backlogProjectsQuery.data?.find(
+          (candidate) => candidate.guid === issueTracker.project,
+        )?.path ?? null)
+      : null;
+  // `baseUrl` may or may not already carry a scheme (the Settings page shows
+  // values like "http://localhost:4321"), so only prepend one when missing.
+  const backlogBaseUrl = backlogStatusQuery.data?.baseUrl?.replace(/\/+$/, "");
+  const backlogProjectUrl =
+    issueTracker.kind === "backlog" && backlogBaseUrl && backlogProjectPath
+      ? `${/^https?:\/\//i.test(backlogBaseUrl) ? backlogBaseUrl : `https://${backlogBaseUrl}`}/projects/${backlogProjectPath}`
+      : null;
   const createMutation = useAddProjectRepositoryMutation();
   const attachMutation = useAttachProjectRepositoryMutation();
   const repairMutation = useBindProjectRepositoryChannelMutation();
@@ -124,45 +145,29 @@ export function ProjectRepositoryManagement({
         repository={repository}
       />
       {repository.githubRepo ? (
-        <>
-          <GithubConnectionDialog
-            onOpenChange={setGithubOpen}
-            open={githubOpen}
-          />
-          <Button
-            className="h-8 shrink-0 gap-1.5"
-            data-testid="github-connection"
-            onClick={() => setGithubOpen(true)}
-            size="sm"
-            type="button"
-            variant="outline"
-          >
-            <GitHubMark className="h-3.5 w-3.5" />
-            {githubConnection.data?.connected
-              ? (githubConnection.data.login ?? "GitHub")
-              : "Connect GitHub"}
-          </Button>
-        </>
+        <a
+          className="flex h-8 shrink-0 items-center gap-1.5 rounded-md border border-border/60 px-2.5 text-sm text-muted-foreground hover:text-foreground"
+          data-testid="github-repo-link"
+          href={`https://github.com/${repository.githubRepo.owner}/${repository.githubRepo.name}`}
+          rel="noopener noreferrer"
+          target="_blank"
+        >
+          <GitHubMark className="h-3.5 w-3.5" />
+          {repository.githubRepo.owner}/{repository.githubRepo.name}
+          <ExternalLink className="h-3 w-3" />
+        </a>
       ) : null}
-      {isRepositoryOwner ? (
-        <>
-          <RepositoryIssueTrackerDialog
-            onOpenChange={setIssueTrackerOpen}
-            open={issueTrackerOpen}
-            repository={repository}
-          />
-          <Button
-            className="h-8 shrink-0 gap-1.5"
-            data-testid="repository-issue-tracker"
-            onClick={() => setIssueTrackerOpen(true)}
-            size="sm"
-            type="button"
-            variant="outline"
-          >
-            <ListTodo className="h-3.5 w-3.5" />
-            Issues
-          </Button>
-        </>
+      {backlogProjectUrl ? (
+        <a
+          className="flex h-8 shrink-0 items-center gap-1.5 rounded-md border border-border/60 px-2.5 text-sm text-muted-foreground hover:text-foreground"
+          data-testid="backlog-project-link"
+          href={backlogProjectUrl}
+          rel="noopener noreferrer"
+          target="_blank"
+        >
+          Backlog · {backlogProjectPath}
+          <ExternalLink className="h-3 w-3" />
+        </a>
       ) : null}
       {canManageAccess ? (
         <DropdownMenu>

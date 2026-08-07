@@ -26,22 +26,20 @@ function ProjectTabLabel({ children }: { children: string }) {
   );
 }
 
+/** Overview | Code | Issues | Pull Requests — the unified project tab bar (v2). */
 export function ProjectTabsList({ prsActive }: { prsActive?: boolean }) {
   return (
     <TabsList className="h-full min-w-0 max-w-full flex-none justify-start gap-1 overflow-x-auto bg-transparent p-0 scrollbar-none">
       <TabsTrigger
         aria-label="Overview"
         className={PROJECT_OVERVIEW_TAB_CLASS}
-        title="README"
+        title="Overview"
         value="overview"
       >
         <BookOpen className="h-full w-full" strokeWidth={2} />
       </TabsTrigger>
       <TabsTrigger className={PROJECT_TAB_TRIGGER_CLASS} value="files">
-        <ProjectTabLabel>Files</ProjectTabLabel>
-      </TabsTrigger>
-      <TabsTrigger className={PROJECT_TAB_TRIGGER_CLASS} value="activity">
-        <ProjectTabLabel>Commits</ProjectTabLabel>
+        <ProjectTabLabel>Code</ProjectTabLabel>
       </TabsTrigger>
       <TabsTrigger className={PROJECT_TAB_TRIGGER_CLASS} value="issues">
         <ProjectTabLabel>Issues</ProjectTabLabel>
@@ -54,10 +52,7 @@ export function ProjectTabsList({ prsActive }: { prsActive?: boolean }) {
         )}
         value="prs"
       >
-        <ProjectTabLabel>Pull Request</ProjectTabLabel>
-      </TabsTrigger>
-      <TabsTrigger className={PROJECT_TAB_TRIGGER_CLASS} value="contributors">
-        <ProjectTabLabel>Contributors</ProjectTabLabel>
+        <ProjectTabLabel>Pull Requests</ProjectTabLabel>
       </TabsTrigger>
     </TabsList>
   );

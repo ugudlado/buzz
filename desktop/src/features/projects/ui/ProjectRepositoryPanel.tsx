@@ -59,7 +59,7 @@ export function formatLastChangedAt(timestamp: number | null) {
   });
 }
 
-function formatFileSize(size: number | null) {
+export function formatFileSize(size: number | null) {
   if (size === null) return "—";
   if (size < 1024) return `${size} B`;
   if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
@@ -523,7 +523,7 @@ function handleRepositoryEntryKeyDown(
   onOpen();
 }
 
-function BreadcrumbButton({
+export function BreadcrumbButton({
   children,
   onClick,
 }: {

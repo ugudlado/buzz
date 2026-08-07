@@ -35,6 +35,7 @@ import {
   ProjectActivityBar,
   ProjectPeopleStack,
   ProjectStatsRow,
+  REPOSITORY_STAT_KEYS,
 } from "./ProjectCards";
 import { GitHubMark } from "./GitHubMark";
 import { ProjectListRowMenu } from "./ProjectListRowMenu";
@@ -242,9 +243,12 @@ export function RepositoryGridCard(props: RepositoryItemProps) {
           <RepositoryUpdatedLabel repository={repository} summary={summary} />
         </div>
         <div className="mt-2">
-          <ProjectStatsRow summary={summary} />
+          <ProjectStatsRow statKeys={REPOSITORY_STAT_KEYS} summary={summary} />
           <div className="mt-2">
-            <ProjectActivityBar summary={summary} />
+            <ProjectActivityBar
+              statKeys={REPOSITORY_STAT_KEYS}
+              summary={summary}
+            />
           </div>
         </div>
       </div>
@@ -294,9 +298,16 @@ export function RepositoryListRow(props: RepositoryItemProps) {
             className="hidden items-center gap-3 xl:flex"
             data-testid="repositories-row-summary"
           >
-            <ProjectStatsRow fixedColumns summary={summary} />
+            <ProjectStatsRow
+              fixedColumns
+              statKeys={REPOSITORY_STAT_KEYS}
+              summary={summary}
+            />
             <div className="w-20 shrink-0">
-              <ProjectActivityBar summary={summary} />
+              <ProjectActivityBar
+                statKeys={REPOSITORY_STAT_KEYS}
+                summary={summary}
+              />
             </div>
           </div>
           <div
