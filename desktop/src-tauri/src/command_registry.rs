@@ -7,6 +7,7 @@
 use crate::archive;
 use crate::builderlab::*;
 use crate::commands::*;
+use crate::huddle;
 use crate::huddle::audio_output::{
     get_audio_output_device, list_audio_output_devices, set_audio_output_device,
 };
