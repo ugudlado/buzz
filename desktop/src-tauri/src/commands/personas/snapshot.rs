@@ -24,9 +24,6 @@ use crate::{
 
 pub(crate) mod import;
 
-// Re-export import-side commands so callers see a flat `snapshot::` namespace.
-pub use import::{confirm_agent_snapshot_import, preview_agent_snapshot_import};
-
 // ── Pure resolver (testable without AppHandle) ────────────────────────────────
 
 /// Inner resolver operating on pre-fetched slices — testable without
