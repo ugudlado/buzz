@@ -13,6 +13,7 @@ import {
   MessagesSquare,
   MonitorCog,
   Moon,
+  Plug,
   ShieldAlert,
   Smartphone,
   Smile,
@@ -69,6 +70,7 @@ import { ModerationQueueCard } from "./ModerationQueueCard";
 import { NotificationSettingsCard } from "./NotificationSettingsCard";
 import { AgentsSettingsPanel } from "./AgentsSettingsPanel";
 import { HostedCommunitiesSettingsCard } from "./HostedCommunitiesSettingsCard";
+import { IntegrationsSettingsCard } from "./IntegrationsSettingsCard";
 import { SettingsOptionGroup, SettingsOptionRow } from "./SettingsOptionGroup";
 import { ProfileSettingsCard } from "./ProfileSettingsCard";
 import { UpdateChecker } from "../UpdateChecker";
@@ -83,6 +85,7 @@ export type SettingsSection =
   | "agents"
   | "channel-templates"
   | "compute"
+  | "integrations"
   | "appearance"
   | "shortcuts"
   | "hosted-communities"
@@ -103,6 +106,7 @@ const SETTINGS_SECTION_VALUES: readonly SettingsSection[] = [
   "agents",
   "channel-templates",
   "compute",
+  "integrations",
   "appearance",
   "shortcuts",
   "hosted-communities",
@@ -186,6 +190,11 @@ export const settingsSections: SettingsSectionDescriptor[] = [
     value: "compute",
     label: "Compute",
     icon: Cpu,
+  },
+  {
+    value: "integrations",
+    label: "Integrations",
+    icon: Plug,
   },
   {
     value: "shortcuts",
@@ -851,6 +860,8 @@ export function renderSettingsSection(
       return <ChannelTemplatesSettingsCard />;
     case "compute":
       return <MeshComputeSettingsCard />;
+    case "integrations":
+      return <IntegrationsSettingsCard />;
     case "appearance":
       return <ThemeSettingsCard />;
     case "shortcuts":

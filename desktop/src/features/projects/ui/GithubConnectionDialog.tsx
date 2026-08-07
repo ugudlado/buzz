@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import * as React from "react";
 import { toast } from "sonner";
 
+import { useAppNavigation } from "@/app/navigation/useAppNavigation";
 import {
   connectGithub,
   connectGithubFromGhCli,
@@ -36,6 +37,7 @@ export function GithubConnectionDialog({
   open: boolean;
 }) {
   const queryClient = useQueryClient();
+  const { goSettings } = useAppNavigation();
   const statusQuery = useGithubConnectionQuery();
   const [token, setToken] = React.useState("");
 
@@ -89,6 +91,17 @@ export function GithubConnectionDialog({
               token is stored in your OS keychain.
             </p>
           </div>
+          <button
+            className="text-xs font-medium text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+            data-testid="github-manage-in-settings"
+            onClick={() => {
+              onOpenChange(false);
+              void goSettings("integrations");
+            }}
+            type="button"
+          >
+            Manage connection in Settings →
+          </button>
           {status?.connected ? (
             <div className="flex items-center justify-between rounded-lg border border-border/60 px-3 py-2 text-sm">
               <span data-testid="github-connected-as">
