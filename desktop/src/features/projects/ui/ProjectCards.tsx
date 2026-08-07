@@ -169,14 +169,25 @@ const PROJECT_STAT_ITEMS = [
   },
 ] as const;
 
+/** Stat keys shown on Repository cards/rows — no issues stat there. */
+export const REPOSITORY_STAT_KEYS = ["commitCount", "prCount"] as const;
+
+type ProjectStatKey = (typeof PROJECT_STAT_ITEMS)[number]["key"];
+
 export function ProjectStatsRow({
   summary,
   fixedColumns = false,
+  statKeys,
 }: {
   summary: ProjectActivitySummary | undefined;
   /** Give each stat a fixed width so stats align vertically across list rows. */
   fixedColumns?: boolean;
+  /** Restrict which stats render, in `PROJECT_STAT_ITEMS` order. Defaults to all three. */
+  statKeys?: readonly ProjectStatKey[];
 }) {
+  const items = statKeys
+    ? PROJECT_STAT_ITEMS.filter((item) => statKeys.includes(item.key))
+    : PROJECT_STAT_ITEMS;
   return (
     <div
       className={cn(
@@ -185,24 +196,22 @@ export function ProjectStatsRow({
         !fixedColumns && "flex-wrap",
       )}
     >
-      {PROJECT_STAT_ITEMS.map(
-        ({ key, icon: Icon, iconClass, label, columnClass }) => {
-          const count = summary?.[key] ?? 0;
-          return (
-            <span
-              className={cn(
-                "flex items-center gap-1",
-                fixedColumns && cn("shrink-0", columnClass),
-              )}
-              key={key}
-            >
-              <Icon className={cn("h-3.5 w-3.5 shrink-0", iconClass)} />
-              <span className="font-medium text-foreground">{count}</span>
-              {label(count)}
-            </span>
-          );
-        },
-      )}
+      {items.map(({ key, icon: Icon, iconClass, label, columnClass }) => {
+        const count = summary?.[key] ?? 0;
+        return (
+          <span
+            className={cn(
+              "flex items-center gap-1",
+              fixedColumns && cn("shrink-0", columnClass),
+            )}
+            key={key}
+          >
+            <Icon className={cn("h-3.5 w-3.5 shrink-0", iconClass)} />
+            <span className="font-medium text-foreground">{count}</span>
+            {label(count)}
+          </span>
+        );
+      })}
     </div>
   );
 }
@@ -211,10 +220,16 @@ export function ProjectStatsRow({
 // Hovering thickens the bar and reveals a tooltip with the exact breakdown.
 export function ProjectActivityBar({
   summary,
+  statKeys,
 }: {
   summary: ProjectActivitySummary | undefined;
+  /** Restrict which stats render, in `PROJECT_STAT_ITEMS` order. Defaults to all three. */
+  statKeys?: readonly ProjectStatKey[];
 }) {
-  const items = PROJECT_STAT_ITEMS.map(({ key, barClass, label }) => {
+  const sourceItems = statKeys
+    ? PROJECT_STAT_ITEMS.filter((item) => statKeys.includes(item.key))
+    : PROJECT_STAT_ITEMS;
+  const items = sourceItems.map(({ key, barClass, label }) => {
     const count = summary?.[key] ?? 0;
     return { barClass, count, text: label(count) };
   });
@@ -541,13 +556,8 @@ export function ProjectGridCard({
           />
         </div>
 
-        <div className="mt-auto">
-          <div className="flex min-w-0 items-center px-4 pb-2 pt-1">
-            <ProjectStatsRow summary={summary} />
-          </div>
-          <div className="px-4 pb-3">
-            <ProjectActivityBar summary={summary} />
-          </div>
+        <div className="mt-auto px-4 pb-3 pt-1">
+          <ProjectActivityBar summary={summary} />
         </div>
       </div>
     </Card>
@@ -612,13 +622,10 @@ export function ProjectListRow({
             />
           </div>
           <div
-            className="hidden items-center gap-3 xl:flex"
+            className="hidden w-20 shrink-0 items-center xl:flex"
             data-testid="projects-row-summary"
           >
-            <ProjectStatsRow fixedColumns summary={summary} />
-            <div className="w-20 shrink-0">
-              <ProjectActivityBar summary={summary} />
-            </div>
+            <ProjectActivityBar summary={summary} />
           </div>
           <div
             className="hidden w-24 shrink-0 justify-end lg:flex"

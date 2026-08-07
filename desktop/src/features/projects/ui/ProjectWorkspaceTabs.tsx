@@ -28,9 +28,11 @@ import {
   refineRepoUnavailableReason,
 } from "@/features/projects/lib/projectRepoAvailability";
 import { useMemberChannelIds } from "@/features/projects/useRepositoryAccess";
+import { useGithubReadmeQuery } from "@/features/projects/useGithubRepoBrowser";
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
 import { Button } from "@/shared/ui/button";
 import { Tabs, TabsContent } from "@/shared/ui/tabs";
+import { GithubRepositoryFilesPanel } from "./GithubRepositoryFilesPanel";
 import { findReadmeFile } from "./ProjectReadmePanel";
 import { RepositoryFilesPanel } from "./ProjectRepositoryPanel";
 import type { RepoSourceHeaderControls } from "./ProjectRepositorySource";
@@ -198,6 +200,13 @@ export function WorkspaceTabs({
   terminalTitle?: string;
   viewerGitIdentity?: ViewerGitIdentity | null;
 }) {
+  // GitHub-linked repositories fetch their "Remote" view live from GitHub's
+  // API instead of the Buzz relay mirror — the relay snapshot query for these
+  // repos is disabled entirely (see ProjectDetailScreen's
+  // `repoRemote.host.kind === "buzz"` gate), so the readme/file browser here
+  // reads from useGithubReadmeQuery / GithubRepositoryFilesPanel instead of
+  // `snapshot` when this is true.
+  const isGithubRemote = repoSource === "remote" && Boolean(project.githubRepo);
   const localCheckoutSnapshot = localSnapshot?.snapshot ?? null;
   const displayedSnapshot =
     repoSource === "local" ? localCheckoutSnapshot : snapshot;
@@ -208,24 +217,49 @@ export function WorkspaceTabs({
   const displayedContributors =
     displayedSnapshot?.contributors ?? repoContributors;
   const files = displayedSnapshot?.files ?? [];
-  const readmeFile = React.useMemo(() => findReadmeFile(files), [files]);
+  const localReadmeFile = React.useMemo(() => findReadmeFile(files), [files]);
+  const githubBranch = isGithubRemote ? sourceControls?.branch : undefined;
+  const githubReadme = useGithubReadmeQuery(
+    isGithubRemote ? project : null,
+    githubBranch,
+  );
+  const readmeFile = isGithubRemote
+    ? githubReadme.entry && githubReadme.content
+      ? {
+          path: githubReadme.entry.path,
+          kind: "file",
+          size: githubReadme.content.size,
+          previewContent: githubReadme.content.content,
+          lastChangedAt: null,
+          latestCommit: null,
+        }
+      : null
+    : localReadmeFile;
   const externalHost =
-    repoSource === "remote" && repoHost.kind === "external"
+    repoSource === "remote" && !isGithubRemote && repoHost.kind === "external"
       ? repoHost.host
       : undefined;
-  const gitDataState: GitDataState = displayedSnapshotLoading
-    ? "checking"
-    : externalHost || displayedSnapshotError || !displayedSnapshot
-      ? "unavailable"
-      : files.length === 0
-        ? "empty"
-        : "available";
+  const gitDataState: GitDataState = isGithubRemote
+    ? githubReadme.isLoading
+      ? "checking"
+      : githubReadme.error
+        ? "unavailable"
+        : githubReadme.entry && githubReadme.content
+          ? "available"
+          : "empty"
+    : displayedSnapshotLoading
+      ? "checking"
+      : externalHost || displayedSnapshotError || !displayedSnapshot
+        ? "unavailable"
+        : files.length === 0
+          ? "empty"
+          : "available";
   // The relay masks channel-ACL denials as 404 (anti-enumeration), so a
   // "missing" git result is re-classified with the repository's channel
   // binding and the viewer's memberships before it reaches the UI copy.
   const memberChannelIds = useMemberChannelIds();
   const unavailableReason =
-    gitDataState === "unavailable" && !externalHost
+    gitDataState === "unavailable" && !externalHost && !isGithubRemote
       ? refineRepoUnavailableReason({
           reason: projectRepoUnavailableReason(displayedSnapshotError),
           repositoryChannelId: project.channelId,
@@ -533,20 +567,28 @@ export function WorkspaceTabs({
             </div>
           </div>
         ) : null}
-        <RepositoryFilesPanel
-          error={displayedSnapshotError}
-          fallbackAuthorPubkey={project.owner}
-          files={files}
-          isLoading={displayedSnapshotLoading}
-          profiles={profiles}
-          snapshot={displayedSnapshot}
-          sourceControls={sourceControls}
-          unavailableMessage={
-            externalHost
-              ? `Not mirrored on Buzz. Repository files are hosted on ${externalHost}.`
-              : undefined
-          }
-        />
+        {isGithubRemote ? (
+          <GithubRepositoryFilesPanel
+            branch={githubBranch ?? null}
+            repository={project}
+            sourceControls={sourceControls}
+          />
+        ) : (
+          <RepositoryFilesPanel
+            error={displayedSnapshotError}
+            fallbackAuthorPubkey={project.owner}
+            files={files}
+            isLoading={displayedSnapshotLoading}
+            profiles={profiles}
+            snapshot={displayedSnapshot}
+            sourceControls={sourceControls}
+            unavailableMessage={
+              externalHost
+                ? `Not mirrored on Buzz. Repository files are hosted on ${externalHost}.`
+                : undefined
+            }
+          />
+        )}
       </TabsContent>
 
       <TabsContent className="m-0" value="contributors">

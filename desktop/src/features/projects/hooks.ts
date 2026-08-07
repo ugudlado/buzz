@@ -7,6 +7,11 @@ import {
   fetchBacklogIssuesForRepos,
 } from "@/features/projects/backlogIssues";
 import { fetchGithubPullRequestsForRepos } from "@/features/projects/githubPullRequests";
+import {
+  overlayGithubActivity,
+  useGithubRepoActivitiesQuery,
+} from "@/features/projects/githubRepoActivities";
+import { aggregateProjectActivitySummaries } from "@/features/projects/projectActivitySummaries";
 import { getRelaySelf } from "@/features/moderation/lib/relaySelf";
 import { getCachedRelayOrigin } from "@/shared/lib/mediaUrl";
 import { signRelayEvent } from "@/shared/api/tauri";
@@ -554,80 +559,6 @@ export async function fetchRepositoryActivitySummaries(
   >;
 }
 
-async function fetchProjectActivitySummaries(
-  projects: Project[],
-): Promise<Record<string, ProjectActivitySummary>> {
-  if (projects.length === 0) return {};
-
-  const repositories = [
-    ...new Map(
-      projects
-        .flatMap((project) => project.repositories)
-        .map((repository) => [repository.repoAddress, repository]),
-    ).values(),
-  ];
-  const summariesByRepository =
-    await fetchRepositoryActivitySummaries(repositories);
-  return Object.fromEntries(
-    projects.map((project) => {
-      const summaries = project.repositories.map(
-        (repository) => summariesByRepository[repository.repoAddress],
-      );
-      const latestCommit =
-        summaries
-          .map((summary) => summary?.latestCommit)
-          .filter(
-            (
-              commit,
-            ): commit is NonNullable<ProjectActivitySummary["latestCommit"]> =>
-              Boolean(commit),
-          )
-          .sort((left, right) => right.createdAt - left.createdAt)[0] ?? null;
-      const activityByDay: Record<string, number> = {};
-      for (const summary of summaries) {
-        for (const [day, count] of Object.entries(
-          summary?.activityByDay ?? {},
-        )) {
-          activityByDay[day] = (activityByDay[day] ?? 0) + count;
-        }
-      }
-      return [
-        project.id,
-        {
-          repoAddress: project.projectAddress,
-          issueCount: summaries.reduce(
-            (count, summary) => count + (summary?.issueCount ?? 0),
-            0,
-          ),
-          prCount: summaries.reduce(
-            (count, summary) => count + (summary?.prCount ?? 0),
-            0,
-          ),
-          commitCount: summaries.reduce(
-            (count, summary) => count + (summary?.commitCount ?? 0),
-            0,
-          ),
-          activityCount: summaries.reduce(
-            (count, summary) => count + (summary?.activityCount ?? 0),
-            0,
-          ),
-          updatedAt: Math.max(
-            0,
-            ...summaries.map((summary) => summary?.updatedAt ?? 0),
-          ),
-          participantPubkeys: [
-            ...new Set(
-              summaries.flatMap((summary) => summary?.participantPubkeys ?? []),
-            ),
-          ],
-          latestCommit,
-          activityByDay,
-        } satisfies ProjectActivitySummary,
-      ];
-    }),
-  );
-}
-
 async function deleteProject(project: Project): Promise<void> {
   const identity = await getIdentity();
   if (identity.pubkey.toLowerCase() !== project.owner.toLowerCase()) {
@@ -932,6 +863,17 @@ export function useCreateProjectPullRequestCommentMutation(
   });
 }
 
+/**
+ * GitHub-linked repositories get their issue/PR/commit counts and
+ * `updatedAt` overlaid from the GitHub API before per-project aggregation
+ * (see `githubRepoActivities.ts`); Buzz-native repositories keep their
+ * relay-derived counts unchanged. A GitHub fetch failure for one repo
+ * silently falls back to the relay values for that repo. Aggregation is
+ * recomputed from the (possibly overlaid) per-repository summaries via
+ * `aggregateProjectActivitySummaries`, so a project spanning both a
+ * GitHub-linked and a Buzz-native repository sums each repo's own
+ * provider-sourced counts rather than mixing already-summed totals.
+ */
 export function useProjectActivitySummariesQuery(projects: Project[]) {
   const repoAddresses = React.useMemo(
     () =>
@@ -942,13 +884,39 @@ export function useProjectActivitySummariesQuery(projects: Project[]) {
         .sort(),
     [projects],
   );
+  const repositories = React.useMemo(
+    () => [
+      ...new Map(
+        projects
+          .flatMap((project) => project.repositories)
+          .map((repository) => [repository.repoAddress, repository]),
+      ).values(),
+    ],
+    [projects],
+  );
 
-  return useQuery({
+  const repositorySummariesQuery = useQuery({
     enabled: repoAddresses.length > 0,
-    queryKey: ["projects", "activity-summaries", repoAddresses],
-    queryFn: () => fetchProjectActivitySummaries(projects),
+    queryKey: ["projects", "activity-summaries", "repositories", repoAddresses],
+    queryFn: () => fetchRepositoryActivitySummaries(repositories),
     staleTime: 30_000,
   });
+  const githubActivityQuery = useGithubRepoActivitiesQuery(repositories);
+
+  const data = React.useMemo(():
+    | Record<string, ProjectActivitySummary>
+    | undefined => {
+    if (!repositorySummariesQuery.data) return undefined;
+    return aggregateProjectActivitySummaries(
+      projects,
+      overlayGithubActivity(
+        repositorySummariesQuery.data,
+        githubActivityQuery.data,
+      ),
+    );
+  }, [repositorySummariesQuery.data, githubActivityQuery.data, projects]);
+
+  return { ...repositorySummariesQuery, data };
 }
 
 export function useDeleteProjectMutation() {

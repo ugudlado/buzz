@@ -63,6 +63,7 @@ import { normalizeRepositoryUrl } from "@/features/projects/lib/projectsViewHelp
 import { selectProjectRepository } from "@/features/projects/projectModels";
 import { KIND_REPO_ANNOUNCEMENT } from "@/shared/constants/kinds";
 import { useProjectRepoPresentation } from "@/features/projects/useProjectRepoHost";
+import { useGithubAwareBranchOptions } from "@/features/projects/useGithubRepoBrowser";
 import { WorkspaceTabs } from "./ProjectWorkspaceTabs";
 import type { RepoSourceHeaderControls } from "./ProjectRepositorySource";
 import { showProjectCloneErrorToast } from "./projectGitErrorToast";
@@ -148,9 +149,13 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
           (pullRequest) => pullRequest.branchName ?? null,
         ) ?? [],
     });
+  const branchOptionsWithGithub = useGithubAwareBranchOptions(
+    repository,
+    branchOptions,
+  );
   const { activeBranch, selectBranch, selectedTag, selectTag } =
     useProjectRepositoryRefSelection({
-      branchOptions,
+      branchOptions: branchOptionsWithGithub,
       defaultBranch,
       projectAvailable: Boolean(repository),
       projectPending: projectQuery.isPending,
@@ -300,7 +305,7 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
       ? localRepoDiffQuery.isLoading
       : repoDiffQuery.isLoading;
   const branchOptionsWithLocal = projectBranchOptionsFromSync(
-    branchOptions,
+    branchOptionsWithGithub,
     repoSyncStatusQuery.data,
   );
   const { activeBranchCommit, activeRemoteBranch, deleteBranchReason } =
