@@ -4,6 +4,7 @@ import type { ProjectWorkItemSection } from "@/features/projects/projectWorkItem
 import { Button } from "@/shared/ui/button";
 
 const SECTION_LABELS: Record<ProjectWorkItemSection, string> = {
+  "backlog-issues": "Backlog issues",
   comments: "comments",
   "pull-request-updates": "pull request updates",
   statuses: "statuses",

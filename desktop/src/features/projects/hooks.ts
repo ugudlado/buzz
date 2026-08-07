@@ -2,6 +2,10 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import * as React from "react";
 
 import { relayClient } from "@/shared/api/relayClient";
+import {
+  createBacklogIssueComment,
+  fetchBacklogIssuesForRepos,
+} from "@/features/projects/backlogIssues";
 import { getRelaySelf } from "@/features/moderation/lib/relaySelf";
 import { getCachedRelayOrigin } from "@/shared/lib/mediaUrl";
 import { signRelayEvent } from "@/shared/api/tauri";
@@ -224,6 +228,15 @@ async function fetchRepoState(project: Repository): Promise<RepoState | null> {
 async function fetchProjectIssues(
   project: Repository,
 ): Promise<ProjectIssue[]> {
+  if (project.issueTracker.kind === "backlog") {
+    const byRepo = await fetchBacklogIssuesForRepos([
+      {
+        repoAddress: project.repoAddress,
+        backlogProject: project.issueTracker.project,
+      },
+    ]);
+    return byRepo.get(project.repoAddress) ?? [];
+  }
   const [issueEvents, statusEvents, commentEvents] = await Promise.all([
     relayClient.fetchEvents({
       kinds: [KIND_GIT_ISSUE],
@@ -391,6 +404,15 @@ async function createProjectIssueComment({
   const body = content.trim();
   if (!body) {
     throw new Error("Comment cannot be empty.");
+  }
+
+  if (project.issueTracker.kind === "backlog") {
+    await createBacklogIssueComment(
+      project.issueTracker.project,
+      issue.id,
+      body,
+    );
+    return;
   }
 
   const recipients = new Set([

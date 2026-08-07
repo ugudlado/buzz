@@ -137,3 +137,91 @@ test("fetchProjectsWorkItems returns a single row for a PR present in both proje
   // Sanity: the stub was actually called (proves we ran the production path).
   assert.ok(callCount >= 1, "fetchEvents must have been called");
 });
+
+test("fetchProjectsWorkItems routes backlog-tracked repos to the backlog provider", async () => {
+  const BACKLOG_REPO = `30617:${"b".repeat(64)}:tracked`;
+  const backlogProjectGuid = "guid-1";
+  const projects = [
+    {
+      repositories: [
+        { repoAddress: REPO_ADDRESS },
+        {
+          repoAddress: BACKLOG_REPO,
+          issueTracker: { kind: "backlog", project: backlogProjectGuid },
+        },
+      ],
+    },
+  ];
+  const relayIssue = makeIssue(ISSUE_ID);
+  // Relay also has a stale 1621 for the backlog-tracked repo — must be ignored.
+  const staleIssue = {
+    ...makeIssue("s".repeat(64)),
+    tags: [
+      ["a", BACKLOG_REPO],
+      ["subject", "Stale relay issue"],
+    ],
+  };
+  const fetchEvents = makeFetchEvents([relayIssue, staleIssue]);
+  const backlogIssue = {
+    id: "backlog:task-1",
+    title: "ORC-1 From backlog",
+    content: "",
+    tags: [],
+    author: "spidey",
+    createdAt: 10,
+    repoAddress: BACKLOG_REPO,
+    channelId: null,
+    originAgentName: null,
+    labels: [],
+    recipients: [],
+    status: "In Progress",
+    statusEventId: null,
+    updatedAt: 20,
+    comments: [],
+  };
+  const fetchBacklogIssues = async (repos) => {
+    assert.deepEqual(repos, [
+      { repoAddress: BACKLOG_REPO, backlogProject: backlogProjectGuid },
+    ]);
+    return new Map([[BACKLOG_REPO, [backlogIssue]]]);
+  };
+
+  const result = await fetchProjectsWorkItems(
+    projects,
+    fetchEvents,
+    fetchBacklogIssues,
+  );
+
+  const ids = result.issues.items.map((item) => item.issue.id);
+  assert.deepEqual(ids.sort(), ["backlog:task-1", ISSUE_ID].sort());
+  assert.deepEqual(result.issues.failedSections, []);
+});
+
+test("fetchProjectsWorkItems reports backlog failure without dropping relay issues", async () => {
+  const BACKLOG_REPO = `30617:${"c".repeat(64)}:tracked`;
+  const projects = [
+    {
+      repositories: [
+        { repoAddress: REPO_ADDRESS },
+        {
+          repoAddress: BACKLOG_REPO,
+          issueTracker: { kind: "backlog", project: "guid-2" },
+        },
+      ],
+    },
+  ];
+  const fetchEvents = makeFetchEvents([makeIssue(ISSUE_ID)]);
+  const fetchBacklogIssues = async () => {
+    throw new Error("backlog down");
+  };
+
+  const result = await fetchProjectsWorkItems(
+    projects,
+    fetchEvents,
+    fetchBacklogIssues,
+  );
+
+  assert.equal(result.issues.items.length, 1);
+  assert.equal(result.issues.items[0].issue.id, ISSUE_ID);
+  assert.deepEqual(result.issues.failedSections, ["backlog-issues"]);
+});

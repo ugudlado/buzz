@@ -5,6 +5,15 @@ import {
 } from "@/shared/constants/kinds";
 import { effectiveCloneUrls } from "./lib/projectCloneUrl";
 
+/**
+ * Where a repository's issues live. Persisted as a `buzz-issue-tracker` tag on
+ * the kind:30617 announcement (["buzz-issue-tracker", "backlog", "<guid>"]);
+ * absent tag means Buzz-native NIP-34 issues.
+ */
+export type RepositoryIssueTracker =
+  | { kind: "buzz" }
+  | { kind: "backlog"; project: string };
+
 export type Repository = {
   id: string;
   dtag: string;
@@ -18,6 +27,7 @@ export type Repository = {
   status: string;
   defaultBranch: string;
   repoAddress: string;
+  issueTracker: RepositoryIssueTracker;
   maintainers?: string[];
   channelId?: string | null;
   eventContent?: string;
@@ -259,6 +269,13 @@ export function eventToRepository(
   const owner = event.pubkey.toLowerCase();
   const setupUsers = getAllTags(event, "auth");
   const channel = getTag(event, "buzz-channel");
+  const trackerTag = event.tags.find((tag) => tag[0] === "buzz-issue-tracker");
+  const issueTracker: RepositoryIssueTracker =
+    trackerTag?.[1] === "backlog" &&
+    typeof trackerTag[2] === "string" &&
+    trackerTag[2].length > 0
+      ? { kind: "backlog", project: trackerTag[2] }
+      : { kind: "buzz" };
   return {
     id: `${owner}:${dtag}`,
     dtag,
@@ -277,6 +294,7 @@ export function eventToRepository(
     status: getTag(event, "status") ?? "active",
     defaultBranch: getTag(event, "default-branch") ?? "main",
     repoAddress: `${KIND_REPO_ANNOUNCEMENT}:${owner}:${dtag}`,
+    issueTracker,
     channelId: channel && isValidProjectChannelId(channel) ? channel : null,
     eventContent: event.content,
     eventTags: event.tags.map((tag) => [...tag]),
