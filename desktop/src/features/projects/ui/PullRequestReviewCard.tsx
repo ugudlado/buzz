@@ -39,6 +39,10 @@ import {
 } from "@/shared/ui/dropdown-menu";
 import { Textarea } from "@/shared/ui/textarea";
 import {
+  githubPullRequestUrl,
+  isGithubPullRequestId,
+} from "@/features/projects/githubPullRequests";
+import {
   MergePullRequestButton,
   type OpenMergeRecoveryTerminal,
 } from "./MergePullRequestButton";
@@ -54,6 +58,11 @@ export function PullRequestReviewCard({
   pullRequest: ProjectPullRequest;
 }) {
   const identityQuery = useIdentityQuery();
+  // GitHub-hosted PRs are read-only in Buzz — reviews/merges happen on
+  // GitHub, so signing relay status events for them would be meaningless.
+  const githubUrl = isGithubPullRequestId(pullRequest.id)
+    ? githubPullRequestUrl(pullRequest)
+    : null;
   const { isPending: isUpdatingStatus, mutateAsync: updatePullRequestStatus } =
     useUpdateProjectPullRequestStatusMutation(project);
   const { isPending: isApproving, mutateAsync: approvePullRequest } =
@@ -175,6 +184,36 @@ export function PullRequestReviewCard({
     canConvertToDraft ||
     canClose ||
     canReopen;
+
+  if (isGithubPullRequestId(pullRequest.id)) {
+    return (
+      <div className="pull-request-action-timeline flex min-w-0 flex-1 items-start gap-2">
+        <span
+          aria-hidden="true"
+          className="mt-3.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-background text-muted-foreground ring-1 ring-border/70"
+        >
+          <GitPullRequest className="h-3 w-3" />
+        </span>
+        <div className="flex min-w-0 flex-1 flex-wrap items-center justify-start gap-2 rounded-lg border border-border/60 bg-muted/15 p-2 text-sm text-muted-foreground">
+          <span>
+            Reviews and merges for this pull request happen on GitHub.
+          </span>
+          {githubUrl ? (
+            <Button
+              className="h-8 gap-1.5 px-3"
+              data-testid="open-pull-request-on-github"
+              onClick={() => window.open(githubUrl, "_blank", "noopener")}
+              size="xs"
+              type="button"
+              variant="secondary"
+            >
+              Open on GitHub
+            </Button>
+          ) : null}
+        </div>
+      </div>
+    );
+  }
 
   if (!hasAvailableAction) return null;
 

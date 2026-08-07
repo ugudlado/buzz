@@ -225,3 +225,93 @@ test("fetchProjectsWorkItems reports backlog failure without dropping relay issu
   assert.equal(result.issues.items[0].issue.id, ISSUE_ID);
   assert.deepEqual(result.issues.failedSections, ["backlog-issues"]);
 });
+
+test("fetchProjectsWorkItems routes GitHub-hosted repos to the GitHub PR provider", async () => {
+  const GH_REPO = `30617:${"d".repeat(64)}:ghapp`;
+  const projects = [
+    {
+      repositories: [
+        { repoAddress: REPO_ADDRESS },
+        { repoAddress: GH_REPO, githubRepo: { name: "app", owner: "acme" } },
+      ],
+    },
+  ];
+  const relayPr = makePR(PR_ID, 100);
+  const fetchEvents = makeFetchEvents([relayPr]);
+  const githubPr = {
+    id: "github:42",
+    title: "#42 Ship it",
+    content: "",
+    tags: [["web", "https://github.com/acme/app/pull/42"]],
+    author: "octocat",
+    createdAt: 10,
+    repoAddress: GH_REPO,
+    channelId: null,
+    originAgentName: null,
+    labels: [],
+    recipients: [],
+    reviewers: [],
+    approvals: [],
+    changeRequests: [],
+    status: "Open",
+    statusEventId: null,
+    statusCreatedAt: null,
+    branchName: "ship",
+    targetBranch: "main",
+    initialCommit: null,
+    commit: null,
+    cloneUrls: [],
+    updateCount: 0,
+    updatedAt: 20,
+    updates: [],
+    comments: [],
+  };
+  const fetchBacklogIssues = async () => new Map();
+  const fetchGithubPullRequests = async (repos) => {
+    assert.deepEqual(repos, [
+      { repoAddress: GH_REPO, githubRepo: { name: "app", owner: "acme" } },
+    ]);
+    return new Map([[GH_REPO, [githubPr]]]);
+  };
+
+  const result = await fetchProjectsWorkItems(
+    projects,
+    fetchEvents,
+    fetchBacklogIssues,
+    fetchGithubPullRequests,
+  );
+
+  const ids = result.pullRequests.items.map((item) => item.pullRequest.id);
+  assert.deepEqual(ids.sort(), ["github:42", PR_ID].sort());
+  assert.deepEqual(result.pullRequests.failedSections, []);
+});
+
+test("fetchProjectsWorkItems reports GitHub failure without dropping relay PRs", async () => {
+  const GH_REPO = `30617:${"e".repeat(64)}:ghapp`;
+  const projects = [
+    {
+      repositories: [
+        { repoAddress: REPO_ADDRESS },
+        { repoAddress: GH_REPO, githubRepo: { name: "app", owner: "acme" } },
+      ],
+    },
+  ];
+  const fetchEvents = makeFetchEvents([makePR(PR_ID, 100)]);
+  const fetchBacklogIssues = async () => new Map();
+  const fetchGithubPullRequests = async () => {
+    throw new Error("GitHub is not connected.");
+  };
+
+  const result = await fetchProjectsWorkItems(
+    projects,
+    fetchEvents,
+    fetchBacklogIssues,
+    fetchGithubPullRequests,
+  );
+
+  assert.equal(result.pullRequests.items.length, 1);
+  assert.equal(result.pullRequests.items[0].pullRequest.id, PR_ID);
+  assert.deepEqual(result.pullRequests.failedSections, [
+    "github-pull-requests",
+  ]);
+});

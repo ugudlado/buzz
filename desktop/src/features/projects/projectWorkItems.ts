@@ -21,11 +21,13 @@ import {
 } from "./projectPullRequests.mjs";
 
 import { fetchBacklogIssuesForRepos } from "./backlogIssues";
-import type { RepositoryIssueTracker } from "./projectModels";
+import { fetchGithubPullRequestsForRepos } from "./githubPullRequests";
+import type { GithubRepoRef, RepositoryIssueTracker } from "./projectModels";
 
 type RepositoryReference = {
   repoAddress: string;
   issueTracker?: RepositoryIssueTracker;
+  githubRepo?: GithubRepoRef | null;
 };
 
 type ProjectReference = {
@@ -39,6 +41,7 @@ type ProjectRepository<TProject extends ProjectReference> =
 export type ProjectWorkItemSection =
   | "backlog-issues"
   | "comments"
+  | "github-pull-requests"
   | "pull-request-updates"
   | "statuses";
 
@@ -83,6 +86,7 @@ export async function fetchProjectsWorkItems<TProject extends ProjectReference>(
     filter: FetchEventsInput,
   ) => Promise<RelayEvent[]> = relayClient.fetchEvents.bind(relayClient),
   fetchBacklogIssues: typeof fetchBacklogIssuesForRepos = fetchBacklogIssuesForRepos,
+  fetchGithubPullRequests: typeof fetchGithubPullRequestsForRepos = fetchGithubPullRequestsForRepos,
 ): Promise<ProjectsWorkItemsResult<TProject>> {
   const repoAddresses = [
     ...new Set(
@@ -102,56 +106,82 @@ export async function fetchProjectsWorkItems<TProject extends ProjectReference>(
       ),
     ),
   );
-  const backlogIssuesPromise: Promise<Map<string, ProjectIssue[]>> =
-    backlogRepos.size
-      ? fetchBacklogIssues(
-          [...backlogRepos.entries()].map(([repoAddress, backlogProject]) => ({
-            repoAddress,
-            backlogProject,
-          })),
-        )
-      : Promise.resolve(new Map());
-  // Relay issue events are only consumed for non-Backlog repos; skip the kind
-  // entirely when every repo is Backlog-tracked.
-  const hasRelayIssueRepos = repoAddresses.some(
+  const backlogTrackedRepos = [...backlogRepos.entries()].map(
+    ([repoAddress, backlogProject]) => ({ repoAddress, backlogProject }),
+  );
+  const buzzIssueRepoAddresses = repoAddresses.filter(
     (address) => !backlogRepos.has(address),
   );
-  const [rootResult, updateResult, commentResult, statusResult, backlogResult] =
-    await Promise.allSettled([
-      fetchEvents({
-        kinds: hasRelayIssueRepos
-          ? [KIND_GIT_ISSUE, KIND_GIT_PULL_REQUEST]
-          : [KIND_GIT_PULL_REQUEST],
-        "#a": repoAddresses,
-        limit: 2_000,
-      }),
-      fetchEvents({
-        kinds: [KIND_GIT_PR_UPDATE],
-        "#a": repoAddresses,
-        limit: 2_000,
-      }),
-      fetchEvents({
-        kinds: [KIND_TEXT_NOTE],
-        "#a": repoAddresses,
-        limit: 2_000,
-      }),
-      fetchEvents({
-        kinds: [
-          KIND_GIT_STATUS_OPEN,
-          KIND_GIT_STATUS_MERGED,
-          KIND_GIT_STATUS_CLOSED,
-          KIND_GIT_STATUS_DRAFT,
-        ],
-        "#a": repoAddresses,
-        limit: 2_000,
-      }),
-      backlogIssuesPromise,
-    ]);
+  // Repos hosted on GitHub get pull requests from the GitHub API instead of
+  // relay NIP-34 events.
+  const githubRepos = new Map(
+    projects.flatMap((project) =>
+      project.repositories.flatMap((repository) =>
+        repository.githubRepo
+          ? [[repository.repoAddress, repository.githubRepo] as const]
+          : [],
+      ),
+    ),
+  );
+  const githubTrackedRepos = [...githubRepos.entries()].map(
+    ([repoAddress, githubRepo]) => ({ repoAddress, githubRepo }),
+  );
+  const relayPrRepoAddresses = repoAddresses.filter(
+    (address) => !githubRepos.has(address),
+  );
+  const [
+    issueRootResult,
+    prRootResult,
+    updateResult,
+    commentResult,
+    statusResult,
+    backlogResult,
+    githubResult,
+  ] = await Promise.allSettled([
+    buzzIssueRepoAddresses.length
+      ? fetchEvents({
+          kinds: [KIND_GIT_ISSUE],
+          "#a": buzzIssueRepoAddresses,
+          limit: 2_000,
+        })
+      : Promise.resolve<RelayEvent[]>([]),
+    relayPrRepoAddresses.length
+      ? fetchEvents({
+          kinds: [KIND_GIT_PULL_REQUEST],
+          "#a": relayPrRepoAddresses,
+          limit: 2_000,
+        })
+      : Promise.resolve<RelayEvent[]>([]),
+    fetchEvents({
+      kinds: [KIND_GIT_PR_UPDATE],
+      "#a": repoAddresses,
+      limit: 2_000,
+    }),
+    fetchEvents({
+      kinds: [KIND_TEXT_NOTE],
+      "#a": repoAddresses,
+      limit: 2_000,
+    }),
+    fetchEvents({
+      kinds: [
+        KIND_GIT_STATUS_OPEN,
+        KIND_GIT_STATUS_MERGED,
+        KIND_GIT_STATUS_CLOSED,
+        KIND_GIT_STATUS_DRAFT,
+      ],
+      "#a": repoAddresses,
+      limit: 2_000,
+    }),
+    fetchBacklogIssues(backlogTrackedRepos),
+    fetchGithubPullRequests(githubTrackedRepos),
+  ]);
 
-  if (rootResult.status === "rejected") {
-    throw rootResult.reason instanceof Error
-      ? rootResult.reason
-      : new Error("Could not load project issues and pull requests.");
+  for (const rootResult of [issueRootResult, prRootResult]) {
+    if (rootResult.status === "rejected") {
+      throw rootResult.reason instanceof Error
+        ? rootResult.reason
+        : new Error("Could not load project issues and pull requests.");
+    }
   }
 
   const updateEvents =
@@ -160,21 +190,31 @@ export async function fetchProjectsWorkItems<TProject extends ProjectReference>(
     commentResult.status === "fulfilled" ? commentResult.value : [];
   const statusEvents =
     statusResult.status === "fulfilled" ? statusResult.value : [];
-  const rootsByRepo = groupByRepoAddress(rootResult.value);
+  const rootsByRepo = groupByRepoAddress([
+    ...(issueRootResult.status === "fulfilled" ? issueRootResult.value : []),
+    ...(prRootResult.status === "fulfilled" ? prRootResult.value : []),
+  ]);
   const updatesByRepo = groupByRepoAddress(updateEvents);
   const commentsByRepo = groupByRepoAddress(commentEvents);
   const statusesByRepo = groupByRepoAddress(statusEvents);
 
+  const githubPullsByRepo =
+    githubResult.status === "fulfilled"
+      ? githubResult.value
+      : new Map<string, ProjectPullRequest[]>();
   const pullRequests = projects
     .flatMap((project) =>
       project.repositories.flatMap((repository) =>
-        projectPullRequestEventsToPullRequests(
-          (rootsByRepo.get(repository.repoAddress) ?? []).filter(
-            (event) => event.kind === KIND_GIT_PULL_REQUEST,
-          ),
-          updatesByRepo.get(repository.repoAddress) ?? [],
-          commentsByRepo.get(repository.repoAddress) ?? [],
-          statusesByRepo.get(repository.repoAddress) ?? [],
+        (repository.githubRepo
+          ? (githubPullsByRepo.get(repository.repoAddress) ?? [])
+          : projectPullRequestEventsToPullRequests(
+              (rootsByRepo.get(repository.repoAddress) ?? []).filter(
+                (event) => event.kind === KIND_GIT_PULL_REQUEST,
+              ),
+              updatesByRepo.get(repository.repoAddress) ?? [],
+              commentsByRepo.get(repository.repoAddress) ?? [],
+              statusesByRepo.get(repository.repoAddress) ?? [],
+            )
         ).map((pullRequest) => ({ project, pullRequest, repository })),
       ),
     )
@@ -244,6 +284,9 @@ export async function fetchProjectsWorkItems<TProject extends ProjectReference>(
   const pullRequestFailedSections = [...sharedFailedSections];
   if (updateResult.status === "rejected") {
     pullRequestFailedSections.unshift("pull-request-updates");
+  }
+  if (githubResult.status === "rejected") {
+    pullRequestFailedSections.unshift("github-pull-requests");
   }
   const issueFailedSections = [...sharedFailedSections];
   if (backlogResult.status === "rejected") {

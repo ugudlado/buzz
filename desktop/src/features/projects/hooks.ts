@@ -6,6 +6,7 @@ import {
   createBacklogIssueComment,
   fetchBacklogIssuesForRepos,
 } from "@/features/projects/backlogIssues";
+import { fetchGithubPullRequestsForRepos } from "@/features/projects/githubPullRequests";
 import { getRelaySelf } from "@/features/moderation/lib/relaySelf";
 import { getCachedRelayOrigin } from "@/shared/lib/mediaUrl";
 import { signRelayEvent } from "@/shared/api/tauri";
@@ -266,6 +267,12 @@ async function fetchProjectIssues(
 async function fetchProjectPullRequests(
   project: Repository,
 ): Promise<ProjectPullRequest[]> {
+  if (project.githubRepo) {
+    const byRepo = await fetchGithubPullRequestsForRepos([
+      { githubRepo: project.githubRepo, repoAddress: project.repoAddress },
+    ]);
+    return byRepo.get(project.repoAddress) ?? [];
+  }
   const [pullRequestEvents, updateEvents, commentEvents, statusEvents] =
     await Promise.all([
       relayClient.fetchEvents({
