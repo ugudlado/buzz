@@ -27,7 +27,7 @@ mod agent_tts_routing;
 pub mod agent_voice;
 pub mod agents;
 pub mod audio_output;
-mod commands;
+pub(crate) mod commands;
 pub mod jitter;
 pub mod models;
 pub mod pipeline;
@@ -43,7 +43,7 @@ pub mod tts;
 pub mod tts_settings;
 mod tts_voice_import;
 mod tts_voice_registry;
-mod window;
+pub(crate) mod window;
 pub mod wire;
 
 // ── Shared utilities ──────────────────────────────────────────────────────────
@@ -68,13 +68,7 @@ pub(super) fn drain_until_shutdown<T>(
 
 // ── Re-exports ────────────────────────────────────────────────────────────────
 
-pub use commands::{
-    interrupt_huddle_speech, remove_agent_from_huddle, set_huddle_manual_mic_unmuted,
-};
 pub use state::{HuddleJoinInfo, HuddlePhase, HuddleState, VoiceInputMode};
-pub use transcription::{set_huddle_transcription_enabled, start_stt_pipeline};
-pub use tts_settings::set_tts_enabled;
-pub use window::{close_huddle_companion, open_huddle_window};
 
 // ── Imports ───────────────────────────────────────────────────────────────────
 
@@ -88,7 +82,6 @@ use agent_tts_routing::{
     classify_agent_tts_runtime, enqueue_agent_tts_text, normalize_agent_tts_text,
     AgentTtsRuntimeGate,
 };
-pub use pipeline::check_pipeline_hotstart;
 use pipeline::{
     await_inflight_tts_start, maybe_start_stt_pipeline, maybe_start_tts_pipeline,
     post_connect_setup, start_auto_enabled_transcription, PostConnectOutcome,

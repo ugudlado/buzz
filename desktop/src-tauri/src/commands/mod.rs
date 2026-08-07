@@ -42,7 +42,7 @@ mod notifications;
 mod observer_archive;
 mod os_idle;
 pub mod pairing;
-mod personas;
+pub(crate) mod personas;
 mod prevent_sleep;
 mod profile;
 mod project_git;

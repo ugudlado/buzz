@@ -10,30 +10,11 @@ use crate::commands;
 use crate::commands::*;
 use crate::deep_link;
 use crate::huddle;
-use crate::huddle::audio_output::{
-    get_audio_output_device, list_audio_output_devices, set_audio_output_device,
-};
-use crate::huddle::reconnect::reconnect_huddle_audio;
-use crate::huddle::{
-    add_agent_to_huddle, check_pipeline_hotstart, close_huddle_companion, confirm_huddle_active,
-    download_voice_models, end_huddle, get_huddle_agent_pubkeys, get_huddle_state,
-    get_model_status, get_voice_input_mode, interrupt_huddle_speech, join_huddle, leave_huddle,
-    open_huddle_window, push_audio_pcm, remove_agent_from_huddle, set_huddle_manual_mic_unmuted,
-    set_huddle_transcription_enabled, set_tts_enabled, set_voice_input_mode, speak_agent_message,
-    start_huddle, start_stt_pipeline,
-};
-use crate::initial_window::*;
 #[cfg(target_os = "macos")]
 use crate::macos_notifications;
 use crate::managed_agents;
-use crate::managed_agents::{
-    backfill_persona_snapshots, list_managed_agent_runtimes, put_managed_agent_runtime_lifecycle,
-    reconcile_managed_agent_runtimes, restart_managed_agent_runtime, start_managed_agent_runtime,
-    stop_managed_agent_runtime,
-};
 #[cfg(not(feature = "mesh-llm"))]
 use crate::mesh_llm_stubs::*;
-use crate::shutdown::shut_down_app;
 use crate::terminal_runtime;
 #[cfg(target_os = "macos")]
 use crate::tray_menu;
@@ -246,15 +227,15 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         discover_backend_providers,
         probe_backend_provider,
         list_personas,
-        create_persona,
-        import_orchestrator_pack,
-        pick_orchestrator_pack_directory,
-        update_persona,
-        update_persona_and_publish,
+        commands::personas::create::create_persona,
+        commands::personas::orchestrator_import::import_orchestrator_pack,
+        commands::personas::orchestrator_import::pick_orchestrator_pack_directory,
+        commands::personas::update::update_persona,
+        commands::personas::sharing::update_persona_and_publish,
         delete_persona,
         set_persona_active,
-        set_persona_shared,
-        reconcile_inbound_persona_event,
+        commands::personas::sharing::set_persona_shared,
+        commands::personas::inbound::reconcile_inbound_persona_event,
         list_channel_templates,
         create_channel_template,
         update_channel_template,
@@ -264,16 +245,16 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         create_team,
         update_team,
         delete_team,
-        export_agent_snapshot,
+        commands::personas::snapshot::export_agent_snapshot,
         card_mint_key_status,
         card_mint_save_openai_key,
         mint_agent_card,
         save_agent_card,
         list_agent_cards,
         load_agent_card,
-        preview_agent_snapshot_import,
-        confirm_agent_snapshot_import,
-        encode_agent_snapshot_for_send,
+        commands::personas::snapshot::import::preview_agent_snapshot_import,
+        commands::personas::snapshot::import::confirm_agent_snapshot_import,
+        commands::personas::snapshot::encode_agent_snapshot_for_send,
         export_team_snapshot,
         encode_team_snapshot_for_send,
         preview_team_snapshot_import,
@@ -321,9 +302,9 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         huddle::agent_voice::set_huddle_agent_tts_enabled,
         huddle::agent_voice::set_huddle_agent_voice,
         huddle::speak_agent_message,
-        interrupt_huddle_speech,
+        huddle::commands::interrupt_huddle_speech,
         huddle::add_agent_to_huddle,
-        remove_agent_from_huddle,
+        huddle::commands::remove_agent_from_huddle,
         huddle::agents::sync_agents_to_active_huddle,
         huddle::pipeline::check_pipeline_hotstart,
         huddle::confirm_huddle_active,
@@ -331,7 +312,7 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         huddle::get_huddle_agent_pubkeys,
         huddle::set_voice_input_mode,
         huddle::get_voice_input_mode,
-        set_huddle_manual_mic_unmuted,
+        huddle::commands::set_huddle_manual_mic_unmuted,
         huddle::audio_output::list_audio_output_devices,
         huddle::audio_output::set_audio_output_device,
         huddle::audio_output::get_audio_output_device,

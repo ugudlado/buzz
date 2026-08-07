@@ -29,15 +29,10 @@ fn trim_optional(value: Option<String>) -> Option<String> {
 mod pending;
 pub(in crate::commands) use pending::retain_persona_pending;
 pub(super) use pending::tombstone_persona_pending;
-mod create;
-pub use create::create_persona;
-mod sharing;
-pub use sharing::set_persona_shared;
-pub use sharing::update_persona_and_publish;
-mod update;
-pub use update::update_persona;
-mod inbound;
-pub use inbound::reconcile_inbound_persona_event;
+pub(crate) mod create;
+pub(crate) mod inbound;
+pub(crate) mod sharing;
+pub(crate) mod update;
 
 #[tauri::command]
 pub async fn list_personas(app: AppHandle) -> Result<Vec<AgentDefinition>, String> {
@@ -307,7 +302,7 @@ pub async fn set_persona_active(
 
 pub(crate) const PNG_MAGIC: [u8; 4] = [0x89, 0x50, 0x4E, 0x47];
 mod card;
-mod snapshot;
+pub(crate) mod snapshot;
 pub use card::*;
 #[cfg(test)]
 pub(crate) use snapshot::import::decode_snapshot_from_bytes;
@@ -315,5 +310,3 @@ pub(crate) use snapshot::import::{
     parse_snapshot_payload_from_bytes, resolve_snapshot_import_behavior, MAX_SNAPSHOT_JSON_BYTES,
     MAX_SNAPSHOT_PNG_BYTES,
 };
-pub use snapshot::{confirm_agent_snapshot_import, preview_agent_snapshot_import};
-pub use snapshot::{encode_agent_snapshot_for_send, export_agent_snapshot};
