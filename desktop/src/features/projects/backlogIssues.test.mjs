@@ -10,7 +10,6 @@ import {
   fetchBacklogIssuesForRepos,
 } from "./backlogIssues.ts";
 
-const CONNECTION = { baseUrl: "http://localhost:4321/", token: "bklg_test" };
 const REPO_A = "30617:aaa:one";
 const REPO_B = "30617:bbb:two";
 
@@ -19,26 +18,12 @@ const TASK = {
   displayId: "ORC-12",
   title: "Fix the thing",
   status: "In Progress",
-  assignee: { id: "u1", name: "spidey" },
+  assignee: { name: "spidey" },
   createdDate: "2026-08-01T00:00:00.000Z",
   updatedDate: "2026-08-02T00:00:00.000Z",
   labels: ["bug"],
   description: "It is broken.",
 };
-
-function fakeFetch(handler) {
-  const calls = [];
-  const impl = async (url, init) => {
-    calls.push({ url, init });
-    const body = handler(url, init);
-    return {
-      ok: true,
-      status: 200,
-      json: async () => body,
-    };
-  };
-  return { calls, impl };
-}
 
 test("status mapping covers the default backlog ramp", () => {
   assert.equal(backlogStatusToIssueStatus("To Do"), "Backlog");
@@ -66,55 +51,49 @@ test("task maps to ProjectIssue with a synthetic id", () => {
 });
 
 test("fetch groups repos by backlog project (one request per project)", async () => {
-  const { calls, impl } = fakeFetch(() => [TASK]);
+  const calls = [];
   const byRepo = await fetchBacklogIssuesForRepos(
     [
       { repoAddress: REPO_A, backlogProject: "guid-1" },
       { repoAddress: REPO_B, backlogProject: "guid-1" },
     ],
-    { connection: CONNECTION, fetchImpl: impl },
+    async (projectGuid) => {
+      calls.push(projectGuid);
+      return [TASK];
+    },
   );
-  assert.equal(calls.length, 1);
-  assert.equal(calls[0].url, "http://localhost:4321/api/projects/guid-1/tasks");
-  assert.equal(calls[0].init.headers.Authorization, "Bearer bklg_test");
+  assert.deepEqual(calls, ["guid-1"]);
   assert.equal(byRepo.get(REPO_A).length, 1);
   assert.equal(byRepo.get(REPO_B).length, 1);
 });
 
-test("create issue posts to the nested route and returns synthetic id", async () => {
-  const { calls, impl } = fakeFetch(() => ({ id: "task-9" }));
+test("create issue passes trimmed description and returns synthetic id", async () => {
+  const calls = [];
   const id = await createBacklogIssue(
     "guid-1",
     { title: "New", body: "  Body  " },
-    { connection: CONNECTION, fetchImpl: impl },
+    async (projectGuid, title, description) => {
+      calls.push({ description, projectGuid, title });
+      return { id: "task-9" };
+    },
   );
   assert.equal(id, "backlog:task-9");
-  assert.equal(calls[0].url, "http://localhost:4321/api/projects/guid-1/tasks");
-  assert.deepEqual(JSON.parse(calls[0].init.body), {
-    title: "New",
-    description: "Body",
-  });
+  assert.deepEqual(calls, [
+    { description: "Body", projectGuid: "guid-1", title: "New" },
+  ]);
 });
 
-test("comment posts body to the task comments route", async () => {
-  const { calls, impl } = fakeFetch(() => ({}));
-  await createBacklogIssueComment("guid-1", "backlog:task-9", "hello", {
-    connection: CONNECTION,
-    fetchImpl: impl,
-  });
-  assert.equal(
-    calls[0].url,
-    "http://localhost:4321/api/projects/guid-1/tasks/task-9/comments",
+test("comment resolves the task id from the synthetic issue id", async () => {
+  const calls = [];
+  await createBacklogIssueComment(
+    "guid-1",
+    "backlog:task-9",
+    "hello",
+    async (projectGuid, taskId, body) => {
+      calls.push({ body, projectGuid, taskId });
+    },
   );
-  assert.deepEqual(JSON.parse(calls[0].init.body), { body: "hello" });
-});
-
-test("missing connection rejects with a clear error", async () => {
-  await assert.rejects(
-    fetchBacklogIssuesForRepos(
-      [{ repoAddress: REPO_A, backlogProject: "guid-1" }],
-      {},
-    ),
-    /Backlog is not connected/,
-  );
+  assert.deepEqual(calls, [
+    { body: "hello", projectGuid: "guid-1", taskId: "task-9" },
+  ]);
 });

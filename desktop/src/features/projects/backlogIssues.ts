@@ -2,50 +2,53 @@
 //
 // A repository opts in via a `buzz-issue-tracker` tag on its kind:30617
 // announcement: ["buzz-issue-tracker", "backlog", "<backlog project guid>"].
-// Reads/writes go to a Backlog server (~/code/backlog) over its project-nested
-// REST API (`/api/projects/{guid}/tasks…`, bearer `bklg_` token). Tasks are
-// mapped into the existing `ProjectIssue` shape so every issue surface renders
-// them unchanged; ids are prefixed `backlog:` so they can never collide with
-// 64-hex Nostr event ids in `${repoAddress}:${issue.id}` dedupe keys.
+// All HTTP happens in Rust (`commands/backlog.rs`) with the user token in the
+// OS keyring; this module maps raw task rows into the existing `ProjectIssue`
+// shape so every issue surface renders them unchanged. Ids are prefixed
+// `backlog:` so they can never collide with 64-hex Nostr event ids in
+// `${repoAddress}:${issue.id}` dedupe keys.
 
 import {
-  getStorageItem,
-  removeStorageItem,
-  setStorageItem,
-} from "@/shared/lib/safeStorage";
-
+  connectBacklog,
+  createBacklogTask,
+  createBacklogTaskComment,
+  getBacklogStatus,
+  listBacklogTasks,
+} from "@/shared/api/tauriBacklog";
 import type { ProjectIssue, ProjectIssueStatus } from "./projectIssues.mjs";
 
-/** Connection to a Backlog server (user-scoped, one per app). */
-export type BacklogConnection = {
-  baseUrl: string;
-  token: string;
-};
+/** Pre-keyring storage key (Slice 1) — migrated to Rust on first use. */
+const LEGACY_CONNECTION_KEY = "buzz-backlog-connection.v1";
 
-const CONNECTION_KEY = "buzz-backlog-connection.v1";
-
-/** Read the stored Backlog connection (null when not configured). */
-export function getBacklogConnection(): BacklogConnection | null {
-  if (typeof window === "undefined") return null;
-  const raw = getStorageItem(CONNECTION_KEY);
-  if (!raw) return null;
-  try {
-    const parsed = JSON.parse(raw) as Partial<BacklogConnection>;
-    if (!parsed.baseUrl || !parsed.token) return null;
-    return { baseUrl: parsed.baseUrl, token: parsed.token };
-  } catch {
-    return null;
-  }
-}
-
-/** Store (or clear with null) the Backlog connection. */
-export function setBacklogConnection(connection: BacklogConnection | null) {
+/**
+ * One-time migration: Slice 1 kept `{baseUrl, token}` in localStorage. Move
+ * it into the OS keyring via `backlog_connect` and delete the plaintext copy.
+ * Safe to call repeatedly; no-ops once localStorage is clean.
+ */
+export async function migrateLegacyBacklogConnection(): Promise<void> {
   if (typeof window === "undefined") return;
-  if (!connection) {
-    removeStorageItem(CONNECTION_KEY);
+  type LegacyConnection = { baseUrl?: string; token?: string };
+  let legacy: LegacyConnection | null = null;
+  try {
+    const raw = window.localStorage.getItem(LEGACY_CONNECTION_KEY);
+    legacy = raw ? (JSON.parse(raw) as LegacyConnection) : null;
+  } catch {
+    legacy = null;
+  }
+  if (!legacy?.baseUrl || !legacy.token) {
+    window.localStorage.removeItem(LEGACY_CONNECTION_KEY);
     return;
   }
-  setStorageItem(CONNECTION_KEY, JSON.stringify(connection));
+  try {
+    const status = await getBacklogStatus();
+    if (!status.connected) {
+      await connectBacklog({ baseUrl: legacy.baseUrl, token: legacy.token });
+    }
+    window.localStorage.removeItem(LEGACY_CONNECTION_KEY);
+  } catch {
+    // Keyring/connect unavailable (e.g. server down) — keep the legacy copy
+    // so a later attempt can still migrate it.
+  }
 }
 
 /** Synthetic issue-id namespace for Backlog tasks. */
@@ -68,39 +71,6 @@ export type BacklogTask = {
   labels: string[];
   description?: string;
 };
-
-type BacklogDeps = {
-  connection?: BacklogConnection;
-  fetchImpl?: typeof fetch;
-};
-
-async function backlogRequest(
-  path: string,
-  init: RequestInit,
-  deps?: BacklogDeps,
-): Promise<Response> {
-  const connection = deps?.connection ?? getBacklogConnection();
-  if (!connection) {
-    throw new Error(
-      "Backlog is not connected. Set the Backlog server URL and token first.",
-    );
-  }
-  const fetchImpl = deps?.fetchImpl ?? fetch;
-  const base = connection.baseUrl.replace(/\/+$/, "");
-  const response = await fetchImpl(`${base}${path}`, {
-    ...init,
-    headers: {
-      Accept: "application/json",
-      Authorization: `Bearer ${connection.token}`,
-      ...(init.body ? { "Content-Type": "application/json" } : {}),
-      ...init.headers,
-    },
-  });
-  if (!response.ok) {
-    throw new Error(`Backlog request failed (${response.status}): ${path}`);
-  }
-  return response;
-}
 
 /** Map a Backlog status string onto the project-issue status ramp. */
 export function backlogStatusToIssueStatus(status: string): ProjectIssueStatus {
@@ -150,14 +120,18 @@ type BacklogTrackedRepository = {
 };
 
 /**
- * Fetch issues for Backlog-tracked repositories, one GET per distinct Backlog
- * project (repos sharing a project share the request). Returns issues keyed by
- * repoAddress.
+ * Fetch issues for Backlog-tracked repositories, one request per distinct
+ * Backlog project (repos sharing a project share the request). Returns issues
+ * keyed by repoAddress.
  */
 export async function fetchBacklogIssuesForRepos(
   repos: BacklogTrackedRepository[],
-  deps?: BacklogDeps,
+  listTasks: typeof listBacklogTasks = listBacklogTasks,
 ): Promise<Map<string, ProjectIssue[]>> {
+  const result = new Map<string, ProjectIssue[]>();
+  if (repos.length === 0) return result;
+  await migrateLegacyBacklogConnection();
+
   const reposByProject = new Map<string, BacklogTrackedRepository[]>();
   for (const repo of repos) {
     const group = reposByProject.get(repo.backlogProject) ?? [];
@@ -165,15 +139,9 @@ export async function fetchBacklogIssuesForRepos(
     reposByProject.set(repo.backlogProject, group);
   }
 
-  const result = new Map<string, ProjectIssue[]>();
   await Promise.all(
     [...reposByProject.entries()].map(async ([project, projectRepos]) => {
-      const response = await backlogRequest(
-        `/api/projects/${encodeURIComponent(project)}/tasks`,
-        { method: "GET" },
-        deps,
-      );
-      const tasks = (await response.json()) as BacklogTask[];
+      const tasks = (await listTasks(project)) as BacklogTask[];
       for (const repo of projectRepos) {
         result.set(
           repo.repoAddress,
@@ -191,20 +159,13 @@ export async function fetchBacklogIssuesForRepos(
 export async function createBacklogIssue(
   backlogProject: string,
   input: { title: string; body: string },
-  deps?: BacklogDeps,
+  createTask: typeof createBacklogTask = createBacklogTask,
 ): Promise<string> {
-  const response = await backlogRequest(
-    `/api/projects/${encodeURIComponent(backlogProject)}/tasks`,
-    {
-      method: "POST",
-      body: JSON.stringify({
-        title: input.title,
-        ...(input.body.trim() ? { description: input.body.trim() } : {}),
-      }),
-    },
-    deps,
+  const task = await createTask(
+    backlogProject,
+    input.title,
+    input.body.trim() || undefined,
   );
-  const task = (await response.json()) as { id: string };
   return `${BACKLOG_ISSUE_ID_PREFIX}${task.id}`;
 }
 
@@ -213,11 +174,7 @@ export async function createBacklogIssueComment(
   backlogProject: string,
   issueId: string,
   body: string,
-  deps?: BacklogDeps,
+  createComment: typeof createBacklogTaskComment = createBacklogTaskComment,
 ): Promise<void> {
-  await backlogRequest(
-    `/api/projects/${encodeURIComponent(backlogProject)}/tasks/${encodeURIComponent(backlogTaskIdFromIssueId(issueId))}/comments`,
-    { method: "POST", body: JSON.stringify({ body }) },
-    deps,
-  );
+  await createComment(backlogProject, backlogTaskIdFromIssueId(issueId), body);
 }

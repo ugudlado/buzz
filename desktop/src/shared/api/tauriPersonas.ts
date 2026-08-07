@@ -19,6 +19,7 @@ export type RawPersona = {
   is_active?: boolean;
   shared?: boolean;
   source_team?: string | null;
+  source_team_persona_slug?: string | null;
   /**
    * Provenance of a local copy of another owner's catalog entry. Serialized by
    * the backend `CatalogSource` in snake_case; the create payload sends the
@@ -49,6 +50,7 @@ export function fromRawPersona(persona: RawPersona): AgentPersona {
     isActive: persona.is_active ?? true,
     shared: persona.shared ?? false,
     sourceTeam: persona.source_team ?? null,
+    sourceTeamPersonaSlug: persona.source_team_persona_slug ?? null,
     catalogSource: persona.catalog_source
       ? {
           ownerPubkey: persona.catalog_source.owner_pubkey,

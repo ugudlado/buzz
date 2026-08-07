@@ -1,22 +1,39 @@
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import * as React from "react";
 import { toast } from "sonner";
 
-import {
-  getBacklogConnection,
-  setBacklogConnection,
-} from "@/features/projects/backlogIssues";
+import { migrateLegacyBacklogConnection } from "@/features/projects/backlogIssues";
 import type { Repository } from "@/features/projects/hooks";
 import { PROJECT_FORM_FIELD_CLASS } from "@/features/projects/ui/projectPanelStyles";
 import { useSetRepositoryIssueTrackerMutation } from "@/features/projects/useSetRepositoryIssueTracker";
+import {
+  connectBacklog,
+  disconnectBacklog,
+  getBacklogStatus,
+  listBacklogProjects,
+  provisionBacklogAgentEnv,
+} from "@/shared/api/tauriBacklog";
+import { listPersonas, updatePersona } from "@/shared/api/tauriPersonas";
 import { Button } from "@/shared/ui/button";
 import { ChooserDialogContent } from "@/shared/ui/chooser-dialog-content";
 import { Dialog } from "@/shared/ui/dialog";
 import { Input } from "@/shared/ui/input";
 
+export const backlogConnectionQueryKey = ["backlog-connection"] as const;
+export const backlogProjectsQueryKey = ["backlog-projects"] as const;
+
+// Identity of the pack-generated coordinator persona (kept in sync with
+// buzz-workflow's ORCHESTRATOR_STEP_ID and the desktop import's source team).
+const ORCHESTRATOR_SOURCE_TEAM = "orchestrator-pack";
+const ORCHESTRATOR_SLUG = "orchestrator";
+/** Backlog-side agent identity Buzz provisions tokens for. */
+const BACKLOG_AGENT_NAME = "buzz-orchestrator";
+
 /**
  * Choose where a repository's issues live: Buzz-native NIP-34 events, or a
- * Backlog project. Saving Backlog also stores the app-wide Backlog connection
- * (server URL + token) used by the issue provider.
+ * Backlog project. Handles the Backlog connection (login or token → OS
+ * keyring via Rust), lists projects for guid-free binding, and can provision
+ * a project-pinned agent token onto the Orchestrator persona's env.
  */
 export function RepositoryIssueTrackerDialog({
   onOpenChange,
@@ -27,10 +44,11 @@ export function RepositoryIssueTrackerDialog({
   open: boolean;
   repository: Repository;
 }) {
+  const queryClient = useQueryClient();
   const mutation = useSetRepositoryIssueTrackerMutation();
   const [kind, setKind] = React.useState<"buzz" | "backlog">("buzz");
   const [backlogProject, setBacklogProject] = React.useState("");
-  const [baseUrl, setBaseUrl] = React.useState("");
+  const [baseUrl, setBaseUrl] = React.useState("http://localhost:4321");
   const [token, setToken] = React.useState("");
 
   const trackerKind = repository.issueTracker.kind;
@@ -38,23 +56,99 @@ export function RepositoryIssueTrackerDialog({
     repository.issueTracker.kind === "backlog"
       ? repository.issueTracker.project
       : "";
+  const [email, setEmail] = React.useState("");
+  const [password, setPassword] = React.useState("");
+
+  const statusQuery = useQuery({
+    enabled: open,
+    queryFn: async () => {
+      await migrateLegacyBacklogConnection();
+      return getBacklogStatus();
+    },
+    queryKey: backlogConnectionQueryKey,
+  });
+  const connected = statusQuery.data?.connected === true;
+  const projectsQuery = useQuery({
+    enabled: open && kind === "backlog" && connected,
+    queryFn: listBacklogProjects,
+    queryKey: backlogProjectsQueryKey,
+  });
+
   React.useEffect(() => {
     if (!open) return;
     setKind(trackerKind);
     setBacklogProject(trackerProject);
-    const stored = getBacklogConnection();
-    setBaseUrl(stored?.baseUrl ?? "");
-    setToken(stored?.token ?? "");
   }, [open, trackerKind, trackerProject]);
+
+  function refreshConnection() {
+    void queryClient.invalidateQueries({ queryKey: backlogConnectionQueryKey });
+    void queryClient.invalidateQueries({ queryKey: backlogProjectsQueryKey });
+  }
+
+  const connectMutation = useMutation({
+    mutationFn: () =>
+      connectBacklog({
+        baseUrl,
+        ...(token.trim()
+          ? { token: token.trim() }
+          : { email: email.trim(), password }),
+      }),
+    onError: (error: Error) => toast.error(error.message),
+    onSuccess: (status) => {
+      toast.success(`Connected to Backlog as ${status.userName || "unknown"}.`);
+      setToken("");
+      setPassword("");
+      refreshConnection();
+    },
+  });
+  const disconnectMutation = useMutation({
+    mutationFn: disconnectBacklog,
+    onError: (error: Error) => toast.error(error.message),
+    onSuccess: () => {
+      toast.success("Backlog disconnected.");
+      refreshConnection();
+    },
+  });
+  const provisionMutation = useMutation({
+    mutationFn: async () => {
+      if (!backlogProject) throw new Error("Choose a Backlog project first.");
+      const env = await provisionBacklogAgentEnv(
+        BACKLOG_AGENT_NAME,
+        backlogProject,
+      );
+      const personas = await listPersonas();
+      const orchestrator = personas.find(
+        (persona) =>
+          persona.sourceTeam === ORCHESTRATOR_SOURCE_TEAM &&
+          persona.sourceTeamPersonaSlug === ORCHESTRATOR_SLUG,
+      );
+      if (!orchestrator) {
+        throw new Error(
+          "No Orchestrator persona found. Import the orchestrator pack first.",
+        );
+      }
+      await updatePersona({
+        displayName: orchestrator.displayName,
+        envVars: { ...orchestrator.envVars, ...env },
+        id: orchestrator.id,
+        model: orchestrator.model ?? undefined,
+        provider: orchestrator.provider ?? undefined,
+        runtime: orchestrator.runtime ?? undefined,
+        systemPrompt: orchestrator.systemPrompt,
+      });
+      return orchestrator.displayName;
+    },
+    onError: (error: Error) => toast.error(error.message),
+    onSuccess: (name) => {
+      toast.success(`Backlog agent token provisioned onto ${name}.`);
+    },
+  });
 
   async function handleSave(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     try {
-      if (kind === "backlog") {
-        if (!baseUrl.trim() || !token.trim()) {
-          throw new Error("Backlog server URL and token are required.");
-        }
-        setBacklogConnection({ baseUrl: baseUrl.trim(), token: token.trim() });
+      if (kind === "backlog" && !connected) {
+        throw new Error("Connect Backlog first.");
       }
       await mutation.mutateAsync({
         issueTracker:
@@ -78,6 +172,12 @@ export function RepositoryIssueTrackerDialog({
     }
   }
 
+  const busy =
+    mutation.isPending ||
+    connectMutation.isPending ||
+    disconnectMutation.isPending ||
+    provisionMutation.isPending;
+
   return (
     <Dialog onOpenChange={onOpenChange} open={open}>
       <ChooserDialogContent
@@ -85,7 +185,7 @@ export function RepositoryIssueTrackerDialog({
         footer={
           <div className="flex w-full justify-end gap-2">
             <Button
-              disabled={mutation.isPending}
+              disabled={busy}
               onClick={() => onOpenChange(false)}
               type="button"
               variant="ghost"
@@ -94,7 +194,7 @@ export function RepositoryIssueTrackerDialog({
             </Button>
             <Button
               data-testid="issue-tracker-save"
-              disabled={mutation.isPending}
+              disabled={busy || (kind === "backlog" && !backlogProject)}
               form="issue-tracker-form"
               type="submit"
             >
@@ -115,7 +215,7 @@ export function RepositoryIssueTrackerDialog({
             <select
               className={PROJECT_FORM_FIELD_CLASS}
               data-testid="issue-tracker-kind"
-              disabled={mutation.isPending}
+              disabled={busy}
               onChange={(event) =>
                 setKind(event.target.value === "backlog" ? "backlog" : "buzz")
               }
@@ -126,51 +226,121 @@ export function RepositoryIssueTrackerDialog({
             </select>
           </label>
           {kind === "backlog" ? (
-            <>
-              <label
-                className="block space-y-1.5 text-sm font-medium"
-                htmlFor="issue-tracker-backlog-project"
-              >
-                <span>Backlog project id</span>
-                <Input
-                  data-testid="issue-tracker-backlog-project"
-                  id="issue-tracker-backlog-project"
-                  disabled={mutation.isPending}
-                  onChange={(event) => setBacklogProject(event.target.value)}
-                  placeholder="Project guid"
-                  value={backlogProject}
-                />
-              </label>
-              <label
-                className="block space-y-1.5 text-sm font-medium"
-                htmlFor="issue-tracker-backlog-url"
-              >
-                <span>Backlog server URL</span>
-                <Input
-                  data-testid="issue-tracker-backlog-url"
-                  id="issue-tracker-backlog-url"
-                  disabled={mutation.isPending}
-                  onChange={(event) => setBaseUrl(event.target.value)}
-                  placeholder="http://localhost:4321"
-                  value={baseUrl}
-                />
-              </label>
-              <label
-                className="block space-y-1.5 text-sm font-medium"
-                htmlFor="issue-tracker-backlog-token"
-              >
-                <span>Backlog token</span>
-                <Input
-                  data-testid="issue-tracker-backlog-token"
-                  id="issue-tracker-backlog-token"
-                  disabled={mutation.isPending}
-                  onChange={(event) => setToken(event.target.value)}
-                  placeholder="bklg_…"
-                  type="password"
-                  value={token}
-                />
-              </label>
-            </>
+            connected ? (
+              <>
+                <div className="flex items-center justify-between rounded-lg border border-border/60 px-3 py-2 text-sm">
+                  <span data-testid="backlog-connected-as">
+                    Connected as{" "}
+                    <strong>{statusQuery.data?.userName || "unknown"}</strong>
+                  </span>
+                  <Button
+                    data-testid="backlog-disconnect"
+                    disabled={busy}
+                    onClick={() => disconnectMutation.mutate()}
+                    size="sm"
+                    type="button"
+                    variant="outline"
+                  >
+                    Disconnect
+                  </Button>
+                </div>
+                <label className="block space-y-1.5 text-sm font-medium">
+                  <span>Backlog project</span>
+                  <select
+                    className={PROJECT_FORM_FIELD_CLASS}
+                    data-testid="issue-tracker-backlog-project"
+                    disabled={busy || projectsQuery.isLoading}
+                    onChange={(event) => setBacklogProject(event.target.value)}
+                    value={backlogProject}
+                  >
+                    <option value="">
+                      {projectsQuery.isLoading
+                        ? "Loading projects…"
+                        : "Choose a project"}
+                    </option>
+                    {(projectsQuery.data ?? []).map((project) => (
+                      <option key={project.guid} value={project.guid}>
+                        {project.path}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <Button
+                  data-testid="backlog-provision-agent"
+                  disabled={busy || !backlogProject}
+                  onClick={() => provisionMutation.mutate()}
+                  size="sm"
+                  type="button"
+                  variant="outline"
+                >
+                  {provisionMutation.isPending
+                    ? "Provisioning…"
+                    : "Provision Orchestrator env"}
+                </Button>
+              </>
+            ) : (
+              <div className="space-y-2">
+                <label
+                  className="block space-y-1.5 text-sm font-medium"
+                  htmlFor="backlog-url"
+                >
+                  <span>Backlog server URL</span>
+                  <Input
+                    data-testid="backlog-url"
+                    disabled={busy}
+                    id="backlog-url"
+                    onChange={(event) => setBaseUrl(event.target.value)}
+                    placeholder="http://localhost:4321"
+                    value={baseUrl}
+                  />
+                </label>
+                <label
+                  className="block space-y-1.5 text-sm font-medium"
+                  htmlFor="backlog-token"
+                >
+                  <span>Token (or sign in below)</span>
+                  <Input
+                    data-testid="backlog-token"
+                    disabled={busy}
+                    id="backlog-token"
+                    onChange={(event) => setToken(event.target.value)}
+                    placeholder="bklg_…"
+                    type="password"
+                    value={token}
+                  />
+                </label>
+                {!token.trim() ? (
+                  <div className="grid grid-cols-2 gap-2">
+                    <Input
+                      aria-label="Backlog email"
+                      data-testid="backlog-email"
+                      disabled={busy}
+                      onChange={(event) => setEmail(event.target.value)}
+                      placeholder="Email"
+                      value={email}
+                    />
+                    <Input
+                      aria-label="Backlog password"
+                      data-testid="backlog-password"
+                      disabled={busy}
+                      onChange={(event) => setPassword(event.target.value)}
+                      placeholder="Password"
+                      type="password"
+                      value={password}
+                    />
+                  </div>
+                ) : null}
+                <Button
+                  data-testid="backlog-connect"
+                  disabled={busy}
+                  onClick={() => connectMutation.mutate()}
+                  size="sm"
+                  type="button"
+                >
+                  {connectMutation.isPending ? "Connecting…" : "Connect"}
+                </Button>
+              </div>
+            )
           ) : null}
         </form>
       </ChooserDialogContent>
