@@ -14,6 +14,29 @@ export type RepositoryIssueTracker =
   | { kind: "buzz" }
   | { kind: "backlog"; project: string };
 
+/** GitHub coordinates derived from a `https://github.com/<owner>/<repo>` clone URL. */
+export type GithubRepoRef = { owner: string; name: string };
+
+/** First clone URL that points at github.com, parsed to owner/name. */
+export function githubRepoFromCloneUrls(
+  cloneUrls: string[],
+): GithubRepoRef | null {
+  for (const cloneUrl of cloneUrls) {
+    try {
+      const url = new URL(cloneUrl);
+      if (url.protocol !== "https:" || url.host !== "github.com") continue;
+      const segments = url.pathname.split("/").filter(Boolean);
+      if (segments.length !== 2) continue;
+      const owner = segments[0] as string;
+      const name = (segments[1] as string).replace(/\.git$/, "");
+      if (owner && name) return { name, owner };
+    } catch {
+      // Not a URL — ignore.
+    }
+  }
+  return null;
+}
+
 export type Repository = {
   id: string;
   dtag: string;
@@ -28,6 +51,8 @@ export type Repository = {
   defaultBranch: string;
   repoAddress: string;
   issueTracker: RepositoryIssueTracker;
+  /** Set when the repository's canonical remote is a GitHub repo. */
+  githubRepo: GithubRepoRef | null;
   maintainers?: string[];
   channelId?: string | null;
   eventContent?: string;
@@ -287,6 +312,7 @@ export function eventToRepository(
       owner,
       dtag,
     ),
+    githubRepo: githubRepoFromCloneUrls(getCloneUrls(event)),
     webUrl: getTag(event, "web") ?? null,
     owner,
     contributors: [...new Set([...getAllTags(event, "p"), ...setupUsers])],

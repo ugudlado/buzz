@@ -17,6 +17,11 @@ import {
 } from "@/shared/ui/dropdown-menu";
 import { AddProjectRepositoryDialog } from "./AddProjectRepositoryDialog";
 import { AttachProjectRepositoryDialog } from "./AttachProjectRepositoryDialog";
+import {
+  GithubConnectionDialog,
+  useGithubConnectionQuery,
+} from "./GithubConnectionDialog";
+import { GitHubMark } from "./GitHubMark";
 import { ProjectRepositoryPicker } from "./ProjectRepositoryPicker";
 import { RepositoryIssueTrackerDialog } from "./RepositoryIssueTrackerDialog";
 
@@ -36,11 +41,15 @@ export function ProjectRepositoryManagement({
   const [createOpen, setCreateOpen] = React.useState(false);
   const [attachOpen, setAttachOpen] = React.useState(false);
   const [issueTrackerOpen, setIssueTrackerOpen] = React.useState(false);
+  const [githubOpen, setGithubOpen] = React.useState(false);
+  const githubConnection = useGithubConnectionQuery();
   const channelsQuery = useChannelsQuery();
   const createMutation = useAddProjectRepositoryMutation();
   const attachMutation = useAttachProjectRepositoryMutation();
   const repairMutation = useBindProjectRepositoryChannelMutation();
   const canEdit = identityPubkey?.toLowerCase() === project.owner.toLowerCase();
+  const isRepositoryOwner =
+    identityPubkey?.toLowerCase() === repository.owner.toLowerCase();
   const accessChannels = React.useMemo(
     () =>
       (channelsQuery.data ?? []).filter(
@@ -61,9 +70,7 @@ export function ProjectRepositoryManagement({
     (candidate) =>
       candidate && accessChannels.some((channel) => channel.id === candidate),
   );
-  const canManageAccess =
-    accessChannels.length > 0 &&
-    identityPubkey?.toLowerCase() === repository.owner.toLowerCase();
+  const canManageAccess = accessChannels.length > 0 && isRepositoryOwner;
   const attachCandidates = React.useMemo(() => {
     const currentAddresses = new Set(project.repositoryAddresses);
     const candidates = new Map<string, Repository>();
@@ -116,7 +123,28 @@ export function ProjectRepositoryManagement({
         project={project}
         repository={repository}
       />
-      {identityPubkey?.toLowerCase() === repository.owner.toLowerCase() ? (
+      {repository.githubRepo ? (
+        <>
+          <GithubConnectionDialog
+            onOpenChange={setGithubOpen}
+            open={githubOpen}
+          />
+          <Button
+            className="h-8 shrink-0 gap-1.5"
+            data-testid="github-connection"
+            onClick={() => setGithubOpen(true)}
+            size="sm"
+            type="button"
+            variant="outline"
+          >
+            <GitHubMark className="h-3.5 w-3.5" />
+            {githubConnection.data?.connected
+              ? (githubConnection.data.login ?? "GitHub")
+              : "Connect GitHub"}
+          </Button>
+        </>
+      ) : null}
+      {isRepositoryOwner ? (
         <>
           <RepositoryIssueTrackerDialog
             onOpenChange={setIssueTrackerOpen}

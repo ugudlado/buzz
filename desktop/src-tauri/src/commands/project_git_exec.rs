@@ -49,6 +49,9 @@ pub(crate) struct GitAuthConfig {
     credential_helper: Option<std::path::PathBuf>,
     nsec: String,
     allow_file_transport: bool,
+    /// GitHub token from the keyring, injected as an env-based auth header
+    /// for github.com remotes only (never reaches argv or the webview).
+    github_token: Option<String>,
 }
 
 fn read_pipe_lossy(pipe: Option<impl Read>) -> String {
@@ -169,6 +172,18 @@ fn configure_git_auth(command: &mut Command, auth: &GitAuthConfig, needs_credent
         ),
     ];
     if needs_credentials {
+        if let Some(token) = &auth.github_token {
+            // GitHub over https: env-based auth header (actions/checkout
+            // pattern) scoped to github.com so it can never leak to other
+            // remotes. GIT_CONFIG_* env vars keep it out of argv.
+            use base64::Engine as _;
+            let basic =
+                base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}"));
+            entries.push((
+                "http.https://github.com/.extraheader",
+                format!("AUTHORIZATION: basic {basic}"),
+            ));
+        }
         let Some(cred_helper) = &auth.credential_helper else {
             return apply_git_config(command, &entries);
         };
@@ -214,6 +229,7 @@ pub(crate) fn build_git_clone_auth_config(
             credential_helper: None,
             nsec: String::new(),
             allow_file_transport: false,
+            github_token: crate::commands::github::github_token(),
         });
     }
     build_git_auth_config(state)
@@ -231,6 +247,7 @@ pub(crate) fn build_git_auth_config_for_keys(keys: &Keys) -> Result<GitAuthConfi
         credential_helper,
         nsec,
         allow_file_transport: false,
+        github_token: None,
     })
 }
 

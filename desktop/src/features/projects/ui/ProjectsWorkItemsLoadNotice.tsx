@@ -6,6 +6,7 @@ import { Button } from "@/shared/ui/button";
 const SECTION_LABELS: Record<ProjectWorkItemSection, string> = {
   "backlog-issues": "Backlog issues",
   comments: "comments",
+  "github-pull-requests": "GitHub pull requests",
   "pull-request-updates": "pull request updates",
   statuses: "statuses",
 };

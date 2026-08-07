@@ -10523,6 +10523,9 @@ export function maybeInstallE2eTauriMocks() {
       deviceName: state === "running" ? "Mock desktop" : null,
     };
   };
+  let mockGithubConnection: { connected: boolean; login?: string } = {
+    connected: false,
+  };
   let mockImportedVoices: Array<{
     key: string;
     displayName: string;
@@ -11987,6 +11990,40 @@ export function maybeInstallE2eTauriMocks() {
         return handleCreatePersona(
           payload as Parameters<typeof handleCreatePersona>[0],
         );
+      case "github_connection_status":
+        return mockGithubConnection;
+      case "github_connect":
+      case "github_connect_from_gh_cli":
+        mockGithubConnection = { connected: true, login: "mock-octocat" };
+        return mockGithubConnection;
+      case "github_disconnect":
+        mockGithubConnection = { connected: false };
+        return null;
+      case "github_list_pull_requests": {
+        if (!mockGithubConnection.connected) {
+          throw new Error("GitHub is not connected. Connect it first.");
+        }
+        const { owner, repo } = payload as { owner: string; repo: string };
+        return [
+          {
+            number: 42,
+            title: "Add release workflow",
+            body: "Automates the release pipeline.",
+            author: "mock-octocat",
+            state: "open",
+            draft: false,
+            merged: false,
+            headRef: "release-workflow",
+            baseRef: "main",
+            headSha: "a".repeat(40),
+            htmlUrl: `https://github.com/${owner}/${repo}/pull/42`,
+            createdAt: "2026-08-01T00:00:00Z",
+            updatedAt: "2026-08-06T00:00:00Z",
+            labels: ["ci"],
+            requestedReviewers: [],
+          },
+        ];
+      }
       case "update_persona":
         return handleUpdatePersona(
           payload as Parameters<typeof handleUpdatePersona>[0],

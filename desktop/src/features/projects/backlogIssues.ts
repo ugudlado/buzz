@@ -49,7 +49,7 @@ export function setBacklogConnection(connection: BacklogConnection | null) {
 }
 
 /** Synthetic issue-id namespace for Backlog tasks. */
-export const BACKLOG_ISSUE_ID_PREFIX = "backlog:";
+const BACKLOG_ISSUE_ID_PREFIX = "backlog:";
 
 /** Backlog task id from a synthetic issue id. */
 export function backlogTaskIdFromIssueId(issueId: string): string {
@@ -62,7 +62,7 @@ export type BacklogTask = {
   displayId: string;
   title: string;
   status: string;
-  assignee: { id: string; name: string } | null;
+  assignee: { name: string } | null;
   createdDate: string;
   updatedDate?: string;
   labels: string[];

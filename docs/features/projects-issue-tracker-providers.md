@@ -49,6 +49,45 @@ Orca consumes it: plain REST, bearer token, no polymorphic provider interface).
   saving republishes the 30617 with the tag
   (`buildRepositoryIssueTrackerTemplate` preserves all other tags verbatim).
 
+## GitHub connection (Slice 2 — shipped)
+
+- Rust `commands/github.rs`: `github_connect` (PAT validated against
+  `GET /user`), `github_connect_from_gh_cli` (`gh auth token` import),
+  `github_connection_status`, `github_disconnect`,
+  `github_list_pull_requests`. Token + login live in the OS keyring
+  (`SecretStore`, keys `github.token`/`github.login`) — the token never
+  reaches the webview.
+- Authenticated clone: `build_git_clone_auth_config` injects the token for
+  github.com remotes via a `http.https://github.com/.extraheader` basic-auth
+  header carried in `GIT_CONFIG_*` env vars (actions/checkout pattern, never
+  argv). Private-repo clone works once connected; other git ops on GitHub
+  remotes remain gated.
+- PR provider: `Repository.githubRepo` (derived from a
+  `https://github.com/<owner>/<repo>` clone URL) routes pull requests through
+  `githubPullRequests.ts` → Rust API call, mapped to the shared
+  ProjectPullRequest shape with `github:`-prefixed ids. GitHub-hosted repos
+  skip the relay kind:1618 fetch. Not-connected resolves empty (not a load
+  failure); fetch errors surface as a `github-pull-requests` failed section.
+- UI: a GitHub button on repository management (visible for GitHub-hosted
+  repos) opens `GithubConnectionDialog` (paste PAT or import from gh CLI,
+  shows the connected login, disconnect). `PullRequestReviewCard` renders
+  "Open on GitHub" instead of relay review/merge actions for `github:` PRs.
+- Not done: GitHub PR comments/reviews in the timeline, files-changed diff
+  for GitHub PRs (needs a local clone or the compare API), fetch/push/sync
+  on GitHub remotes, creating GitHub PRs/issues from Buzz, OAuth device flow
+  (PAT + gh CLI only).
+
+## Security notes (flagged, deliberate for Slice 1)
+
+- The Backlog bearer token lives in webview localStorage
+  (`buzz-backlog-connection.v1`). The GitHub token already uses the OS
+  keyring — move the Backlog token to the same mechanism next.
+- The `buzz-issue-tracker` tag publishes shared state whose resolution
+  depends on per-device connection config; other collaborators see a
+  "backlog-issues" failed section until they connect. Consider carrying the
+  (non-secret) server base URL as a 4th tag position and documenting the tag
+  in NIP-MP's `buzz-` table.
+
 ## Not done (next slices)
 
 - GitHub git ops beyond clone (fetch/diff/sync/push) + private-repo
