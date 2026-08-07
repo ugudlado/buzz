@@ -1,13 +1,31 @@
+import { useQuery } from "@tanstack/react-query";
 import * as React from "react";
 
 import { useChannelsQuery } from "@/features/channels/hooks";
-import type { CreateProjectInput } from "@/features/projects/useCreateProject";
+import type { Repository } from "@/features/projects/hooks";
+import type { RepositoryIssueTracker } from "@/features/projects/projectModels";
+import { useGithubConnectionQuery } from "@/features/projects/ui/GithubConnectionDialog";
+import type {
+  CreateProjectInput,
+  CreateProjectResult,
+} from "@/features/projects/useCreateProject";
+import { useSetRepositoryIssueTrackerMutation } from "@/features/projects/useSetRepositoryIssueTracker";
+import {
+  type BacklogProjectRef,
+  getBacklogStatus,
+  listBacklogProjects,
+} from "@/shared/api/tauriBacklog";
+import { listGithubRepos } from "@/shared/api/tauriGithub";
 import { cn } from "@/shared/lib/cn";
 import { Button } from "@/shared/ui/button";
 import { ChooserDialogContent } from "@/shared/ui/chooser-dialog-content";
 import { Dialog } from "@/shared/ui/dialog";
 import { Input } from "@/shared/ui/input";
+import { SearchSelect } from "@/shared/ui/search-select";
 import { Textarea } from "@/shared/ui/textarea";
+
+type RepoSource = "github" | "cloneUrl" | "none";
+type TrackerProvider = "buzz" | "backlog" | "none";
 
 const CREATE_FIELD_SHELL_CLASS =
   "rounded-xl border border-input bg-muted/40 transition-colors duration-150 ease-out hover:border-muted-foreground/40 focus-within:border-muted-foreground/50";
@@ -18,7 +36,7 @@ const CREATE_LABEL_OPTIONAL_CLASS =
 
 type CreateProjectDialogProps = {
   isCreating: boolean;
-  onCreate: (input: CreateProjectInput) => Promise<void>;
+  onCreate: (input: CreateProjectInput) => Promise<CreateProjectResult>;
   onOpenChange: (open: boolean) => void;
   open: boolean;
 };
@@ -32,8 +50,12 @@ export function CreateProjectDialog({
 }: CreateProjectDialogProps) {
   const [name, setName] = React.useState("");
   const [description, setDescription] = React.useState("");
+  const [repoSource, setRepoSource] = React.useState<RepoSource>("none");
+  const [githubRepoCloneUrl, setGithubRepoCloneUrl] = React.useState("");
   const [cloneUrl, setCloneUrl] = React.useState("");
-  const [webUrl, setWebUrl] = React.useState("");
+  const [trackerProvider, setTrackerProvider] =
+    React.useState<TrackerProvider>("buzz");
+  const [backlogProjectGuid, setBacklogProjectGuid] = React.useState("");
   const [accessChannelId, setAccessChannelId] = React.useState("");
   const [errorMessage, setErrorMessage] = React.useState<string | null>(null);
   const nameInputRef = React.useRef<HTMLInputElement>(null);
@@ -49,13 +71,38 @@ export function CreateProjectDialog({
     [channelsQuery.data],
   );
 
+  const githubConnectionQuery = useGithubConnectionQuery();
+  const githubConnected = githubConnectionQuery.data?.connected ?? false;
+  const githubReposQuery = useQuery({
+    enabled: open && repoSource === "github" && githubConnected,
+    queryFn: listGithubRepos,
+    queryKey: ["github-repos"],
+  });
+
+  const backlogStatusQuery = useQuery({
+    enabled: open,
+    queryFn: getBacklogStatus,
+    queryKey: ["backlog-status"],
+  });
+  const backlogConnected = backlogStatusQuery.data?.connected ?? false;
+  const backlogProjectsQuery = useQuery<BacklogProjectRef[]>({
+    enabled: open && trackerProvider === "backlog" && backlogConnected,
+    queryFn: listBacklogProjects,
+    queryKey: ["backlog-projects"],
+  });
+
+  const setTrackerMutation = useSetRepositoryIssueTrackerMutation();
+
   React.useEffect(() => {
     if (!open) return;
 
     setName("");
     setDescription("");
+    setRepoSource("none");
+    setGithubRepoCloneUrl("");
     setCloneUrl("");
-    setWebUrl("");
+    setTrackerProvider("buzz");
+    setBacklogProjectGuid("");
     setAccessChannelId(accessChannels[0]?.id ?? "");
     setErrorMessage(null);
 
@@ -74,14 +121,29 @@ export function CreateProjectDialog({
 
     setErrorMessage(null);
 
+    const resolvedCloneUrl =
+      repoSource === "github"
+        ? githubRepoCloneUrl
+        : repoSource === "cloneUrl"
+          ? cloneUrl.trim()
+          : "";
+
     try {
-      await onCreate({
+      const { project } = await onCreate({
         accessChannelId,
         name: trimmedName,
         description: description.trim() || undefined,
-        cloneUrl: cloneUrl.trim() || undefined,
-        webUrl: webUrl.trim() || undefined,
+        cloneUrl: resolvedCloneUrl || undefined,
       });
+
+      const repository: Repository | undefined = project.repositories[0];
+      if (trackerProvider === "backlog" && backlogProjectGuid && repository) {
+        const issueTracker: RepositoryIssueTracker = {
+          kind: "backlog",
+          project: backlogProjectGuid,
+        };
+        await setTrackerMutation.mutateAsync({ issueTracker, repository });
+      }
 
       onOpenChange(false);
     } catch (error) {
@@ -237,73 +299,175 @@ export function CreateProjectDialog({
           <div className="space-y-1.5">
             <label
               className="text-sm font-medium text-foreground"
-              htmlFor="create-project-clone-url"
+              htmlFor="create-project-repo-provider"
             >
-              Initial repository clone URL
+              Repository
               <span className={CREATE_LABEL_OPTIONAL_CLASS}>Optional</span>
             </label>
+            <p className="text-xs text-muted-foreground">Provider</p>
             <div
               className={cn(
                 "flex min-h-11 items-center px-3",
                 CREATE_FIELD_SHELL_CLASS,
               )}
             >
-              <Input
-                autoCapitalize="none"
-                autoComplete="off"
-                autoCorrect="off"
+              <select
                 className={cn(
-                  "h-8 px-0 py-0 leading-6",
+                  "h-8 w-full px-0 py-0",
                   CREATE_FIELD_CONTROL_CLASS,
                 )}
-                data-testid="create-project-clone-url"
+                data-testid="create-project-repo-provider"
                 disabled={isCreating}
-                id="create-project-clone-url"
+                id="create-project-repo-provider"
                 onChange={(event) => {
-                  setCloneUrl(event.target.value);
+                  setRepoSource(event.target.value as RepoSource);
                   setErrorMessage(null);
                 }}
-                placeholder="https://relay.example.com/git/bee-garden-game.git"
-                spellCheck={false}
-                value={cloneUrl}
-              />
+                value={repoSource}
+              >
+                <option value="none">None</option>
+                <option value="github">GitHub</option>
+                <option value="cloneUrl">Clone URL</option>
+              </select>
             </div>
+
+            {repoSource === "github" ? (
+              githubConnected ? (
+                <div className="mt-1.5 space-y-1.5">
+                  <p className="text-xs text-muted-foreground">Repository</p>
+                  <div
+                    className={cn(
+                      "flex min-h-11 items-center px-3",
+                      CREATE_FIELD_SHELL_CLASS,
+                    )}
+                  >
+                    <SearchSelect
+                      disabled={isCreating}
+                      emptyLabel="No repositories match"
+                      getLabel={(repo) => `${repo.owner}/${repo.name}`}
+                      getValue={(repo) => repo.cloneUrl}
+                      items={githubReposQuery.data ?? []}
+                      loading={githubReposQuery.isLoading}
+                      loadingLabel="Loading repositories..."
+                      onChange={(nextValue) => {
+                        setGithubRepoCloneUrl(nextValue);
+                        setErrorMessage(null);
+                      }}
+                      placeholder="Select a repository"
+                      searchPlaceholder="Search repositories..."
+                      testId="create-project-github-repo"
+                      value={githubRepoCloneUrl}
+                    />
+                  </div>
+                </div>
+              ) : (
+                <p className="mt-1.5 text-xs text-muted-foreground">
+                  Connect GitHub in Settings → Integrations to pick a repo.
+                </p>
+              )
+            ) : null}
+
+            {repoSource === "cloneUrl" ? (
+              <div
+                className={cn(
+                  "mt-1.5 flex min-h-11 items-center px-3",
+                  CREATE_FIELD_SHELL_CLASS,
+                )}
+              >
+                <Input
+                  autoCapitalize="none"
+                  autoComplete="off"
+                  autoCorrect="off"
+                  className={cn(
+                    "h-8 px-0 py-0 leading-6",
+                    CREATE_FIELD_CONTROL_CLASS,
+                  )}
+                  data-testid="create-project-clone-url"
+                  disabled={isCreating}
+                  id="create-project-clone-url"
+                  onChange={(event) => {
+                    setCloneUrl(event.target.value);
+                    setErrorMessage(null);
+                  }}
+                  placeholder="https://relay.example.com/git/bee-garden-game.git"
+                  spellCheck={false}
+                  value={cloneUrl}
+                />
+              </div>
+            ) : null}
           </div>
 
           <div className="space-y-1.5">
             <label
               className="text-sm font-medium text-foreground"
-              htmlFor="create-project-web-url"
+              htmlFor="create-project-tracker-provider"
             >
-              Initial repository web URL
+              Issue tracker
               <span className={CREATE_LABEL_OPTIONAL_CLASS}>Optional</span>
             </label>
+            <p className="text-xs text-muted-foreground">Provider</p>
             <div
               className={cn(
                 "flex min-h-11 items-center px-3",
                 CREATE_FIELD_SHELL_CLASS,
               )}
             >
-              <Input
-                autoCapitalize="none"
-                autoComplete="off"
-                autoCorrect="off"
+              <select
                 className={cn(
-                  "h-8 px-0 py-0 leading-6",
+                  "h-8 w-full px-0 py-0",
                   CREATE_FIELD_CONTROL_CLASS,
                 )}
-                data-testid="create-project-web-url"
+                data-testid="create-project-tracker-provider"
                 disabled={isCreating}
-                id="create-project-web-url"
+                id="create-project-tracker-provider"
                 onChange={(event) => {
-                  setWebUrl(event.target.value);
+                  setTrackerProvider(event.target.value as TrackerProvider);
                   setErrorMessage(null);
                 }}
-                placeholder="https://github.com/owner/repo"
-                spellCheck={false}
-                value={webUrl}
-              />
+                value={trackerProvider}
+              >
+                <option value="buzz">Buzz issues</option>
+                <option value="backlog">Backlog</option>
+                <option value="none">None</option>
+              </select>
             </div>
+
+            {trackerProvider === "backlog" ? (
+              backlogConnected ? (
+                <div className="mt-1.5 space-y-1.5">
+                  <p className="text-xs text-muted-foreground">Project</p>
+                  <div
+                    className={cn(
+                      "flex min-h-11 items-center px-3",
+                      CREATE_FIELD_SHELL_CLASS,
+                    )}
+                  >
+                    <SearchSelect
+                      disabled={isCreating}
+                      emptyLabel="No projects match"
+                      getLabel={(project) => project.path}
+                      getValue={(project) => project.guid}
+                      items={backlogProjectsQuery.data ?? []}
+                      loading={backlogProjectsQuery.isLoading}
+                      loadingLabel="Loading projects..."
+                      onChange={(nextValue) => {
+                        setBacklogProjectGuid(nextValue);
+                        setErrorMessage(null);
+                      }}
+                      placeholder="Select a Backlog project"
+                      searchPlaceholder="Search projects..."
+                      testId="create-project-backlog-project"
+                      value={backlogProjectGuid}
+                    />
+                  </div>
+                </div>
+              ) : (
+                <p className="mt-1.5 text-xs text-muted-foreground">
+                  Connect Backlog in Settings → Integrations to track issues
+                  there.
+                </p>
+              )
+            ) : null}
           </div>
 
           {errorMessage ? (
