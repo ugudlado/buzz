@@ -14,6 +14,7 @@ import {
   disconnectGithub,
 } from "@/shared/api/tauriGithub";
 import {
+  backlogConnectionQueryKey,
   connectBacklog,
   disconnectBacklog,
   getBacklogStatus,
@@ -21,8 +22,6 @@ import {
 import { Button } from "@/shared/ui/button";
 import { Input } from "@/shared/ui/input";
 import { SettingsSectionHeader } from "./SettingsSectionHeader";
-
-export const backlogConnectionQueryKey = ["backlog-connection"] as const;
 
 function useBacklogConnectionQuery() {
   return useQuery({

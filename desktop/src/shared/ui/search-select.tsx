@@ -43,6 +43,7 @@ export function SearchSelect<TItem>({
   const [open, setOpen] = React.useState(false);
   const [query, setQuery] = React.useState("");
   const inputRef = React.useRef<HTMLInputElement>(null);
+  const listboxId = React.useId();
 
   const selectedItem = React.useMemo(
     () => items.find((item) => getValue(item) === value),
@@ -70,12 +71,15 @@ export function SearchSelect<TItem>({
     >
       <PopoverTrigger asChild>
         <button
+          aria-controls={open ? listboxId : undefined}
+          aria-expanded={open}
           className={cn(
             "flex h-8 w-full items-center justify-between gap-2 bg-transparent px-0 py-0 text-left text-sm text-muted-foreground/55 outline-none transition-colors duration-150 ease-out disabled:cursor-not-allowed disabled:opacity-50",
             selectedItem && "text-foreground",
           )}
           data-testid={testId}
           disabled={disabled}
+          role="combobox"
           type="button"
         >
           <span className="truncate">
@@ -102,7 +106,11 @@ export function SearchSelect<TItem>({
             value={query}
           />
         </div>
-        <div className="max-h-60 overflow-y-auto p-1">
+        <div
+          className="max-h-60 overflow-y-auto p-1"
+          id={listboxId}
+          role="listbox"
+        >
           {filteredItems.length === 0 ? (
             <p className="px-2 py-3 text-center text-sm text-muted-foreground">
               {emptyLabel}
@@ -113,6 +121,7 @@ export function SearchSelect<TItem>({
               const isSelected = itemValue === value;
               return (
                 <button
+                  aria-selected={isSelected}
                   className={cn(
                     "flex min-h-9 w-full cursor-default select-none items-center gap-2 rounded-lg py-2 pl-2 pr-4 text-left text-sm outline-hidden transition-colors hover:bg-muted/50 focus:bg-muted/50 focus:text-foreground",
                   )}
@@ -122,6 +131,7 @@ export function SearchSelect<TItem>({
                     onChange(itemValue);
                     setOpen(false);
                   }}
+                  role="option"
                   type="button"
                 >
                   <Check

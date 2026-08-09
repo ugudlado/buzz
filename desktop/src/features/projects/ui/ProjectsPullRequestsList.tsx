@@ -10,7 +10,7 @@ import { relativeTime } from "@/features/projects/lib/projectsViewHelpers";
 import type { ProjectWorkItemSection } from "@/features/projects/projectWorkItems";
 import { cn } from "@/shared/lib/cn";
 import {
-  resolveUserLabel,
+  resolveWorkItemAuthor,
   type UserProfileLookup,
 } from "@/features/profile/lib/identity";
 import { Button } from "@/shared/ui/button";
@@ -67,9 +67,10 @@ function PullRequestGridCard({
   pullRequest: ProjectPullRequest;
   onOpen: (project: Project, pullRequest: ProjectPullRequest) => void;
 }) {
-  const authorLabel = resolveUserLabel({
+  const author = resolveWorkItemAuthor({
+    author: pullRequest.author,
+    authorKind: pullRequest.authorKind,
     profiles,
-    pubkey: pullRequest.author,
   });
 
   return (
@@ -129,9 +130,9 @@ function PullRequestGridCard({
             <span>
               by{" "}
               <ProjectAuthorIdentity
-                label={authorLabel}
+                label={author.label}
                 profiles={profiles}
-                pubkey={pullRequest.author}
+                pubkey={author.pubkey}
               />
             </span>
             {pullRequest.comments.length > 0 ? (
@@ -158,9 +159,10 @@ function PullRequestListRow({
   pullRequest: ProjectPullRequest;
   onOpen: (project: Project, pullRequest: ProjectPullRequest) => void;
 }) {
-  const authorLabel = resolveUserLabel({
+  const author = resolveWorkItemAuthor({
+    author: pullRequest.author,
+    authorKind: pullRequest.authorKind,
     profiles,
-    pubkey: pullRequest.author,
   });
 
   return (
@@ -192,9 +194,9 @@ function PullRequestListRow({
             <span className="inline-flex items-center gap-1">
               <span>by</span>
               <ProjectAuthorIdentity
-                label={authorLabel}
+                label={author.label}
                 profiles={profiles}
-                pubkey={pullRequest.author}
+                pubkey={author.pubkey}
                 testId="projects-pr-author"
               />
             </span>

@@ -6,6 +6,7 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 use crate::app_state::keyring_service;
+use crate::managed_agents::resolve_command;
 use crate::secret_store::SecretStore;
 
 const GITHUB_TOKEN_KEY: &str = "github.token";
@@ -95,14 +96,16 @@ pub async fn github_connect(token: String) -> Result<GithubConnectionStatus, Str
 /// Import the token from an authenticated `gh` CLI (`gh auth token`).
 #[tauri::command]
 pub async fn github_connect_from_gh_cli() -> Result<GithubConnectionStatus, String> {
-    let output = tokio::task::spawn_blocking(|| {
-        std::process::Command::new("gh")
+    let gh_path =
+        resolve_command("gh").ok_or_else(|| "The gh CLI was not found on PATH.".to_string())?;
+    let output = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(gh_path)
             .args(["auth", "token"])
             .output()
     })
     .await
     .map_err(|error| format!("spawn_blocking failed: {error}"))?
-    .map_err(|_| "The gh CLI was not found on PATH.".to_string())?;
+    .map_err(|error| format!("Failed to run gh: {error}"))?;
     if !output.status.success() {
         return Err("gh is not logged in. Run `gh auth login` first.".into());
     }
@@ -150,8 +153,38 @@ fn valid_repo_segment(segment: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
+/// Percent-encodes a single path segment for use in a GitHub contents-API
+/// URL, rejecting `..` so it can't escape the repo/branch scope via path
+/// traversal (mirrors `backlog.rs`'s `urlencode`).
+fn encode_repo_path(path: &str) -> Result<String, String> {
+    if path.split('/').any(|segment| segment == "..") {
+        return Err("Invalid path.".into());
+    }
+    Ok(path
+        .split('/')
+        .map(|segment| {
+            segment
+                .bytes()
+                .map(|byte| match byte {
+                    b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                        (byte as char).to_string()
+                    }
+                    other => format!("%{other:02X}"),
+                })
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("/"))
+}
+
+/// Cap on pull requests returned — bounds worst-case pagination against
+/// very large/old repositories, matching [`LIST_REPOS_MAX`]'s approach.
+const LIST_PULL_REQUESTS_MAX: usize = 500;
+const LIST_PULL_REQUESTS_PER_PAGE: u32 = 100;
+
 /// List pull requests (all states) for a GitHub repository. Requires a
-/// connected token; returns an error naming the gap otherwise.
+/// connected token; returns an error naming the gap otherwise. Paginates
+/// until exhausted or [`LIST_PULL_REQUESTS_MAX`] is reached.
 #[tauri::command]
 pub async fn github_list_pull_requests(
     owner: String,
@@ -198,50 +231,70 @@ pub async fn github_list_pull_requests(
         requested_reviewers: Vec<RawUser>,
     }
 
-    let response = api_client()?
-        .get(format!(
-            "{GITHUB_API}/repos/{owner}/{repo}/pulls?state=all&per_page=100&sort=updated&direction=desc"
-        ))
-        .bearer_auth(&token)
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await
-        .map_err(|error| format!("github: {error}"))?;
-    check_github_status(
-        &response,
-        Some(&format!(
-            "GitHub repository {owner}/{repo} was not found (or the token cannot see it)."
-        )),
-    )?;
-    let pulls: Vec<RawPull> = response
-        .json()
-        .await
-        .map_err(|error| format!("github: {error}"))?;
+    let client = api_client()?;
+    let mut pulls = Vec::new();
+    let mut page = 1u32;
+    loop {
+        let response = client
+            .get(format!("{GITHUB_API}/repos/{owner}/{repo}/pulls"))
+            .query(&[
+                ("state", "all"),
+                ("sort", "updated"),
+                ("direction", "desc"),
+                ("per_page", &LIST_PULL_REQUESTS_PER_PAGE.to_string()),
+                ("page", &page.to_string()),
+            ])
+            .bearer_auth(&token)
+            .header("Accept", "application/vnd.github+json")
+            .send()
+            .await
+            .map_err(|error| format!("github: {error}"))?;
+        check_github_status(
+            &response,
+            Some(&format!(
+                "GitHub repository {owner}/{repo} was not found (or the token cannot see it)."
+            )),
+        )?;
+        let raw_pulls: Vec<RawPull> = response
+            .json()
+            .await
+            .map_err(|error| format!("github: {error}"))?;
+        let fetched = raw_pulls.len();
 
-    Ok(pulls
-        .into_iter()
-        .map(|pull| GithubPullRequest {
-            number: pull.number,
-            title: pull.title,
-            body: pull.body.unwrap_or_default(),
-            author: pull.user.map(|user| user.login).unwrap_or_default(),
-            merged: pull.merged_at.is_some(),
-            state: pull.state,
-            draft: pull.draft,
-            head_ref: pull.head.name,
-            base_ref: pull.base.name,
-            head_sha: pull.head.sha,
-            html_url: pull.html_url,
-            created_at: pull.created_at,
-            updated_at: pull.updated_at,
-            labels: pull.labels.into_iter().map(|label| label.name).collect(),
-            requested_reviewers: pull
-                .requested_reviewers
-                .into_iter()
-                .map(|user| user.login)
-                .collect(),
-        })
-        .collect())
+        for pull in raw_pulls {
+            pulls.push(GithubPullRequest {
+                number: pull.number,
+                title: pull.title,
+                body: pull.body.unwrap_or_default(),
+                author: pull.user.map(|user| user.login).unwrap_or_default(),
+                merged: pull.merged_at.is_some(),
+                state: pull.state,
+                draft: pull.draft,
+                head_ref: pull.head.name,
+                base_ref: pull.base.name,
+                head_sha: pull.head.sha,
+                html_url: pull.html_url,
+                created_at: pull.created_at,
+                updated_at: pull.updated_at,
+                labels: pull.labels.into_iter().map(|label| label.name).collect(),
+                requested_reviewers: pull
+                    .requested_reviewers
+                    .into_iter()
+                    .map(|user| user.login)
+                    .collect(),
+            });
+            if pulls.len() >= LIST_PULL_REQUESTS_MAX {
+                return Ok(pulls);
+            }
+        }
+
+        if fetched < LIST_PULL_REQUESTS_PER_PAGE as usize {
+            break;
+        }
+        page += 1;
+    }
+
+    Ok(pulls)
 }
 
 /// Repository summary for the project-creation repo picker.
@@ -450,7 +503,8 @@ pub async fn github_get_tree(
     let url = if path.is_empty() {
         format!("{GITHUB_API}/repos/{owner}/{repo}/contents")
     } else {
-        format!("{GITHUB_API}/repos/{owner}/{repo}/contents/{path}")
+        let encoded_path = encode_repo_path(&path)?;
+        format!("{GITHUB_API}/repos/{owner}/{repo}/contents/{encoded_path}")
     };
 
     let response = api_client()?
@@ -534,8 +588,11 @@ pub async fn github_get_file_content(
         encoding: Option<String>,
     }
 
+    let encoded_path = encode_repo_path(&path)?;
     let response = api_client()?
-        .get(format!("{GITHUB_API}/repos/{owner}/{repo}/contents/{path}"))
+        .get(format!(
+            "{GITHUB_API}/repos/{owner}/{repo}/contents/{encoded_path}"
+        ))
         .query(&[("ref", &branch)])
         .bearer_auth(&token)
         .header("Accept", "application/vnd.github+json")
@@ -627,6 +684,29 @@ fn check_github_status(
     if response.status() == reqwest::StatusCode::NOT_FOUND {
         if let Some(message) = not_found_message {
             return Err(message.to_string());
+        }
+    }
+    if matches!(
+        response.status(),
+        reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::TOO_MANY_REQUESTS
+    ) {
+        let remaining = response
+            .headers()
+            .get("x-ratelimit-remaining")
+            .and_then(|v| v.to_str().ok());
+        if remaining == Some("0") {
+            let reset_in = response
+                .headers()
+                .get("x-ratelimit-reset")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<i64>().ok())
+                .map(|reset_at| (reset_at - chrono::Utc::now().timestamp()).max(0));
+            return Err(match reset_in {
+                Some(seconds) => {
+                    format!("GitHub API rate limit exceeded. Try again in {seconds}s.")
+                }
+                None => "GitHub API rate limit exceeded. Try again later.".to_string(),
+            });
         }
     }
     if !response.status().is_success() {
@@ -744,7 +824,7 @@ pub async fn github_repo_activity(
 
 #[cfg(test)]
 mod tests {
-    use super::valid_repo_segment;
+    use super::{encode_repo_path, valid_repo_segment};
 
     #[test]
     fn repo_segments_reject_flags_and_traversal() {
@@ -754,5 +834,21 @@ mod tests {
         assert!(!valid_repo_segment("-flag"));
         assert!(!valid_repo_segment("a..b"));
         assert!(!valid_repo_segment("a/b"));
+    }
+
+    #[test]
+    fn encode_repo_path_preserves_segments_and_encodes_reserved_bytes() {
+        assert_eq!(encode_repo_path("src/main.rs").unwrap(), "src/main.rs");
+        assert_eq!(
+            encode_repo_path("a dir/file?.txt").unwrap(),
+            "a%20dir/file%3F.txt"
+        );
+        assert_eq!(encode_repo_path("weird#frag").unwrap(), "weird%23frag");
+    }
+
+    #[test]
+    fn encode_repo_path_rejects_traversal() {
+        assert!(encode_repo_path("../../etc/passwd").is_err());
+        assert!(encode_repo_path("a/../b").is_err());
     }
 }

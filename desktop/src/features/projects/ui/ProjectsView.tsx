@@ -213,7 +213,9 @@ export function ProjectsView() {
           ),
           ...(projectsWorkItemsQuery.data?.pullRequests.items.flatMap(
             ({ pullRequest }) => [
-              pullRequest.author,
+              ...(pullRequest.authorKind === "nostr"
+                ? [pullRequest.author]
+                : []),
               ...pullRequest.recipients,
               ...pullRequest.reviewers,
               ...pullRequest.approvals.map((approval) => approval.author),
@@ -222,7 +224,7 @@ export function ProjectsView() {
             ],
           ) ?? []),
           ...(projectsWorkItemsQuery.data?.issues.items.flatMap(({ issue }) => [
-            issue.author,
+            ...(issue.authorKind === "nostr" ? [issue.author] : []),
             ...issue.recipients,
             ...issue.comments.map((comment) => comment.author),
           ]) ?? []),
@@ -593,7 +595,29 @@ export function ProjectsView() {
   }
 
   if (projects.length === 0) {
-    return <EmptyState />;
+    return (
+      <>
+        <EmptyState onCreateProject={() => setCreateProjectOpen(true)} />
+        <CreateProjectDialog
+          isCreating={createProjectMutation.isPending}
+          onCreate={async (input) => {
+            const result = await createProjectMutation.mutateAsync(input);
+            if (result.compatibilityWarning) {
+              toast.warning("Created as a standalone project", {
+                description: result.compatibilityWarning,
+              });
+            } else {
+              toast.success(`Project "${result.project.name}" created.`);
+            }
+            handleRepositoryScopeChange("all");
+            handleFilterChange("projects");
+            return result;
+          }}
+          onOpenChange={setCreateProjectOpen}
+          open={createProjectOpen}
+        />
+      </>
+    );
   }
 
   const projectItems =

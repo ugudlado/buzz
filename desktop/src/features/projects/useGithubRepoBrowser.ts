@@ -6,6 +6,7 @@
 // Query's cache (keyed by owner/repo/branch/path) makes repeat visits free.
 
 import { useQuery } from "@tanstack/react-query";
+import { useMemo } from "react";
 
 import type { Repository } from "@/features/projects/projectModels";
 import {
@@ -53,13 +54,16 @@ export function useGithubAwareBranchOptions(
   const githubBranches = useGithubRepoBranchesQuery(
     repository?.githubRepo ? repository : null,
   ).data;
-  if (!repository?.githubRepo) return branchOptions;
-  return [
-    ...new Set([
-      ...branchOptions,
-      ...(githubBranches?.map((branch) => branch.name) ?? []),
-    ]),
-  ];
+  const isGithubRepo = Boolean(repository?.githubRepo);
+  return useMemo(() => {
+    if (!isGithubRepo) return branchOptions;
+    return [
+      ...new Set([
+        ...branchOptions,
+        ...(githubBranches?.map((branch) => branch.name) ?? []),
+      ]),
+    ];
+  }, [isGithubRepo, branchOptions, githubBranches]);
 }
 
 /**

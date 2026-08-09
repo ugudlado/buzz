@@ -8,6 +8,7 @@ import type { Repository } from "@/features/projects/hooks";
 import { PROJECT_FORM_FIELD_CLASS } from "@/features/projects/ui/projectPanelStyles";
 import { useSetRepositoryIssueTrackerMutation } from "@/features/projects/useSetRepositoryIssueTracker";
 import {
+  backlogConnectionQueryKey,
   connectBacklog,
   disconnectBacklog,
   getBacklogStatus,
@@ -20,7 +21,6 @@ import { ChooserDialogContent } from "@/shared/ui/chooser-dialog-content";
 import { Dialog } from "@/shared/ui/dialog";
 import { Input } from "@/shared/ui/input";
 
-export const backlogConnectionQueryKey = ["backlog-connection"] as const;
 export const backlogProjectsQueryKey = ["backlog-projects"] as const;
 
 // Identity of the pack-generated coordinator persona (kept in sync with

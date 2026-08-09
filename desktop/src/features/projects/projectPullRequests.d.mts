@@ -68,12 +68,20 @@ export function normalizeProjectPullRequestCommentAnchor(
     | undefined,
 ): ProjectPullRequestCommentAnchor | null;
 
+/**
+ * Discriminates what `author` actually holds: `"nostr"` is a real 64-hex
+ * pubkey safe to feed into profile/avatar lookups; `"github"` is a GitHub
+ * login that must render as plain text only.
+ */
+export type ProjectPullRequestAuthorKind = "nostr" | "github";
+
 export type ProjectPullRequest = {
   id: string;
   title: string;
   content: string;
   tags: string[][];
   author: string;
+  authorKind: ProjectPullRequestAuthorKind;
   createdAt: number;
   repoAddress: string | null;
   /** Channel where the pull request originated (`h` tag), when provided. */

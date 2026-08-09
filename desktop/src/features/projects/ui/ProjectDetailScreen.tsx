@@ -479,7 +479,7 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
     // publishers who are not listed as project contributors.
     const pullRequestPubkeys = (pullRequestsQuery.data ?? []).flatMap(
       (pullRequest) => [
-        pullRequest.author,
+        ...(pullRequest.authorKind === "nostr" ? [pullRequest.author] : []),
         ...pullRequest.updates.map((update) => update.author),
         ...pullRequest.comments.map((comment) => comment.author),
         ...pullRequest.reviewers,
@@ -487,7 +487,7 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
       ],
     );
     const issuePubkeys = (issuesQuery.data ?? []).flatMap((issue) => [
-      issue.author,
+      ...(issue.authorKind === "nostr" ? [issue.author] : []),
       ...issue.recipients,
       ...issue.comments.map((comment) => comment.author),
     ]);

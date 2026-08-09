@@ -10,7 +10,7 @@ import {
   useProjectIssuesQuery,
 } from "@/features/projects/hooks";
 import {
-  resolveUserLabel,
+  resolveWorkItemAuthor,
   type UserProfileLookup,
 } from "@/features/profile/lib/identity";
 import { relativeTime } from "@/features/projects/lib/projectsViewHelpers";
@@ -38,6 +38,15 @@ const PROJECT_ISSUE_STATUSES: ProjectIssue["status"][] = [
   "Closed",
 ];
 
+/** Dedupe/filter key for an issue author: normalized pubkey for Nostr
+ * authors, the raw external login/name otherwise (normalizing would
+ * lowercase a display name and corrupt grouping). */
+function issueAuthorFilterKey(issue: ProjectIssue): string {
+  return issue.authorKind === "nostr"
+    ? normalizePubkey(issue.author)
+    : issue.author;
+}
+
 export function issueStatusClassName(status: ProjectIssue["status"]) {
   if (status === "Done") return "text-purple-400";
   if (status === "Closed") return "text-destructive";
@@ -62,7 +71,7 @@ function issueMembers(
   return [
     ...new Set([
       project.owner,
-      issue.author,
+      ...(issue.authorKind === "nostr" ? [issue.author] : []),
       ...project.contributors,
       ...issue.recipients,
     ]),
@@ -88,8 +97,12 @@ function IssueRow({
   onOpen: () => void;
   profiles?: UserProfileLookup;
 }) {
-  const authorProfile = profiles?.[normalizePubkey(issue.author)];
-  const authorLabel = resolveUserLabel({ profiles, pubkey: issue.author });
+  const author = resolveWorkItemAuthor({
+    author: issue.author,
+    authorKind: issue.authorKind,
+    profiles,
+  });
+  const authorLabel = author.label;
   const status = issueStatusVisual(issue.status);
 
   return (
@@ -99,10 +112,10 @@ function IssueRow({
           <ProfileIdentityButton
             avatarClassName="shrink-0"
             avatarSize="xs"
-            avatarUrl={authorProfile?.avatarUrl ?? null}
-            isAgent={authorProfile?.isAgent === true}
+            avatarUrl={author.profile?.avatarUrl ?? null}
+            isAgent={author.profile?.isAgent === true}
             label={authorLabel}
-            pubkey={issue.author}
+            pubkey={author.pubkey}
             showLabel={false}
           />
           <span className="truncate text-foreground/80">
@@ -166,7 +179,11 @@ export function ProjectIssueDetail({
   stackMetaRail?: boolean;
 }) {
   const commentMutation = useCreateProjectIssueCommentMutation(project);
-  const authorLabel = resolveUserLabel({ profiles, pubkey: issue.author });
+  const authorLabel = resolveWorkItemAuthor({
+    author: issue.author,
+    authorKind: issue.authorKind,
+    profiles,
+  }).label;
   const members = React.useMemo(
     () => issueMembers(project, issue, profiles),
     [issue, profiles, project],
@@ -269,8 +286,12 @@ function IssueMetaRail({
   profiles?: UserProfileLookup;
   stacked?: boolean;
 }) {
-  const authorProfile = profiles?.[normalizePubkey(issue.author)];
-  const authorLabel = resolveUserLabel({ profiles, pubkey: issue.author });
+  const author = resolveWorkItemAuthor({
+    author: issue.author,
+    authorKind: issue.authorKind,
+    profiles,
+  });
+  const authorLabel = author.label;
   const status = issueStatusVisual(issue.status);
 
   return (
@@ -292,10 +313,10 @@ function IssueMetaRail({
         <ProfileIdentityButton
           align="center"
           avatarSize="xs"
-          avatarUrl={authorProfile?.avatarUrl ?? null}
-          isAgent={authorProfile?.isAgent === true}
+          avatarUrl={author.profile?.avatarUrl ?? null}
+          isAgent={author.profile?.isAgent === true}
           label={authorLabel}
-          pubkey={issue.author}
+          pubkey={author.pubkey}
         />
       </OverviewRailSection>
       {issue.labels.length > 0 ? (
@@ -433,12 +454,18 @@ export function ProjectIssuesPanel({
   }, [issues]);
 
   const authorOptions = React.useMemo(() => {
-    const distinct = new Set<string>();
-    for (const issue of issues) distinct.add(normalizePubkey(issue.author));
-    return [...distinct]
-      .map((pubkey) => ({
-        label: resolveUserLabel({ profiles, pubkey }),
-        value: pubkey,
+    const distinct = new Map<string, ProjectIssue>();
+    for (const issue of issues) {
+      distinct.set(issueAuthorFilterKey(issue), issue);
+    }
+    return [...distinct.entries()]
+      .map(([key, issue]) => ({
+        label: resolveWorkItemAuthor({
+          author: issue.author,
+          authorKind: issue.authorKind,
+          profiles,
+        }).label,
+        value: key,
       }))
       .sort((a, b) => a.label.localeCompare(b.label));
   }, [issues, profiles]);
@@ -456,7 +483,7 @@ export function ProjectIssuesPanel({
       }
       if (
         authorFilter.length > 0 &&
-        !authorFilter.includes(normalizePubkey(issue.author))
+        !authorFilter.includes(issueAuthorFilterKey(issue))
       ) {
         return false;
       }

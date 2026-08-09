@@ -37,6 +37,7 @@ test("maps a GitHub PR to the shared shape", () => {
   assert.equal(pr.branchName, "fix-login");
   assert.equal(pr.targetBranch, "main");
   assert.equal(pr.author, "octocat");
+  assert.equal(pr.authorKind, "github");
   assert.deepEqual(pr.reviewers, ["hubot"]);
   assert.equal(githubPullRequestUrl(pr), "https://github.com/o/r/pull/7");
   assert.ok(pr.updatedAt > pr.createdAt);

@@ -1,5 +1,9 @@
 import { invokeTauri } from "@/shared/api/tauri";
 
+/** React Query key for Backlog connection status — shared so every caller's
+ * cache invalidation actually hits the same cached query. */
+export const backlogConnectionQueryKey = ["backlog-connection"] as const;
+
 /** Backlog connection state. The token stays in the OS keyring (Rust side). */
 export type BacklogConnectionStatus = {
   connected: boolean;

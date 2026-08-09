@@ -45,8 +45,36 @@ fn require_connection() -> Result<Connection, String> {
     stored_connection()?.ok_or_else(|| "Backlog is not connected. Connect it first.".to_string())
 }
 
+/// Trims whitespace/trailing slashes and defaults a missing scheme to
+/// `http://` — a bare `host:port` (e.g. pasted from a terminal prompt) is
+/// not a valid absolute URL and would otherwise fail deep in `reqwest` with
+/// an opaque "builder error" instead of connecting.
 fn normalize_base_url(base_url: &str) -> String {
-    base_url.trim().trim_end_matches('/').to_string()
+    let trimmed = base_url.trim().trim_end_matches('/');
+    if trimmed.contains("://") {
+        trimmed.to_string()
+    } else {
+        format!("http://{trimmed}")
+    }
+}
+
+/// Plain `http://` sends the email/password or token over cleartext, which
+/// is only safe on loopback (the local Backlog dev server this app talks to
+/// in development). Reject `http://` to any other host — remote connections
+/// must use `https://`.
+fn reject_insecure_remote_url(base_url: &str) -> Result<(), String> {
+    let Some(rest) = base_url.strip_prefix("http://") else {
+        return Ok(());
+    };
+    let host = if let Some(bracketed) = rest.strip_prefix('[') {
+        bracketed.split(']').next().unwrap_or("")
+    } else {
+        rest.split(['/', ':']).next().unwrap_or("")
+    };
+    if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+        return Ok(());
+    }
+    Err("Refusing to connect over http:// to a non-localhost Backlog server — credentials would be sent in cleartext. Use https://.".into())
 }
 
 async fn backlog_request(
@@ -155,6 +183,7 @@ pub async fn backlog_connect(
     if base_url.is_empty() {
         return Err("Backlog server URL is required.".into());
     }
+    reject_insecure_remote_url(&base_url)?;
 
     let token = match input.token.map(|t| t.trim().to_string()) {
         Some(token) if !token.is_empty() => token,
@@ -373,7 +402,7 @@ fn urlencode(segment: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_base_url, urlencode};
+    use super::{normalize_base_url, reject_insecure_remote_url, urlencode};
 
     #[test]
     fn base_url_normalization_strips_trailing_slashes() {
@@ -384,8 +413,33 @@ mod tests {
     }
 
     #[test]
+    fn base_url_normalization_defaults_missing_scheme_to_http() {
+        assert_eq!(
+            normalize_base_url("127.0.0.1:4321"),
+            "http://127.0.0.1:4321"
+        );
+        assert_eq!(
+            normalize_base_url("localhost:4321"),
+            "http://localhost:4321"
+        );
+        assert_eq!(
+            normalize_base_url("https://backlog.example.com/"),
+            "https://backlog.example.com"
+        );
+    }
+
+    #[test]
     fn urlencode_escapes_reserved_bytes() {
         assert_eq!(urlencode("a-b_c.d~e"), "a-b_c.d~e");
         assert_eq!(urlencode("my guid/x"), "my%20guid%2Fx");
+    }
+
+    #[test]
+    fn insecure_remote_url_rejects_non_loopback_http() {
+        assert!(reject_insecure_remote_url("http://localhost:4321").is_ok());
+        assert!(reject_insecure_remote_url("http://127.0.0.1:4321").is_ok());
+        assert!(reject_insecure_remote_url("http://[::1]:4321").is_ok());
+        assert!(reject_insecure_remote_url("https://backlog.example.com").is_ok());
+        assert!(reject_insecure_remote_url("http://backlog.example.com").is_err());
     }
 }

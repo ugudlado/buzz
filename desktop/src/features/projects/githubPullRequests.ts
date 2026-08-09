@@ -55,6 +55,7 @@ export function githubPullToProjectPullRequest(
     content: pull.body,
     tags: [["web", pull.htmlUrl]],
     author: pull.author,
+    authorKind: "github",
     createdAt: isoToUnixSeconds(pull.createdAt),
     repoAddress,
     channelId: null,
