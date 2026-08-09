@@ -448,7 +448,47 @@ pub fn resolve_step_templates(
         Delay { duration } => Ok(Delay {
             duration: duration.clone(),
         }),
+        AssignToAgent {
+            agent,
+            agent_pubkey,
+            instruction,
+            timeout,
+        } => Ok(AssignToAgent {
+            agent: t(agent)?,
+            agent_pubkey: agent_pubkey.clone(),
+            instruction: t(instruction)?,
+            timeout: timeout.clone(),
+        }),
     }
+}
+
+/// What a suspended step is waiting on. Both variants pause the run the same
+/// way (see [`StepResult::Suspended`]) but persist to different tables and
+/// carry different resume identifiers.
+#[derive(Debug)]
+pub enum SuspendReason {
+    /// Waiting on a `RequestApproval` gate to be granted or denied.
+    Approval {
+        /// Who may approve (user mention or role spec), from the step's `from` field.
+        approver_spec: String,
+    },
+    /// Waiting on an `AssignToAgent` mention to receive a completion reply.
+    AgentAssignment {
+        /// Hex event id of the `@mention` message sent to the agent.
+        prompt_event_id: String,
+        /// Unix seconds `created_at` of the prompt event — carried forward so
+        /// a later step in the same run can thread its own prompt as a
+        /// NIP-10 reply without a DB round-trip.
+        prompt_created_at: i64,
+        /// Hex event id of this run's thread root — the very first
+        /// `assign_to_agent` prompt. Equal to `prompt_event_id` when this is
+        /// that first prompt.
+        root_event_id: String,
+        /// Unix seconds `created_at` of the root event.
+        root_created_at: i64,
+        /// Compressed public key bytes of the mentioned agent.
+        agent_pubkey: Vec<u8>,
+    },
 }
 
 /// Result of dispatching a single step action.
@@ -456,10 +496,17 @@ pub fn resolve_step_templates(
 pub enum StepResult {
     /// Step completed normally. Output is stored in `step_outputs`.
     Completed(JsonValue),
-    /// Step requests suspension (approval gate). Execution must pause.
+    /// Step requests suspension (approval gate or agent assignment).
+    /// Execution must pause.
     Suspended {
-        /// Token used to resume or reject this approval gate.
-        approval_token: String,
+        /// Token used to resume this suspension. For approvals this is the
+        /// raw approval token (stored hashed); for agent assignments this is
+        /// the prompt event id (public — there is no secret to hash).
+        resume_token: String,
+        /// What this step is waiting on.
+        reason: SuspendReason,
+        /// Duration string (e.g. `"24h"`) after which the suspension expires.
+        timeout: String,
     },
     /// Step was skipped due to `if:` condition being false.
     Skipped,
@@ -523,6 +570,7 @@ pub async fn dispatch_action(
     community_id: CommunityId,
     run_id: Uuid,
     trigger_ctx: &TriggerContext,
+    thread_anchor: Option<&crate::action_sink::ThreadAnchor>,
 ) -> Result<StepResult, WorkflowError> {
     use ActionDef::*;
 
@@ -565,9 +613,19 @@ pub async fn dispatch_action(
                 "SendMessage → {channel_id}: {text}"
             );
 
+            // Thread into the run's conversation (as a direct reply to the
+            // root, same flat shape as agent-step prompts) when the run has
+            // one; a run whose first step is send_message has no thread yet
+            // and posts top-level.
             let event_id = engine
                 .action_sink()?
-                .send_message(community_id, &channel_id, text, &owner_pubkey_hex)
+                .send_message(
+                    community_id,
+                    &channel_id,
+                    text,
+                    &owner_pubkey_hex,
+                    thread_anchor,
+                )
                 .await
                 .map_err(WorkflowError::from)?;
 
@@ -660,11 +718,129 @@ pub async fn dispatch_action(
 
             let token = generate_approval_token(run_id, step_id);
 
-            // TODO (WF-08): create approval record in DB, emit kind:46010.
-            // For now, return Suspended with the token so the caller can persist state.
+            // The approval record is created by `WorkflowEngine::finalize_run`
+            // once this suspension bubbles up through `execute_steps` — it has
+            // the DB handle and run/workflow context needed for the insert.
 
             Ok(StepResult::Suspended {
-                approval_token: token,
+                resume_token: token,
+                reason: SuspendReason::Approval {
+                    approver_spec: from.clone(),
+                },
+                timeout: timeout_str.to_owned(),
+            })
+        }
+
+        AssignToAgent {
+            agent,
+            agent_pubkey: agent_pubkey_hint,
+            instruction,
+            timeout,
+        } => {
+            let timeout_str = timeout.as_deref().unwrap_or("24h");
+
+            let wf_run = engine
+                .db
+                .get_workflow_run(community_id, run_id)
+                .await
+                .map_err(|e| {
+                    WorkflowError::WebhookError(format!(
+                        "AssignToAgent: failed to load workflow run {run_id}: {e}"
+                    ))
+                })?;
+            let workflow = engine
+                .db
+                .get_workflow(community_id, wf_run.workflow_id)
+                .await
+                .map_err(|e| {
+                    WorkflowError::WebhookError(format!(
+                        "AssignToAgent: failed to load workflow {}: {e}",
+                        wf_run.workflow_id
+                    ))
+                })?;
+            let channel_id =
+                resolve_send_message_channel(None, &trigger_ctx.channel_id, workflow.channel_id)?;
+            let owner_pubkey_hex = hex::encode(&workflow.owner_pubkey);
+
+            let sink = engine.action_sink()?;
+
+            // When the step carries an explicit `agent_pubkey`, that's the
+            // authoritative identity: verify it directly against channel
+            // membership rather than resolving `agent` by name. This
+            // disambiguates same-named agents and survives a rename. When
+            // absent, fall back to case-insensitive exact-name resolution —
+            // `send_message`'s own `@Name` mention resolution silently omits
+            // the `p` tag for an unresolved or ambiguous name (it "sends to
+            // nobody"), which would otherwise let this step appear to
+            // succeed while no agent was actually woken. Surface either
+            // failure mode as a typed step failure instead.
+            let agent_pubkey = match agent_pubkey_hint {
+                Some(pk) => sink
+                    .verify_agent_membership(community_id, &channel_id, pk)
+                    .await
+                    .map_err(WorkflowError::from)?
+                    .ok_or_else(|| {
+                        WorkflowError::InvalidDefinition(format!(
+                            "AssignToAgent: agent_pubkey '{pk}' is not a member of channel {channel_id}"
+                        ))
+                    })?,
+                None => sink
+                    .resolve_agent(community_id, &channel_id, agent)
+                    .await
+                    .map_err(WorkflowError::from)?
+                    .ok_or_else(|| {
+                        WorkflowError::InvalidDefinition(format!(
+                            "AssignToAgent: agent '{agent}' does not resolve to exactly one member of channel {channel_id}"
+                        ))
+                    })?,
+            };
+
+            let text = format!("@{agent} {instruction}");
+
+            info!(
+                run_id = %run_id,
+                step = step_id,
+                channel = %channel_id,
+                "AssignToAgent → {channel_id}: {text}"
+            );
+
+            // Anchor every step's prompt as a direct reply to the run's
+            // thread root, not to the previous step's agent reply — keeps
+            // the whole run flat (root, prompt1, reply1, prompt2, reply2,
+            // ...) instead of a growing root→reply→prompt→reply chain that
+            // gets harder to read as more steps are added.
+            let prompt_event_id = sink
+                .send_message(
+                    community_id,
+                    &channel_id,
+                    &text,
+                    &owner_pubkey_hex,
+                    thread_anchor,
+                )
+                .await
+                .map_err(WorkflowError::from)?;
+            // Matches the relay's own `Timestamp::now()` at signing time
+            // (same clock, moments apart) — avoids a broader ActionSink
+            // return-type change just to carry this back from `send_message`.
+            let prompt_created_at = unix_now();
+            // The very first assign_to_agent prompt in a run is its own
+            // thread root; later ones inherit the root from the anchor
+            // carried forward by the prior step's suspend/resume.
+            let (root_event_id, root_created_at) = match thread_anchor {
+                Some(a) => (a.root_event_id.clone(), a.root_created_at),
+                None => (prompt_event_id.clone(), prompt_created_at),
+            };
+
+            Ok(StepResult::Suspended {
+                resume_token: prompt_event_id.clone(),
+                reason: SuspendReason::AgentAssignment {
+                    prompt_event_id,
+                    prompt_created_at,
+                    root_event_id,
+                    root_created_at,
+                    agent_pubkey,
+                },
+                timeout: timeout_str.to_owned(),
             })
         }
 
@@ -932,22 +1108,40 @@ async fn add_reaction_impl(message_id: &str, emoji: &str) -> Result<JsonValue, W
     }))
 }
 
+/// A suspension pending persistence by the caller (`WorkflowEngine::finalize_run`).
+///
+/// Carries everything needed to write either a `workflow_approvals` row (for
+/// `RequestApproval`) or a `workflow_agent_steps` row (for `AssignToAgent`),
+/// plus the step context common to both.
+#[derive(Debug)]
+pub struct PendingSuspend {
+    /// Resume token: the raw approval token (approvals) or the prompt event
+    /// id (agent assignments).
+    pub resume_token: String,
+    /// What the run is waiting on.
+    pub reason: SuspendReason,
+    /// The suspended step's `id`.
+    pub step_id: String,
+    /// The suspended step's timeout duration string (e.g. `"24h"`).
+    pub timeout: String,
+}
+
 /// Rich return type from `execute_run` / `execute_from_step`.
 ///
 /// Carries enough information for the caller to:
-/// - Persist the approval record when suspended at a `RequestApproval` step.
+/// - Persist the approval/agent-step record when suspended.
 /// - Update the run's execution trace and current step in the DB.
-/// - Resume execution from the correct step after approval.
+/// - Resume execution from the correct step after the suspension resolves.
 #[derive(Debug)]
 pub struct ExecutionResult {
-    /// Set when execution suspended at a `RequestApproval` step.
-    /// `None` means the run completed normally.
-    pub approval_token: Option<String>,
+    /// Set when execution suspended at a `RequestApproval` or `AssignToAgent`
+    /// step. `None` means the run completed normally.
+    pub suspend: Option<PendingSuspend>,
     /// Index of the step that suspended (or the total step count on completion).
     pub step_index: usize,
     /// Accumulated step outputs at the point of suspension or completion.
     pub step_outputs: HashMap<String, JsonValue>,
-    /// Execution trace: one entry per completed/skipped step.
+    /// Execution trace: one entry per completed/skipped/waiting/failed step.
     pub trace: Vec<JsonValue>,
 }
 
@@ -1074,6 +1268,24 @@ pub async fn execute_from_step(
     .await
 }
 
+/// Extract a [`crate::action_sink::ThreadAnchor`] from a completed
+/// `assign_to_agent` step's `step_outputs` entry, if it carries a
+/// `__reply_thread` blob (embedded by the relay's resume path — see
+/// `try_resume_agent_step`/`agent_completion_to_output_json` in
+/// `buzz-relay`'s `command_executor.rs`).
+///
+/// Returns `None` for non-agent-step outputs (no `__reply_thread` key) —
+/// harmless, since `execute_steps` only uses this to *seed* the running
+/// anchor for a resumed run, falling back to no anchor (top-level messages)
+/// if nothing is found.
+fn thread_anchor_from_step_output(output: &JsonValue) -> Option<crate::action_sink::ThreadAnchor> {
+    let t = output.get("__reply_thread")?;
+    Some(crate::action_sink::ThreadAnchor {
+        root_event_id: t.get("root_event_id")?.as_str()?.to_owned(),
+        root_created_at: t.get("root_created_at")?.as_i64()?,
+    })
+}
+
 /// Internal: execute workflow steps starting from `start_index`, without
 /// acquiring the semaphore. Called by both [`execute_run`] and
 /// [`execute_from_step`] after they have already acquired a permit.
@@ -1092,11 +1304,32 @@ async fn execute_steps(
     let mut step_outputs: HashMap<String, JsonValue> = initial_outputs.unwrap_or_default();
     let mut trace: Vec<JsonValue> = Vec::new();
 
+    // Running NIP-10 thread anchor for `assign_to_agent` steps, so a
+    // multi-step run threads into one conversation instead of independent
+    // top-level (prompt, reply) pairs. Seeded once from the most recent
+    // already-completed `assign_to_agent` step carried in via `step_outputs`
+    // (i.e. this call is a resume) — see `thread_anchor_from_step_output`;
+    // fresh anchors only appear when execution re-enters here on the next
+    // resume. `None` until the run's first prompt exists, so early steps
+    // post top-level.
+    let thread_anchor: Option<crate::action_sink::ThreadAnchor> =
+        def.steps.iter().take(start_index).rev().find_map(|s| {
+            step_outputs
+                .get(&s.id)
+                .and_then(thread_anchor_from_step_output)
+        });
+
     for (i, step) in def.steps.iter().enumerate() {
         if i < start_index {
             debug!(run_id = %run_id, step = %step.id, "Skipping already-executed step");
             continue;
         }
+
+        // Captured once per step so every trace entry emitted below (skip,
+        // failure, suspend, completion) reports the same `started_at` —
+        // when the executor first picked this step up, not when a
+        // particular sub-phase (condition eval vs dispatch) ran.
+        let step_started_at = unix_now();
 
         if let Some(expr) = &step.if_expr {
             match evaluate_condition(expr, trigger_ctx, &step_outputs).await {
@@ -1108,29 +1341,21 @@ async fn execute_steps(
                     trace.push(serde_json::json!({
                         "step_id": step.id,
                         "status": "skipped",
+                        "started_at": step_started_at,
+                        "completed_at": unix_now(),
                     }));
                     continue;
                 }
                 Err(e) => {
                     warn!(run_id = %run_id, step = %step.id, "Condition error: {e}");
-                    let progress = crate::error::PartialProgress {
-                        step_index: i,
-                        trace,
-                    };
-                    return Err((e, progress));
+                    return Err(fail_step(e, &step.id, step_started_at, i, trace));
                 }
             }
         }
 
         let resolved_action = match resolve_step_templates(step, trigger_ctx, &step_outputs) {
             Ok(a) => a,
-            Err(e) => {
-                let progress = crate::error::PartialProgress {
-                    step_index: i,
-                    trace,
-                };
-                return Err((e, progress));
-            }
+            Err(e) => return Err(fail_step(e, &step.id, step_started_at, i, trace)),
         };
 
         let timeout_secs = step
@@ -1145,31 +1370,20 @@ async fn execute_steps(
                 community_id,
                 run_id,
                 trigger_ctx,
+                thread_anchor.as_ref(),
             ),
         )
         .await;
 
         let result = match dispatch_result {
             Ok(Ok(r)) => r,
-            Ok(Err(e)) => {
-                let progress = crate::error::PartialProgress {
-                    step_index: i,
-                    trace,
-                };
-                return Err((e, progress));
-            }
+            Ok(Err(e)) => return Err(fail_step(e, &step.id, step_started_at, i, trace)),
             Err(_timeout) => {
-                let progress = crate::error::PartialProgress {
-                    step_index: i,
-                    trace,
+                let timeout_err = WorkflowError::StepTimeout {
+                    step_id: step.id.clone(),
+                    timeout_secs,
                 };
-                return Err((
-                    WorkflowError::StepTimeout {
-                        step_id: step.id.clone(),
-                        timeout_secs,
-                    },
-                    progress,
-                ));
+                return Err(fail_step(timeout_err, &step.id, step_started_at, i, trace));
             }
         };
 
@@ -1180,18 +1394,57 @@ async fn execute_steps(
                     "step_id": step.id,
                     "status": "completed",
                     "output": output,
+                    "started_at": step_started_at,
+                    "completed_at": unix_now(),
                 }));
                 step_outputs.insert(step.id.clone(), output);
             }
-            StepResult::Suspended { approval_token } => {
+            StepResult::Suspended {
+                resume_token,
+                reason,
+                timeout,
+            } => {
                 info!(
                     run_id = %run_id, step = %step.id,
-                    "Step suspended — awaiting approval (token: <redacted>)"
+                    "Step suspended — awaiting external resume (token: <redacted>)"
                 );
+                // For agent assignments, carry the prompt's own thread
+                // identity in the trace entry — the resume path (relay's
+                // `try_resume_agent_step`) reads it back out to build the
+                // next step's `ThreadAnchor` without a DB round-trip.
+                let thread = if let SuspendReason::AgentAssignment {
+                    prompt_event_id,
+                    prompt_created_at,
+                    root_event_id,
+                    root_created_at,
+                    ..
+                } = &reason
+                {
+                    serde_json::json!({
+                        "event_id": prompt_event_id,
+                        "created_at": prompt_created_at,
+                        "root_event_id": root_event_id,
+                        "root_created_at": root_created_at,
+                    })
+                } else {
+                    JsonValue::Null
+                };
+                trace.push(serde_json::json!({
+                    "step_id": step.id,
+                    "status": "waiting",
+                    "started_at": step_started_at,
+                    "completed_at": null,
+                    "__prompt_thread": thread,
+                }));
                 // Return the token and current state so the caller can persist the
-                // approval record and update the run's execution trace.
+                // approval/agent-step record and update the run's execution trace.
                 return Ok(ExecutionResult {
-                    approval_token: Some(approval_token),
+                    suspend: Some(PendingSuspend {
+                        resume_token,
+                        reason,
+                        step_id: step.id.clone(),
+                        timeout,
+                    }),
                     step_index: i,
                     step_outputs,
                     trace,
@@ -1202,6 +1455,8 @@ async fn execute_steps(
                 trace.push(serde_json::json!({
                     "step_id": step.id,
                     "status": "skipped",
+                    "started_at": step_started_at,
+                    "completed_at": unix_now(),
                 }));
             }
         }
@@ -1209,11 +1464,41 @@ async fn execute_steps(
 
     info!(run_id = %run_id, "Workflow run completed");
     Ok(ExecutionResult {
-        approval_token: None,
+        suspend: None,
         step_index: def.steps.len(),
         step_outputs,
         trace,
     })
+}
+
+/// Current Unix time in seconds, for `started_at`/`completed_at` trace
+/// fields. Matches the `i64` Unix-seconds convention used elsewhere in the
+/// relay (e.g. `event.created_at.as_secs() as i64`) rather than RFC3339, so
+/// it round-trips through the desktop's `number | null` trace-entry contract
+/// (`RawTraceEntry.started_at`/`completed_at` in
+/// `desktop/src/shared/api/tauriWorkflows.ts`) without a format conversion.
+fn unix_now() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+/// Build the `(error, progress)` pair for a failed step, appending its
+/// `failed` trace entry — shared tail of every failure exit in
+/// [`execute_steps`].
+fn fail_step(
+    err: WorkflowError,
+    step_id: &str,
+    started_at: i64,
+    step_index: usize,
+    mut trace: Vec<JsonValue>,
+) -> (WorkflowError, crate::error::PartialProgress) {
+    trace.push(serde_json::json!({
+        "step_id": step_id,
+        "status": "failed",
+        "error": err.to_string(),
+        "started_at": started_at,
+        "completed_at": unix_now(),
+    }));
+    (err, crate::error::PartialProgress { step_index, trace })
 }
 
 #[cfg(test)]
@@ -1833,5 +2118,518 @@ mod tests {
             resolve_send_message_channel(Some(&override_channel_id.to_string()), "", None)
                 .expect("override should be accepted");
         assert_eq!(resolved, override_channel_id.to_string());
+    }
+
+    // -- AssignToAgent dispatch (requires Postgres) -------------------------
+    //
+    // `dispatch_action` loads the run's workflow via `engine.db`, so exercising
+    // it end-to-end needs a real DB even though the interesting behavior is in
+    // the sink. A `MockAgentSink` stands in for the relay's `RelayActionSink`
+    // so these tests don't need a running relay.
+
+    use crate::action_sink::ActionSinkError;
+    use std::sync::Mutex;
+
+    /// Test double for [`crate::ActionSink`]. `agents` maps a display name to
+    /// `Some(pubkey_bytes)` (resolves) or `None` (unresolved/ambiguous),
+    /// mirroring the real sink's `resolve_agent` contract. `members` is the
+    /// set of pubkeys (hex) considered channel members, for
+    /// `verify_agent_membership`.
+    struct MockAgentSink {
+        agents: HashMap<String, Option<Vec<u8>>>,
+        sent: Mutex<Vec<(String, String)>>, // (channel_id, text)
+        members: HashMap<String, Vec<u8>>,  // pubkey_hex -> pubkey_bytes
+    }
+
+    impl crate::ActionSink for MockAgentSink {
+        fn send_message(
+            &self,
+            _community_id: CommunityId,
+            channel_id: &str,
+            text: &str,
+            _author_pubkey: &str,
+            _reply_to: Option<&crate::action_sink::ThreadAnchor>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<String, ActionSinkError>> + Send + '_>,
+        > {
+            let channel_id = channel_id.to_owned();
+            let text = text.to_owned();
+            Box::pin(async move {
+                self.sent
+                    .lock()
+                    .expect("lock")
+                    .push((channel_id, text.clone()));
+                Ok(format!("{:064x}", text.len())) // fake but distinct event id
+            })
+        }
+
+        fn resolve_agent<'a>(
+            &'a self,
+            _community_id: CommunityId,
+            _channel_id: &'a str,
+            name: &'a str,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<Option<Vec<u8>>, ActionSinkError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            let result = self.agents.get(name).cloned().unwrap_or(None);
+            Box::pin(async move { Ok(result) })
+        }
+
+        fn verify_agent_membership<'a>(
+            &'a self,
+            _community_id: CommunityId,
+            _channel_id: &'a str,
+            pubkey_hex: &'a str,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<Option<Vec<u8>>, ActionSinkError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            let result = self.members.get(pubkey_hex).cloned();
+            Box::pin(async move { Ok(result) })
+        }
+    }
+
+    async fn setup_engine_with_sink(
+        sink: MockAgentSink,
+    ) -> (
+        std::sync::Arc<crate::WorkflowEngine>,
+        buzz_db::Db,
+        CommunityId,
+        Uuid,
+    ) {
+        let db = crate::tests_support::setup_db().await;
+        let creator = nostr::Keys::generate().public_key().to_bytes().to_vec();
+        let (community, channel_id) =
+            crate::tests_support::setup_channel(&db, &creator, &creator).await;
+        let engine = std::sync::Arc::new(crate::WorkflowEngine::new(
+            db.clone(),
+            crate::WorkflowConfig::default(),
+        ));
+        engine.set_action_sink(std::sync::Arc::new(sink));
+        (engine, db, community, channel_id)
+    }
+
+    /// Shared ritual for the Postgres-backed dispatch/execute tests: create
+    /// an owner, a webhook-triggered workflow with the given `steps` JSON,
+    /// and a pending run. Returns the run id, a channel-scoped trigger
+    /// context, and the raw definition JSON (for tests that re-parse it).
+    async fn make_assign_run(
+        db: &buzz_db::Db,
+        community: CommunityId,
+        channel_id: Uuid,
+        steps: serde_json::Value,
+    ) -> (Uuid, TriggerContext, String) {
+        let owner = nostr::Keys::generate().public_key().to_bytes().to_vec();
+        db.ensure_user(community, &owner).await.expect("owner user");
+        let def_json = serde_json::json!({
+            "name": "assign-agent",
+            "trigger": {"on": "webhook"},
+            "steps": steps,
+        })
+        .to_string();
+        let workflow_id = db
+            .create_workflow(
+                community,
+                Some(channel_id),
+                &owner,
+                "assign-agent",
+                &def_json,
+                &[2u8; 32],
+            )
+            .await
+            .expect("create workflow");
+        let run_id = db
+            .create_workflow_run(community, workflow_id, None, None)
+            .await
+            .expect("create run");
+        let trigger_ctx = TriggerContext {
+            channel_id: channel_id.to_string(),
+            ..Default::default()
+        };
+        (run_id, trigger_ctx, def_json)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn dispatch_assign_to_agent_resolved_suspends_with_prompt_event_id() {
+        let agent_pubkey = vec![7u8; 32];
+        let mut agents = HashMap::new();
+        agents.insert("Lep".to_owned(), Some(agent_pubkey.clone()));
+        let sink = MockAgentSink {
+            agents,
+            sent: Mutex::new(Vec::new()),
+            members: HashMap::new(),
+        };
+        let (engine, db, community, channel_id) = setup_engine_with_sink(sink).await;
+
+        let (run_id, trigger_ctx, _def_json) = make_assign_run(
+            &db,
+            community,
+            channel_id,
+            serde_json::json!([{
+                "id": "assign", "action": "assign_to_agent",
+                "agent": "Lep", "instruction": "please investigate"
+            }]),
+        )
+        .await;
+
+        let action = ActionDef::AssignToAgent {
+            agent: "Lep".to_owned(),
+            agent_pubkey: None,
+            instruction: "please investigate".to_owned(),
+            timeout: None,
+        };
+
+        let result = dispatch_action(
+            "assign",
+            &action,
+            &engine,
+            community,
+            run_id,
+            &trigger_ctx,
+            None,
+        )
+        .await
+        .expect("dispatch should succeed");
+
+        match result {
+            StepResult::Suspended {
+                resume_token,
+                reason,
+                timeout,
+            } => {
+                assert!(!resume_token.is_empty());
+                assert_eq!(timeout, "24h", "default timeout should be 24h");
+                match reason {
+                    SuspendReason::AgentAssignment {
+                        prompt_event_id,
+                        agent_pubkey: got_pubkey,
+                        ..
+                    } => {
+                        assert_eq!(prompt_event_id, resume_token);
+                        assert_eq!(got_pubkey, agent_pubkey);
+                    }
+                    other => panic!("expected AgentAssignment, got {other:?}"),
+                }
+            }
+            other => panic!("expected Suspended, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn dispatch_assign_to_agent_with_pubkey_bypasses_name_resolution() {
+        let agent_pubkey = vec![7u8; 32];
+        let pubkey_hex = hex::encode(&agent_pubkey);
+        // Deliberately do NOT register "Lep" in `agents` — if dispatch fell
+        // back to name resolution despite the explicit `agent_pubkey`, this
+        // step would fail with "does not resolve to exactly one member".
+        let mut members = HashMap::new();
+        members.insert(pubkey_hex.clone(), agent_pubkey.clone());
+        let sink = MockAgentSink {
+            agents: HashMap::new(),
+            sent: Mutex::new(Vec::new()),
+            members,
+        };
+        let (engine, db, community, channel_id) = setup_engine_with_sink(sink).await;
+
+        let (run_id, trigger_ctx, _def_json) = make_assign_run(
+            &db,
+            community,
+            channel_id,
+            serde_json::json!([{
+                "id": "assign", "action": "assign_to_agent",
+                "agent": "Lep", "agent_pubkey": pubkey_hex, "instruction": "please investigate"
+            }]),
+        )
+        .await;
+
+        let action = ActionDef::AssignToAgent {
+            agent: "Lep".to_owned(),
+            agent_pubkey: Some(pubkey_hex),
+            instruction: "please investigate".to_owned(),
+            timeout: None,
+        };
+
+        let result = dispatch_action(
+            "assign",
+            &action,
+            &engine,
+            community,
+            run_id,
+            &trigger_ctx,
+            None,
+        )
+        .await
+        .expect("dispatch should succeed via pubkey verification");
+
+        match result {
+            StepResult::Suspended {
+                reason:
+                    SuspendReason::AgentAssignment {
+                        agent_pubkey: got, ..
+                    },
+                ..
+            } => assert_eq!(got, agent_pubkey),
+            other => panic!("expected Suspended/AgentAssignment, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn dispatch_assign_to_agent_pubkey_not_a_member_is_typed_failure() {
+        let sink = MockAgentSink {
+            agents: HashMap::new(),
+            sent: Mutex::new(Vec::new()),
+            members: HashMap::new(), // pubkey below matches no member
+        };
+        let (engine, db, community, channel_id) = setup_engine_with_sink(sink).await;
+
+        let pubkey_hex = hex::encode([9u8; 32]);
+        let (run_id, trigger_ctx, _def_json) = make_assign_run(
+            &db,
+            community,
+            channel_id,
+            serde_json::json!([{
+                "id": "assign", "action": "assign_to_agent",
+                "agent": "Lep", "agent_pubkey": pubkey_hex, "instruction": "please investigate"
+            }]),
+        )
+        .await;
+
+        let action = ActionDef::AssignToAgent {
+            agent: "Lep".to_owned(),
+            agent_pubkey: Some(pubkey_hex),
+            instruction: "please investigate".to_owned(),
+            timeout: None,
+        };
+
+        let err = dispatch_action(
+            "assign",
+            &action,
+            &engine,
+            community,
+            run_id,
+            &trigger_ctx,
+            None,
+        )
+        .await
+        .expect_err("dispatch should fail: pubkey is not a channel member");
+        assert!(
+            err.to_string().contains("is not a member of channel"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn dispatch_assign_to_agent_unresolved_name_is_typed_failure_not_silent_success() {
+        // Agent name matches no member (or is ambiguous) — the sink's
+        // resolve_agent returns Ok(None). Dispatch must surface this as a
+        // step failure, not a "successful" suspend with no one actually
+        // mentioned (which is send_message's own silent behavior for
+        // unresolved @mentions).
+        let sink = MockAgentSink {
+            agents: HashMap::new(), // "Nobody" resolves to None
+            sent: Mutex::new(Vec::new()),
+            members: HashMap::new(),
+        };
+        let (engine, db, community, channel_id) = setup_engine_with_sink(sink).await;
+
+        let (run_id, trigger_ctx, _def_json) = make_assign_run(
+            &db,
+            community,
+            channel_id,
+            serde_json::json!([{
+                "id": "assign", "action": "assign_to_agent",
+                "agent": "Nobody", "instruction": "please investigate"
+            }]),
+        )
+        .await;
+
+        let action = ActionDef::AssignToAgent {
+            agent: "Nobody".to_owned(),
+            agent_pubkey: None,
+            instruction: "please investigate".to_owned(),
+            timeout: None,
+        };
+
+        let err = dispatch_action(
+            "assign",
+            &action,
+            &engine,
+            community,
+            run_id,
+            &trigger_ctx,
+            None,
+        )
+        .await
+        .expect_err("unresolved agent name must be a typed failure");
+
+        assert!(
+            matches!(err, WorkflowError::InvalidDefinition(_)),
+            "expected InvalidDefinition, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("Nobody"),
+            "error should name the unresolved agent: {err}"
+        );
+    }
+
+    // -- Trace timestamps across step outcomes (requires Postgres) ---------
+    //
+    // Design doc "Test plan" bullet: trace entries carry started_at/
+    // completed_at for every action type, including a `waiting` entry on
+    // suspend and a `failed` entry on failure. `execute_run` is exercised
+    // directly (rather than unit-testing `execute_steps` in isolation, which
+    // is private) so the trace shape asserted here is exactly what a real
+    // caller (the relay) receives.
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn trace_entries_carry_started_and_completed_at_for_completed_skipped_and_waiting() {
+        let agent_pubkey = vec![9u8; 32];
+        let mut agents = HashMap::new();
+        agents.insert("Lep".to_owned(), Some(agent_pubkey));
+        let sink = MockAgentSink {
+            agents,
+            sent: Mutex::new(Vec::new()),
+            members: HashMap::new(),
+        };
+        let (engine, db, community, channel_id) = setup_engine_with_sink(sink).await;
+
+        let (run_id, trigger_ctx, def_json) = make_assign_run(
+            &db,
+            community,
+            channel_id,
+            serde_json::json!([
+                {
+                    "id": "notify",
+                    "action": "send_message",
+                    "text": "starting up"
+                },
+                {
+                    "id": "maybe-skip",
+                    "action": "send_message",
+                    "text": "should not run",
+                    "if": "false"
+                },
+                {
+                    "id": "assign",
+                    "action": "assign_to_agent",
+                    "agent": "Lep",
+                    "instruction": "please investigate"
+                }
+            ]),
+        )
+        .await;
+
+        let def: WorkflowDef = serde_json::from_str(&def_json).expect("parse def");
+
+        let result = execute_run(&engine, community, run_id, &def, &trigger_ctx)
+            .await
+            .expect("execute_run should suspend, not error");
+
+        assert_eq!(result.trace.len(), 3, "one trace entry per step");
+
+        let completed = &result.trace[0];
+        assert_eq!(completed["step_id"], "notify");
+        assert_eq!(completed["status"], "completed");
+        assert!(
+            completed["started_at"].as_i64().is_some(),
+            "completed entry must have started_at: {completed}"
+        );
+        assert!(
+            completed["completed_at"].as_i64().is_some(),
+            "completed entry must have completed_at: {completed}"
+        );
+
+        let skipped = &result.trace[1];
+        assert_eq!(skipped["step_id"], "maybe-skip");
+        assert_eq!(skipped["status"], "skipped");
+        assert!(
+            skipped["started_at"].as_i64().is_some(),
+            "skipped entry must have started_at: {skipped}"
+        );
+        assert!(
+            skipped["completed_at"].as_i64().is_some(),
+            "skipped entry must have completed_at: {skipped}"
+        );
+
+        let waiting = &result.trace[2];
+        assert_eq!(waiting["step_id"], "assign");
+        assert_eq!(waiting["status"], "waiting");
+        assert!(
+            waiting["started_at"].as_i64().is_some(),
+            "waiting entry must have started_at: {waiting}"
+        );
+        assert!(
+            waiting["completed_at"].is_null(),
+            "waiting entry's completed_at must be null until resume: {waiting}"
+        );
+
+        assert!(
+            result.suspend.is_some(),
+            "run must suspend at the AssignToAgent step"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn trace_entry_carries_timestamps_and_failed_status_on_dispatch_error() {
+        // Unresolved agent name → dispatch_action returns Err — execute_run
+        // must surface a `failed` trace entry with both timestamps, not an
+        // entry missing started_at/completed_at.
+        let sink = MockAgentSink {
+            agents: HashMap::new(),
+            sent: Mutex::new(Vec::new()),
+            members: HashMap::new(),
+        };
+        let (engine, db, community, channel_id) = setup_engine_with_sink(sink).await;
+
+        let (run_id, trigger_ctx, def_json) = make_assign_run(
+            &db,
+            community,
+            channel_id,
+            serde_json::json!([{
+                "id": "assign",
+                "action": "assign_to_agent",
+                "agent": "Nobody",
+                "instruction": "please investigate"
+            }]),
+        )
+        .await;
+
+        let def: WorkflowDef = serde_json::from_str(&def_json).expect("parse def");
+
+        let (_err, progress) = execute_run(&engine, community, run_id, &def, &trigger_ctx)
+            .await
+            .expect_err("unresolved agent must fail the run");
+
+        assert_eq!(progress.trace.len(), 1);
+        let failed = &progress.trace[0];
+        assert_eq!(failed["step_id"], "assign");
+        assert_eq!(failed["status"], "failed");
+        assert!(
+            failed["error"]
+                .as_str()
+                .is_some_and(|s| s.contains("Nobody")),
+            "failed entry should carry the dispatch error: {failed}"
+        );
+        assert!(
+            failed["started_at"].as_i64().is_some(),
+            "failed entry must have started_at: {failed}"
+        );
+        assert!(
+            failed["completed_at"].as_i64().is_some(),
+            "failed entry must have completed_at: {failed}"
+        );
     }
 }

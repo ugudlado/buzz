@@ -1022,6 +1022,99 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Workflow agent-step expiry + crash-recovery sweeper for
+    // `workflow_agent_steps` (`AssignToAgent` suspensions). Every pod runs
+    // this independently — the sweep's UPDATE...RETURNING is the
+    // at-most-once boundary per row. Each tick does two things:
+    //   1. Move overdue `pending` rows to `expired` and fail their runs.
+    //   2. Retry rows stuck `done` while their run is still
+    //      `waiting_agent` — the crash window between
+    //      `try_resume_agent_step`'s CAS and its resume call (e.g. the pod
+    //      restarted in between). Without this, such a run would otherwise
+    //      never resume, since the CAS already happened and a duplicate
+    //      reply can no longer win it.
+    {
+        let sweep_state = Arc::clone(&state);
+        let interval_secs = std::env::var("BUZZ_AGENT_STEP_SWEEP_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(60)
+            .max(1);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+
+                match sweep_state.db.sweep_expired_agent_steps(100).await {
+                    Ok(expired) => {
+                        for agent_step in &expired {
+                            // Conditional UPDATE: only fails runs still
+                            // `waiting_agent`, so a run that resumed between
+                            // the row expiring and this tick is left alone.
+                            if let Err(e) = sweep_state
+                                .db
+                                .fail_run_if_waiting_agent(
+                                    agent_step.community_id,
+                                    agent_step.run_id,
+                                    agent_step.step_index,
+                                    "agent assignment expired",
+                                )
+                                .await
+                            {
+                                tracing::error!(
+                                    run_id = %agent_step.run_id,
+                                    "Agent-step sweep: failed to fail expired run: {e}"
+                                );
+                            }
+                        }
+                        if !expired.is_empty() {
+                            tracing::info!(
+                                count = expired.len(),
+                                "Swept expired workflow agent steps"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("Agent-step expiry sweep tick failed: {e}");
+                    }
+                }
+
+                // Crash-recovery pass: retry rows CAS'd to `done` whose run
+                // never resumed. `min_age_secs` gives an in-flight resume
+                // (same request, still between its own CAS and its
+                // `execute_from_step` call) room to finish before the
+                // sweeper would otherwise race it.
+                const STUCK_MIN_AGE_SECS: i64 = 30;
+                match sweep_state
+                    .db
+                    .list_stuck_done_agent_steps(STUCK_MIN_AGE_SECS, 100)
+                    .await
+                {
+                    Ok(stuck) => {
+                        if !stuck.is_empty() {
+                            tracing::info!(
+                                count = stuck.len(),
+                                "Retrying crash-interrupted workflow agent-step resumes"
+                            );
+                        }
+                        for stuck_step in &stuck {
+                            buzz_relay::handlers::command_executor::retry_stuck_agent_step_resume(
+                                &sweep_state,
+                                stuck_step.community_id,
+                                &stuck_step.prompt_event_id,
+                            )
+                            .await;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("Agent-step crash-recovery sweep tick failed: {e}");
+                    }
+                }
+            }
+        });
+    }
+
     // Usage metrics: periodic background task polling per-community stats.
     //
     // DB-derived gauges (users, channels, messages, members, workflows, git

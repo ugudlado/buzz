@@ -1956,7 +1956,7 @@ pub async fn workflow_webhook(
         )
         .await;
         engine
-            .finalize_run(community_id, run_id, result, None)
+            .finalize_run(community_id, workflow.id, run_id, result, None)
             .await;
     });
 

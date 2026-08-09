@@ -17,6 +17,7 @@ export const ACTION_TYPES = [
   "request_approval",
   "add_reaction",
   "set_channel_topic",
+  "assign_to_agent",
 ] as const;
 export type ActionType = (typeof ACTION_TYPES)[number];
 
@@ -53,6 +54,9 @@ export type StepFormState = {
   from?: string;
   message?: string;
   timeout?: string;
+  agent?: string;
+  agentPubkey?: string;
+  instruction?: string;
 };
 
 export type WorkflowFormState = {
@@ -87,6 +91,7 @@ export const ACTION_LABELS: Record<ActionType, string> = {
   request_approval: "Request Approval",
   add_reaction: "Add Reaction",
   set_channel_topic: "Set Channel Topic",
+  assign_to_agent: "Assign To Agent",
 };
 
 function toHeaderRows(
@@ -165,6 +170,12 @@ function actionFieldsForStep(step: StepFormState): Record<string, unknown> {
       break;
     case "set_channel_topic":
       if (step.topic) fields.topic = step.topic;
+      break;
+    case "assign_to_agent":
+      if (step.agent) fields.agent = step.agent;
+      if (step.agentPubkey) fields.agent_pubkey = step.agentPubkey;
+      if (step.instruction) fields.instruction = step.instruction;
+      if (step.timeout) fields.timeout = step.timeout;
       break;
   }
   return fields;
@@ -287,6 +298,9 @@ export function yamlToFormState(
         from: step.from as string | undefined,
         message: step.message as string | undefined,
         timeout: step.timeout as string | undefined,
+        agent: step.agent as string | undefined,
+        agentPubkey: step.agent_pubkey as string | undefined,
+        instruction: step.instruction as string | undefined,
       }),
     );
 

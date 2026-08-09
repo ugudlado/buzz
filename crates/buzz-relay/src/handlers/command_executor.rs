@@ -977,7 +977,7 @@ async fn handle_workflow_trigger(
         )
         .await;
         engine
-            .finalize_run(community_id, run_id, result, None)
+            .finalize_run(community_id, workflow_id, run_id, result, None)
             .await;
     });
 
@@ -1365,6 +1365,442 @@ async fn resume_workflow_after_approval(
     )
     .await;
     engine
-        .finalize_run(community_id, run_id, result, existing_trace)
+        .finalize_run(
+            community_id,
+            run.workflow_id,
+            run_id,
+            result,
+            existing_trace,
+        )
         .await;
+}
+
+/// Check whether an incoming kind:9 event is a reply to a pending
+/// `workflow_agent_steps` row, and if so, resume the suspended run.
+///
+/// Called from the event handler's post-store hook for every stored kind:9
+/// event (sibling to, not part of, the ordinary workflow-trigger path — an
+/// agent's completion reply is itself a normal chat message and would
+/// otherwise just flow through `WorkflowEngine::on_event` like any other
+/// trigger candidate).
+///
+/// Matching: the reply's NIP-10 `parent_event_id` (immediate reply target,
+/// not `root_event_id`) must equal a `workflow_agent_steps.prompt_event_id`
+/// row for this community, AND the event's author must equal that row's
+/// `agent_pubkey` — otherwise any thread participant could forge a
+/// completion by simply replying to the same thread. A non-match (no thread
+/// tags, unknown prompt id, wrong author) is not an error — it just means
+/// this event isn't an agent-step reply, and the caller's normal event
+/// handling continues unaffected.
+///
+/// On a match, the row is CAS'd `pending -> done` *before* any further work
+/// (guards against a duplicate reply or a concurrent expiry-sweep resume).
+/// Only the CAS winner parses the completion block and resumes the run.
+pub async fn try_resume_agent_step(tenant: &TenantContext, state: &Arc<AppState>, event: &Event) {
+    // buzz-acp posts completions as direct replies to the run's thread root
+    // (so the run reads as one flat thread) and names the completed prompt
+    // in a `buzz:completion-of` tag. Prefer that; fall back to the NIP-10
+    // parent for agents that reply to the prompt directly (e.g. via the
+    // `buzz` CLI). Authorship is verified against the step row below either
+    // way — the tag grants no authority on its own.
+    let tagged_prompt = event.tags.iter().find_map(|t| {
+        let parts = t.as_slice();
+        (parts.len() >= 2 && parts[0] == buzz_core::thread::TAG_COMPLETION_OF)
+            .then(|| parts[1].to_string())
+    });
+    let harness_posted = tagged_prompt.is_some();
+    let prompt_event_id = match tagged_prompt {
+        Some(id) => id,
+        None => {
+            let thread = buzz_core::thread::parse_thread_tags(event);
+            let Some(parent) = thread.parent_event_id else {
+                return;
+            };
+            parent
+        }
+    };
+
+    let community_id = tenant.community();
+    let step = match state
+        .db
+        .get_agent_step(community_id, &prompt_event_id)
+        .await
+    {
+        Ok(s) => s,
+        Err(buzz_db::DbError::NotFound(_)) => return, // Not a reply to any known agent-step prompt.
+        Err(e) => {
+            tracing::error!(
+                prompt_event_id = %prompt_event_id,
+                "Agent-step resume: failed to look up agent step: {e}"
+            );
+            return;
+        }
+    };
+
+    let author_hex = event.pubkey.to_bytes().to_vec();
+    if author_hex != step.agent_pubkey {
+        tracing::warn!(
+            prompt_event_id = %prompt_event_id,
+            "Agent-step reply author mismatch — ignoring (possible forged completion attempt)"
+        );
+        return;
+    }
+
+    // Look up the prompt's own thread identity (root event id/created_at) so
+    // the reply's thread info below can carry the run's root forward — best
+    // effort: a lookup failure just means the next assign_to_agent step
+    // falls back to posting top-level instead of threading, not a resume
+    // failure. The fetched run is reused by `resume_from_done_agent_step`
+    // below, so a resume costs one `workflow_runs` read, not two.
+    let run = state.db.get_workflow_run(community_id, step.run_id).await;
+    let root_thread = run.as_ref().ok().and_then(|run| {
+        run.execution_trace
+            .as_array()
+            .and_then(|trace| {
+                trace.iter().find(|e| {
+                    e.get("step_id").and_then(|v| v.as_str()) == Some(step.step_id.as_str())
+                })
+            })
+            .and_then(|e| e.get("__prompt_thread"))
+            .cloned()
+    });
+
+    // CAS the row pending -> done FIRST — this is the double-resume guard
+    // against a duplicate reply or a concurrent expiry-sweep/crash-recovery
+    // resume. Only the CAS winner proceeds.
+    // A harness-posted reply (tagged `buzz:completion-of`) is the agent
+    // speaking in its own words at turn end — turn ended means the step is
+    // done, so no ```completion block is required and the message text
+    // becomes the reason. Untagged direct replies (e.g. via the `buzz` CLI)
+    // keep the strict contract: missing/malformed block parses as failed.
+    let completion =
+        if harness_posted && !buzz_workflow::completion::has_completion_block(&event.content) {
+            buzz_workflow::completion::AgentCompletion {
+                status: buzz_workflow::completion::CompletionStatus::Success,
+                outputs: Default::default(),
+                reason: Some(
+                    event
+                        .content
+                        .chars()
+                        .take(buzz_workflow::completion::MAX_FALLBACK_REASON_LEN)
+                        .collect(),
+                ),
+                usage: None,
+            }
+        } else {
+            buzz_workflow::completion::parse(&event.content)
+        };
+    let output = agent_completion_to_output_json(
+        &completion,
+        &event.id.to_hex(),
+        event.created_at.as_secs() as i64,
+        root_thread.as_ref(),
+    );
+
+    let updated = match state
+        .db
+        .update_agent_step_by_prompt_event_id(
+            community_id,
+            &prompt_event_id,
+            buzz_db::workflow::AgentStepStatus::Done,
+            Some(&output),
+        )
+        .await
+    {
+        Ok(updated) => updated,
+        Err(e) => {
+            tracing::error!(
+                prompt_event_id = %prompt_event_id,
+                "Agent-step resume: failed to CAS step to done: {e}"
+            );
+            return;
+        }
+    };
+
+    if !updated {
+        // Lost the CAS race (already resumed by a duplicate reply or the
+        // sweeper) — nothing further to do.
+        return;
+    }
+
+    resume_from_done_agent_step(state, community_id, &step, output, run.ok()).await;
+}
+
+/// Serialize a parsed [`buzz_workflow::AgentCompletion`] into the JSON shape
+/// stored in `workflow_agent_steps.output` and used as the agent step's
+/// trace/step-output entry.
+///
+/// `reply_event_id`/`reply_created_at` identify the reply event itself;
+/// `root_thread` is the prompt's `__prompt_thread` trace blob (root event
+/// id and created_at), when available. Both are folded into
+/// `outputs.__reply_thread` so `buzz-workflow`'s
+/// `thread_anchor_from_step_output` can reconstruct a `ThreadAnchor` for the
+/// *next* `assign_to_agent` step to reply under, threading the whole run
+/// into one NIP-10 conversation. Best-effort: a missing `root_thread`
+/// (e.g. pre-upgrade run) just means the next step falls back to a
+/// top-level message instead of failing the resume.
+fn agent_completion_to_output_json(
+    completion: &buzz_workflow::AgentCompletion,
+    reply_event_id: &str,
+    reply_created_at: i64,
+    root_thread: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let mut outputs = completion.outputs.clone();
+    if let Some(root) = root_thread
+        .and_then(|t| t.get("root_event_id"))
+        .and_then(|v| v.as_str())
+    {
+        let root_created_at = root_thread
+            .and_then(|t| t.get("root_created_at"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(reply_created_at);
+        outputs.insert(
+            "__reply_thread".to_string(),
+            serde_json::json!({
+                "event_id": reply_event_id,
+                "created_at": reply_created_at,
+                "root_event_id": root,
+                "root_created_at": root_created_at,
+            }),
+        );
+    }
+
+    serde_json::json!({
+        "status": match completion.status {
+            buzz_workflow::CompletionStatus::Success => "success",
+            buzz_workflow::CompletionStatus::Failed => "failed",
+        },
+        "outputs": outputs,
+        "reason": completion.reason,
+        "usage": completion.usage.as_ref().map(|u| serde_json::json!({
+            "input_tokens": u.input_tokens,
+            "output_tokens": u.output_tokens,
+            "cost": u.cost,
+        })),
+    })
+}
+
+/// Resume a workflow run from an agent step already CAS'd to `status =
+/// 'done'` (either just now by [`try_resume_agent_step`], or previously by a
+/// crash-interrupted resume that the sweeper is retrying). Writes a synthetic
+/// `completed` trace entry + step output for the agent step, then resumes
+/// execution from the next step.
+///
+/// Idempotent to call more than once for the same step: `execute_from_step`
+/// skips steps before `resume_index`, and [`WorkflowEngine::finalize_run`]'s
+/// callers all guard on `run.status == WaitingAgent` before invoking this,
+/// so a run already advanced past this point is a no-op here.
+async fn resume_from_done_agent_step(
+    state: &Arc<AppState>,
+    community_id: CommunityId,
+    step: &buzz_db::workflow::AgentStepRecord,
+    output: serde_json::Value,
+    run: Option<buzz_db::workflow::WorkflowRunRecord>,
+) {
+    // `run` is passed in when the caller already fetched it (the live resume
+    // path); the sweeper's retry path passes `None` and fetches here.
+    let run = match run {
+        Some(r) => r,
+        None => match state.db.get_workflow_run(community_id, step.run_id).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(
+                    run_id = %step.run_id,
+                    "Agent-step resume: failed to fetch run: {e}"
+                );
+                return;
+            }
+        },
+    };
+
+    // CAS the run waiting_agent -> running before doing any resume work —
+    // this, not the earlier status check alone, is what prevents two
+    // concurrent resume attempts for the same run (e.g. the crash-recovery
+    // sweeper racing a still-in-flight live resume once both are past the
+    // grace period) from both calling `execute_from_step`. Only the CAS
+    // winner proceeds; the loser's run has already been (or is being)
+    // resumed by the other caller.
+    match state
+        .db
+        .try_mark_run_resuming(community_id, step.run_id)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::warn!(
+                run_id = %step.run_id,
+                "Agent-step resume: run has status '{}', expected 'waiting_agent' (lost resume race or already resumed)",
+                run.status
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::error!(
+                run_id = %step.run_id,
+                "Agent-step resume: failed to CAS run to running: {e}"
+            );
+            return;
+        }
+    }
+
+    let workflow = match state.db.get_workflow(community_id, step.workflow_id).await {
+        Ok(w) => w,
+        Err(e) => {
+            tracing::error!(
+                workflow_id = %step.workflow_id,
+                "Agent-step resume: failed to fetch workflow: {e}"
+            );
+            return;
+        }
+    };
+
+    let def: buzz_workflow::WorkflowDef = match serde_json::from_value(workflow.definition.clone())
+    {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::error!("Agent-step resume: failed to parse workflow definition: {e}");
+            if let Err(db_err) = state
+                .db
+                .update_workflow_run(
+                    community_id,
+                    step.run_id,
+                    RunStatus::Failed,
+                    run.current_step,
+                    &run.execution_trace,
+                    Some(&format!("definition parse error: {e}")),
+                )
+                .await
+            {
+                tracing::error!("Agent-step resume: failed to mark run as failed: {db_err}");
+            }
+            return;
+        }
+    };
+
+    // Reconstruct step_outputs from the execution trace so far, same as the
+    // approval-resume path — but unlike that path, the suspended step's own
+    // entry in the trace only has `"status": "waiting"` (no output yet, since
+    // the agent hadn't replied when it was written). Replace that entry with
+    // a synthetic "completed" entry carrying the parsed completion output, so
+    // downstream `{{steps.<id>.output.X}}` references resolve correctly.
+    let mut initial_outputs: std::collections::HashMap<String, serde_json::Value> =
+        std::collections::HashMap::new();
+    let mut trace: Vec<serde_json::Value> =
+        run.execution_trace.as_array().cloned().unwrap_or_default();
+
+    for entry in &trace {
+        if let (Some(step_id), Some(out)) = (
+            entry.get("step_id").and_then(|v| v.as_str()),
+            entry.get("output"),
+        ) {
+            initial_outputs.insert(step_id.to_string(), out.clone());
+        }
+    }
+
+    // A missing/malformed completion block parses to `status: failed` with
+    // the raw reply as `reason` (see `completion::parse`'s documented
+    // fallback) rather than failing outward — the step must resume either
+    // way, never leaving the run stuck. Mirror that outcome into the trace
+    // entry: `outputs` (the structured `{{steps.<id>.output.X}}` map) is
+    // only populated on a real completion block, so a failed/fallback
+    // parse would otherwise silently record an empty `{}` output and a
+    // `status: completed` entry that hides the failure.
+    let completion_failed = output.get("status").and_then(|v| v.as_str()) == Some("failed");
+    let agent_step_output = if completion_failed {
+        output.clone()
+    } else {
+        output.get("outputs").cloned().unwrap_or(output.clone())
+    };
+    initial_outputs.insert(step.step_id.clone(), agent_step_output.clone());
+
+    // `started_at` carries over from the original "waiting" entry (when the
+    // @mention was sent) rather than resetting to now — the agent's think
+    // time is part of the step's duration. Fall back to the assignment row's
+    // `created_at` if the waiting entry never got a `started_at` (e.g. a
+    // pre-upgrade run resumed after this field was added).
+    let waiting_entry = trace
+        .iter_mut()
+        .find(|e| e.get("step_id").and_then(|v| v.as_str()) == Some(step.step_id.as_str()));
+    let started_at = waiting_entry
+        .as_ref()
+        .and_then(|e| e.get("started_at"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or_else(|| step.created_at.timestamp());
+    let completed_entry = serde_json::json!({
+        "step_id": step.step_id,
+        "status": if completion_failed { "failed" } else { "completed" },
+        "output": agent_step_output,
+        "started_at": started_at,
+        "completed_at": chrono::Utc::now().timestamp(),
+    });
+
+    match waiting_entry {
+        Some(entry) => *entry = completed_entry,
+        None => trace.push(completed_entry),
+    }
+
+    let trigger_ctx: TriggerContext = run
+        .trigger_context
+        .as_ref()
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+
+    let resume_index = step.step_index as usize + 1;
+    let existing_trace = Some(trace);
+    let result = buzz_workflow::executor::execute_from_step(
+        &state.workflow_engine,
+        community_id,
+        step.run_id,
+        &def,
+        &trigger_ctx,
+        resume_index,
+        Some(initial_outputs),
+    )
+    .await;
+    state
+        .workflow_engine
+        .finalize_run(
+            community_id,
+            step.workflow_id,
+            step.run_id,
+            result,
+            existing_trace,
+        )
+        .await;
+}
+
+/// Retry resuming a `workflow_agent_steps` row that reached `status = 'done'`
+/// but whose run is still `waiting_agent` — the crash window between
+/// [`try_resume_agent_step`]'s CAS and its resume call (e.g. the relay
+/// restarted in between). Called by the relay's periodic sweeper for each
+/// row `buzz_db::Db::list_stuck_done_agent_steps` returns.
+///
+/// The row's `output` column already holds the parsed completion from the
+/// original CAS, so this re-fetches the full record and resumes from it
+/// without re-parsing or re-CASing (the row is already `done`; CAS'ing again
+/// would just no-op against its own `WHERE status = 'pending'` guard).
+pub async fn retry_stuck_agent_step_resume(
+    state: &Arc<AppState>,
+    community_id: CommunityId,
+    prompt_event_id: &str,
+) {
+    let step = match state.db.get_agent_step(community_id, prompt_event_id).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(
+                prompt_event_id = %prompt_event_id,
+                "Agent-step crash-recovery retry: failed to fetch step: {e}"
+            );
+            return;
+        }
+    };
+
+    if step.status != buzz_db::workflow::AgentStepStatus::Done {
+        // Raced with something else between the sweep's SELECT and this
+        // retry (e.g. already expired) — nothing to do.
+        return;
+    }
+
+    let output = step.output.clone().unwrap_or_else(|| serde_json::json!({}));
+    resume_from_done_agent_step(state, community_id, &step, output, None).await;
 }

@@ -232,11 +232,29 @@ async fn is_owner_or_sibling(
 /// siblings may fire a turn — the explicit allowlist and `anyone` mode do
 /// NOT apply inside DMs. `Nobody` still drops everything. Callers must
 /// resolve `is_dm` fail-closed: unknown channel type ⇒ treat as DM.
+///
+/// # Relay-signed workflow messages (`is_relay_workflow_msg`)
+///
+/// The buzz-workflow engine dispatches `AssignToAgent` prompts as relay-signed
+/// (not agent- or user-signed) events tagged `buzz:workflow`. These must reach
+/// the agent regardless of `respond_to` — a workflow author has no way to be
+/// pre-enrolled in an `OwnerOnly`/`Allowlist` policy, so without this bypass
+/// every agent not configured `respond_to: anyone` silently drops its
+/// workflow-dispatched turns. Callers compute this flag (author is the
+/// relay's own cached NIP-11 `self` pubkey AND the event carries a
+/// `buzz:workflow` tag) and pass it in; this mirrors the relay's own
+/// `is_relay_workflow_msg` check in `buzz-relay/src/handlers/event.rs` so the
+/// two sides agree on what counts as a workflow message.
+///
+/// Deliberately **not** honored inside DMs (`is_dm` short-circuits first) —
+/// same restriction as the relay side; relay-signed workflow messages are
+/// only expected in channels.
 async fn author_allowed(
     respond_to: &RespondTo,
     allowlist: &HashSet<String>,
     author: &str,
     is_dm: bool,
+    is_relay_workflow_msg: bool,
     owner_cache: &OwnerCache,
     rest_client: &relay::RestClient,
 ) -> bool {
@@ -245,6 +263,9 @@ async fn author_allowed(
             RespondTo::Nobody => false,
             _ => is_owner_or_sibling(author, owner_cache, rest_client).await,
         };
+    }
+    if is_relay_workflow_msg {
+        return true;
     }
     match respond_to {
         RespondTo::Anyone => true,
@@ -255,6 +276,28 @@ async fn author_allowed(
                 || is_owner_or_sibling(author, owner_cache, rest_client).await
         }
     }
+}
+
+/// Whether `event` is a relay-signed `buzz:workflow` dispatch message.
+///
+/// Mirrors `is_relay_workflow_msg` in `buzz-relay/src/handlers/event.rs`:
+/// signed by the relay's own keypair (as resolved via NIP-11 at startup) AND
+/// carrying a `buzz:workflow` tag. `relay_pubkey` is `None` when the
+/// startup NIP-11 fetch failed or was skipped — in that case this always
+/// returns `false` and `author_allowed` falls through to normal `respond_to`
+/// handling (fail-closed: no relay pubkey means we can never positively
+/// identify a relay-signed message).
+pub(crate) fn is_relay_workflow_message(
+    event: &nostr::Event,
+    relay_pubkey: Option<&nostr::PublicKey>,
+) -> bool {
+    let Some(relay_pubkey) = relay_pubkey else {
+        return false;
+    };
+    event.pubkey == *relay_pubkey
+        && event.tags.iter().any(|t| {
+            t.as_slice().first().map(|s| s.as_str()) == Some(buzz_core::thread::TAG_WORKFLOW)
+        })
 }
 
 /// Resolve whether `channel_id` is a DM, for the inbound author gate.
@@ -1808,6 +1851,21 @@ async fn tokio_main() -> Result<()> {
         );
     }
 
+    // Resolve the relay's own signing pubkey once via NIP-11, so the inbound
+    // author gate can recognize relay-signed `buzz:workflow` dispatch
+    // messages (see `is_relay_workflow_message`). Best-effort: an unreachable
+    // `/info` document or a relay with NIP-11 disabled must not block agent
+    // startup — the workflow bypass simply never triggers in that case.
+    let relay_pubkey = match relay.rest_client().fetch_relay_pubkey().await {
+        Ok(pk) => Some(pk),
+        Err(e) => {
+            tracing::warn!(
+                "failed to resolve relay pubkey via NIP-11 — relay-signed workflow messages will not bypass respond_to: {e}"
+            );
+            None
+        }
+    };
+
     let base_prompt_content = config.base_prompt_content.take();
     let ctx = Arc::new(PromptContext {
         mcp_servers: build_mcp_servers(&config),
@@ -1843,6 +1901,7 @@ async fn tokio_main() -> Result<()> {
         memory_enabled: config.memory_enabled,
         harness_name: crate::config::normalize_agent_command_identity(&config.agent_command),
         relay_url: config.relay_url.clone(),
+        relay_pubkey,
     });
 
     if !config.memory_enabled {
@@ -2452,11 +2511,16 @@ async fn tokio_main() -> Result<()> {
                                 // exercised by non-owner authors inside DMs.
                                 let is_dm =
                                     is_dm_channel(buzz_event.channel_id, &ctx.channel_info).await;
+                                let is_relay_workflow_msg = is_relay_workflow_message(
+                                    &buzz_event.event,
+                                    ctx.relay_pubkey.as_ref(),
+                                );
                                 let allowed = author_allowed(
                                     &config.respond_to,
                                     &config.respond_to_allowlist,
                                     &author,
                                     is_dm,
+                                    is_relay_workflow_msg,
                                     &owner_cache,
                                     &ctx.rest_client,
                                 )
@@ -3510,6 +3574,15 @@ fn handle_prompt_result(
                 );
                 spawn_failure_notice(rest_client, &dead, content);
             }
+            // Note: a cleanly-successful turn (`PromptOutcome::Ok`) never
+            // reaches this block at all — `send_prompt_result` always passes
+            // `batch: None` on that path (see `run_prompt_task` in
+            // `pool.rs`), since there is nothing to require/dead-letter. The
+            // workflow-completion reply for a successful `assign_to_agent`
+            // turn is therefore posted from INSIDE `run_prompt_task` itself
+            // (`spawn_workflow_completion_if_applicable`, called at both
+            // `PromptOutcome::Ok` call sites in `pool.rs`), before `batch`
+            // is replaced with `None` — not here.
         } else {
             tracing::debug!(
                 channel_id = %batch.channel_id,
@@ -4788,6 +4861,7 @@ mod author_gate_tests {
                 &allowlist,
                 SIBLING,
                 false,
+                false,
                 &cache,
                 &dummy_rest_client()
             )
@@ -4805,6 +4879,7 @@ mod author_gate_tests {
                 &RespondTo::Allowlist,
                 &allowlist,
                 EXTERNAL,
+                false,
                 false,
                 &cache,
                 &dummy_rest_client()
@@ -4824,6 +4899,7 @@ mod author_gate_tests {
                 &allowlist,
                 STRANGER,
                 false,
+                false,
                 &cache,
                 &dummy_rest_client()
             )
@@ -4841,6 +4917,7 @@ mod author_gate_tests {
                 &RespondTo::Allowlist,
                 &allowlist,
                 OWNER,
+                false,
                 false,
                 &cache,
                 &dummy_rest_client()
@@ -4863,6 +4940,7 @@ mod author_gate_tests {
                 &HashSet::new(),
                 STRANGER,
                 false,
+                false,
                 &cache,
                 &dummy_rest_client()
             )
@@ -4880,6 +4958,7 @@ mod author_gate_tests {
                     &RespondTo::OwnerOnly,
                     &HashSet::new(),
                     who,
+                    false,
                     false,
                     &cache,
                     &dummy_rest_client()
@@ -4907,6 +4986,7 @@ mod author_gate_tests {
                 &allowlist,
                 EXTERNAL,
                 true,
+                false,
                 &cache,
                 &dummy_rest_client()
             )
@@ -4924,6 +5004,7 @@ mod author_gate_tests {
                 &HashSet::new(),
                 STRANGER,
                 true,
+                false,
                 &cache,
                 &dummy_rest_client()
             )
@@ -4947,6 +5028,7 @@ mod author_gate_tests {
                         &HashSet::new(),
                         who,
                         true,
+                        false,
                         &cache,
                         &dummy_rest_client()
                     )
@@ -4966,11 +5048,117 @@ mod author_gate_tests {
                 &HashSet::new(),
                 OWNER,
                 true,
+                false,
                 &cache,
                 &dummy_rest_client()
             )
             .await,
             "respond_to=nobody must drop everything, DMs included"
+        );
+    }
+
+    // ── relay-signed workflow messages ──────────────────────────────────────
+    //
+    // AssignToAgent prompts dispatched by the workflow engine are relay-signed
+    // (not agent- or user-signed) and tagged `buzz:workflow`. They must reach
+    // the agent regardless of `respond_to` — a workflow has no way to be
+    // pre-enrolled in an OwnerOnly/Allowlist policy.
+
+    fn relay_event_with_tags(relay_keys: &nostr::Keys, tags: Vec<nostr::Tag>) -> nostr::Event {
+        nostr::EventBuilder::new(nostr::Kind::Custom(9), "workflow prompt")
+            .tags(tags)
+            .sign_with_keys(relay_keys)
+            .expect("test event signing must succeed")
+    }
+
+    #[tokio::test]
+    async fn test_relay_workflow_message_bypasses_owner_only() {
+        let cache = cache_with_sibling();
+        let relay_keys = nostr::Keys::generate();
+        let event = relay_event_with_tags(
+            &relay_keys,
+            vec![nostr::Tag::custom(
+                nostr::TagKind::Custom("buzz:workflow".into()),
+                Vec::<String>::new(),
+            )],
+        );
+        let is_relay_workflow_msg =
+            is_relay_workflow_message(&event, Some(&relay_keys.public_key()));
+        assert!(
+            is_relay_workflow_msg,
+            "a relay-signed event with a buzz:workflow tag must be recognized as a workflow message"
+        );
+        assert!(
+            author_allowed(
+                &RespondTo::OwnerOnly,
+                &HashSet::new(),
+                &relay_keys.public_key().to_hex(),
+                false,
+                is_relay_workflow_msg,
+                &cache,
+                &dummy_rest_client()
+            )
+            .await,
+            "a relay-signed buzz:workflow message must bypass respond_to=OwnerOnly even though the relay is not the owner"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_relay_signed_message_without_workflow_tag_falls_through_to_owner_only() {
+        let cache = cache_with_sibling();
+        let relay_keys = nostr::Keys::generate();
+        // Same relay-signed author, but no buzz:workflow tag.
+        let event = relay_event_with_tags(&relay_keys, vec![]);
+        let is_relay_workflow_msg =
+            is_relay_workflow_message(&event, Some(&relay_keys.public_key()));
+        assert!(
+            !is_relay_workflow_msg,
+            "a relay-signed event without a buzz:workflow tag must not be treated as a workflow message"
+        );
+        assert!(
+            !author_allowed(
+                &RespondTo::OwnerOnly,
+                &HashSet::new(),
+                &relay_keys.public_key().to_hex(),
+                false,
+                is_relay_workflow_msg,
+                &cache,
+                &dummy_rest_client()
+            )
+            .await,
+            "without the buzz:workflow tag, a relay-signed author must fall through to normal OwnerOnly rejection"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_relay_workflow_message_not_force_allowed_in_dm() {
+        let cache = cache_with_sibling();
+        let relay_keys = nostr::Keys::generate();
+        let event = relay_event_with_tags(
+            &relay_keys,
+            vec![nostr::Tag::custom(
+                nostr::TagKind::Custom("buzz:workflow".into()),
+                Vec::<String>::new(),
+            )],
+        );
+        let is_relay_workflow_msg =
+            is_relay_workflow_message(&event, Some(&relay_keys.public_key()));
+        assert!(
+            is_relay_workflow_msg,
+            "sanity check: the fixture event must be recognized as a workflow message outside of DMs"
+        );
+        assert!(
+            !author_allowed(
+                &RespondTo::Nobody,
+                &HashSet::new(),
+                &relay_keys.public_key().to_hex(),
+                true, // is_dm
+                is_relay_workflow_msg,
+                &cache,
+                &dummy_rest_client()
+            )
+            .await,
+            "a relay-signed buzz:workflow message must NOT be force-allowed inside a DM — DM hardening takes priority"
         );
     }
 
@@ -5103,8 +5291,9 @@ mod author_gate_tests {
                 &allowlist,
                 EXTERNAL,
                 is_dm,
+                false,
                 &owner_cache,
-                &dummy_rest_client(),
+                &dummy_rest_client()
             )
             .await,
             "an external author must not pass when startup discovery omitted metadata"

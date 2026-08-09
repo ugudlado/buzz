@@ -119,12 +119,14 @@ function TriggerConfigFields({
 }
 
 type WorkflowFormBuilderProps = {
+  channelId?: string | null;
   disabled?: boolean;
   onChange: (yaml: string) => void;
   yaml: string;
 };
 
 export function WorkflowFormBuilder({
+  channelId = null,
   disabled,
   onChange,
   yaml,
@@ -340,6 +342,7 @@ export function WorkflowFormBuilder({
               <div className="space-y-2">
                 {formState.steps.map((step, index) => (
                   <WorkflowStepCard
+                    channelId={channelId}
                     disabled={disabled}
                     index={index}
                     key={step.id}

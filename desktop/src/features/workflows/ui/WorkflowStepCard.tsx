@@ -3,6 +3,7 @@ import { Trash2 } from "lucide-react";
 import { Button } from "@/shared/ui/button";
 import { Input } from "@/shared/ui/input";
 import { Textarea } from "@/shared/ui/textarea";
+import { AgentCombobox } from "./AgentCombobox";
 import { FieldLabel, FormSelect } from "./workflowFormPrimitives";
 import { ACTION_LABELS, ACTION_TYPES } from "./workflowFormTypes";
 import { WorkflowWebhookHeadersEditor } from "./WorkflowWebhookHeadersEditor";
@@ -41,12 +42,14 @@ function BackendSupportHint({ action }: { action: StepFormState["action"] }) {
 }
 
 function StepConfigFields({
+  channelId,
   step,
   prefix,
   disabled,
   triggerType,
   onUpdate,
 }: {
+  channelId: string | null;
   step: StepFormState;
   prefix: string;
   disabled?: boolean;
@@ -289,12 +292,85 @@ function StepConfigFields({
           </div>
         </div>
       );
+    case "assign_to_agent":
+      return (
+        <div className="space-y-2">
+          <div className="space-y-1.5">
+            <FieldLabel htmlFor={`${prefix}-agent`}>
+              Agent (channel member)
+            </FieldLabel>
+            <AgentCombobox
+              channelId={channelId}
+              disabled={disabled}
+              id={`${prefix}-agent`}
+              onChange={({ displayName, pubkey }) =>
+                onUpdate({ ...step, agent: displayName, agentPubkey: pubkey })
+              }
+              value={step.agent ?? ""}
+            />
+            <p className="text-xs text-muted-foreground">
+              Pick from the target channel's members — pins both the display
+              name and pubkey, so a rename or a duplicate name later won't
+              misdirect this step. You can also type a name directly (no pubkey
+              pin) by editing the YAML.
+            </p>
+          </div>
+          {step.agentPubkey ? (
+            <div className="space-y-1.5">
+              <FieldLabel htmlFor={`${prefix}-agent-pubkey`}>
+                Agent pubkey
+              </FieldLabel>
+              <Input
+                autoCapitalize="off"
+                disabled={disabled}
+                id={`${prefix}-agent-pubkey`}
+                onChange={(event) =>
+                  onUpdate({ ...step, agentPubkey: event.target.value })
+                }
+                value={step.agentPubkey}
+              />
+            </div>
+          ) : null}
+          <div className="space-y-1.5">
+            <FieldLabel htmlFor={`${prefix}-instruction`}>
+              Instruction
+            </FieldLabel>
+            <Textarea
+              autoCapitalize="off"
+              className="min-h-[60px] resize-y text-xs"
+              disabled={disabled}
+              id={`${prefix}-instruction`}
+              onChange={(event) =>
+                onUpdate({ ...step, instruction: event.target.value })
+              }
+              placeholder="What should the agent do? Ask it to reply with a ```completion block."
+              value={step.instruction ?? ""}
+            />
+          </div>
+          <div className="space-y-1.5">
+            <FieldLabel htmlFor={`${prefix}-timeout`}>
+              Timeout (optional)
+            </FieldLabel>
+            <Input
+              autoCapitalize="off"
+              disabled={disabled}
+              id={`${prefix}-timeout`}
+              onChange={(event) =>
+                onUpdate({ ...step, timeout: event.target.value })
+              }
+              placeholder="e.g. 10m, 24h (defaults to 24h)"
+              value={step.timeout ?? ""}
+            />
+          </div>
+        </div>
+      );
     default:
       return null;
   }
 }
 
 export function WorkflowStepCard({
+  channelId = null,
   index,
   disabled,
   onRemove,
@@ -302,6 +378,7 @@ export function WorkflowStepCard({
   step,
   triggerType,
 }: {
+  channelId?: string | null;
   index: number;
   disabled?: boolean;
   onRemove: () => void;
@@ -416,6 +493,7 @@ export function WorkflowStepCard({
       </div>
 
       <StepConfigFields
+        channelId={channelId}
         disabled={disabled}
         onUpdate={onUpdate}
         prefix={prefix}

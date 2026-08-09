@@ -3820,6 +3820,24 @@ impl Db {
         .await
     }
 
+    /// CAS a run's status `waiting_approval|waiting_agent -> running` before resuming it.
+    /// See [`workflow::try_mark_run_resuming`].
+    pub async fn try_mark_run_resuming(&self, community_id: CommunityId, id: Uuid) -> Result<bool> {
+        workflow::try_mark_run_resuming(&self.pool, community_id, id).await
+    }
+
+    /// Fail a run still `waiting_agent` in one conditional UPDATE.
+    /// See [`workflow::fail_run_if_waiting_agent`].
+    pub async fn fail_run_if_waiting_agent(
+        &self,
+        community_id: CommunityId,
+        id: Uuid,
+        current_step: i32,
+        error: &str,
+    ) -> Result<bool> {
+        workflow::fail_run_if_waiting_agent(&self.pool, community_id, id, current_step, error).await
+    }
+
     /// Create an approval request.
     pub async fn create_approval(&self, params: workflow::CreateApprovalParams<'_>) -> Result<()> {
         workflow::create_approval(&self.pool, params).await
@@ -3891,6 +3909,65 @@ impl Db {
             note,
         )
         .await
+    }
+
+    /// Create an agent-assignment step (`AssignToAgent` suspension).
+    pub async fn create_agent_step(
+        &self,
+        params: workflow::CreateAgentStepParams<'_>,
+    ) -> Result<()> {
+        workflow::create_agent_step(&self.pool, params).await
+    }
+
+    /// Fetch an agent-assignment step by its prompt event id.
+    pub async fn get_agent_step(
+        &self,
+        community_id: CommunityId,
+        prompt_event_id: &str,
+    ) -> Result<workflow::AgentStepRecord> {
+        workflow::get_agent_step(&self.pool, community_id, prompt_event_id).await
+    }
+
+    /// Update an agent step's status and optional output.
+    pub async fn update_agent_step_by_prompt_event_id(
+        &self,
+        community_id: CommunityId,
+        prompt_event_id: &str,
+        status: workflow::AgentStepStatus,
+        output: Option<&serde_json::Value>,
+    ) -> Result<bool> {
+        workflow::update_agent_step_by_prompt_event_id(
+            &self.pool,
+            community_id,
+            prompt_event_id,
+            status,
+            output,
+        )
+        .await
+    }
+
+    /// Sweep overdue `workflow_agent_steps` rows to `status = 'expired'`.
+    ///
+    /// Returns one entry per swept row; callers are responsible for
+    /// finalizing the associated `workflow_runs` row (this call only touches
+    /// `workflow_agent_steps`). `limit` bounds one sweep tick.
+    pub async fn sweep_expired_agent_steps(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<workflow::ExpiredAgentStep>> {
+        workflow::sweep_expired_agent_steps(&self.pool, limit).await
+    }
+
+    /// Find `workflow_agent_steps` rows stuck `done` while their run is still
+    /// `waiting_agent` — the crash window between the CAS-to-`done` and the
+    /// resume call. `min_age_secs` avoids racing an in-flight resume (see
+    /// [`workflow::list_stuck_done_agent_steps`]).
+    pub async fn list_stuck_done_agent_steps(
+        &self,
+        min_age_secs: i64,
+        limit: i64,
+    ) -> Result<Vec<workflow::StuckDoneAgentStep>> {
+        workflow::list_stuck_done_agent_steps(&self.pool, min_age_secs, limit).await
     }
 
     /// Ensures monthly partitions exist for the next N months.

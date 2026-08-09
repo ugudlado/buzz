@@ -31,13 +31,15 @@
 //! ```
 
 pub mod action_sink;
+pub mod completion;
 pub mod error;
 pub mod executor;
 pub mod schema;
 
 pub use action_sink::{ActionSink, ActionSinkError};
+pub use completion::{AgentCompletion, CompletionStatus, UsageInfo};
 pub use error::{PartialProgress, WorkflowError};
-pub use executor::ExecutionResult;
+pub use executor::{ExecutionResult, PendingSuspend, SuspendReason};
 pub use schema::{ActionDef, Step, TriggerDef, WorkflowDef};
 
 use std::collections::HashMap;
@@ -213,6 +215,7 @@ impl WorkflowEngine {
     pub async fn finalize_run(
         &self,
         community_id: CommunityId,
+        workflow_id: uuid::Uuid,
         run_id: uuid::Uuid,
         result: Result<ExecutionResult, (WorkflowError, PartialProgress)>,
         existing_trace: Option<Vec<serde_json::Value>>,
@@ -226,30 +229,52 @@ impl WorkflowEngine {
                 let trace_json = serde_json::Value::Array(full_trace);
                 let step_count = result.step_index as i32;
 
-                if result.approval_token.is_some() {
-                    // Approval gates are not yet implemented (WF-08).
-                    // Fail explicitly rather than creating unreachable WaitingApproval rows.
-                    tracing::warn!(
-                        run_id = %run_id,
-                        step_index = result.step_index,
-                        "Workflow hit approval gate — not yet implemented, marking as failed"
-                    );
-                    if let Err(e) = self
-                        .db
-                        .update_workflow_run(
-                            community_id,
-                            run_id,
-                            RunStatus::Failed,
-                            step_count,
-                            &trace_json,
-                            Some("approval gates not yet implemented — see WF-08"),
-                        )
-                        .await
-                    {
-                        tracing::error!(
-                            run_id = %run_id,
-                            "Failed to update run to Failed (approval gate): {e}"
-                        );
+                if let Some(suspend) = result.suspend {
+                    match suspend.reason {
+                        executor::SuspendReason::Approval { .. } => {
+                            // Approval gates are not yet implemented (WF-08).
+                            // Fail explicitly rather than creating unreachable WaitingApproval rows.
+                            tracing::warn!(
+                                run_id = %run_id,
+                                step_index = result.step_index,
+                                "Workflow hit approval gate — not yet implemented, marking as failed"
+                            );
+                            if let Err(e) = self
+                                .db
+                                .update_workflow_run(
+                                    community_id,
+                                    run_id,
+                                    RunStatus::Failed,
+                                    step_count,
+                                    &trace_json,
+                                    Some("approval gates not yet implemented — see WF-08"),
+                                )
+                                .await
+                            {
+                                tracing::error!(
+                                    run_id = %run_id,
+                                    "Failed to update run to Failed (approval gate): {e}"
+                                );
+                            }
+                        }
+                        executor::SuspendReason::AgentAssignment {
+                            prompt_event_id,
+                            agent_pubkey,
+                            ..
+                        } => {
+                            self.suspend_run_for_agent_step(
+                                community_id,
+                                workflow_id,
+                                run_id,
+                                step_count,
+                                &trace_json,
+                                &prompt_event_id,
+                                &suspend.step_id,
+                                &agent_pubkey,
+                                &suspend.timeout,
+                            )
+                            .await;
+                        }
                     }
                 } else {
                     tracing::info!(run_id = %run_id, "Workflow run completed");
@@ -295,6 +320,120 @@ impl WorkflowEngine {
                     );
                 }
             }
+        }
+    }
+
+    /// Default assignment expiry when an `AssignToAgent` step does not specify
+    /// (or specifies an unparseable) `timeout`. Matches `ActionDef::AssignToAgent`'s
+    /// own default in `executor::dispatch_action`.
+    const DEFAULT_AGENT_STEP_TIMEOUT_SECS: i64 = 24 * 3600;
+
+    /// Persist an agent-assignment row and move the run to `WaitingAgent`.
+    ///
+    /// Called from [`finalize_run`](Self::finalize_run) when the executor
+    /// suspends at an `AssignToAgent` step. The status is distinct from
+    /// `WaitingApproval` so listings/UI can tell the two suspend kinds apart;
+    /// the resume path still keys off the waking trigger (which table has the
+    /// gating row), not the run status.
+    ///
+    /// On any failure to create the agent-step row, the run is marked `Failed`
+    /// instead — leaving it `WaitingAgent` without a corresponding row
+    /// would strand it forever with no way to resume.
+    #[allow(clippy::too_many_arguments)]
+    async fn suspend_run_for_agent_step(
+        &self,
+        community_id: CommunityId,
+        workflow_id: uuid::Uuid,
+        run_id: uuid::Uuid,
+        step_index: i32,
+        trace_json: &serde_json::Value,
+        prompt_event_id: &str,
+        step_id: &str,
+        agent_pubkey: &[u8],
+        timeout: &str,
+    ) {
+        let expires_at = executor::parse_duration_secs(timeout)
+            .ok()
+            .map(|secs| Utc::now() + chrono::Duration::seconds(secs as i64))
+            .unwrap_or_else(|| {
+                Utc::now() + chrono::Duration::seconds(Self::DEFAULT_AGENT_STEP_TIMEOUT_SECS)
+            });
+
+        let params = buzz_db::workflow::CreateAgentStepParams {
+            community_id,
+            prompt_event_id,
+            workflow_id,
+            run_id,
+            step_id,
+            step_index,
+            agent_pubkey,
+            expires_at,
+        };
+
+        if let Err(e) = self.db.create_agent_step(params).await {
+            tracing::error!(run_id = %run_id, "Failed to create agent-step record: {e}");
+            self.fail_run_after_suspend_error(
+                community_id,
+                run_id,
+                step_index,
+                trace_json,
+                "failed to persist agent assignment",
+            )
+            .await;
+            return;
+        }
+
+        tracing::info!(
+            run_id = %run_id,
+            step_id = %step_id,
+            "Workflow run suspended — awaiting agent reply"
+        );
+        if let Err(e) = self
+            .db
+            .update_workflow_run(
+                community_id,
+                run_id,
+                RunStatus::WaitingAgent,
+                step_index,
+                trace_json,
+                None,
+            )
+            .await
+        {
+            tracing::error!(
+                run_id = %run_id,
+                "Failed to update run to WaitingAgent (agent step): {e}"
+            );
+        }
+    }
+
+    /// Mark a run `Failed` after `suspend_run_for_agent_step` could not create
+    /// its gating row — leaving the run in `WaitingAgent` with no such
+    /// record would strand it with no path to resume.
+    async fn fail_run_after_suspend_error(
+        &self,
+        community_id: CommunityId,
+        run_id: uuid::Uuid,
+        step_index: i32,
+        trace_json: &serde_json::Value,
+        reason: &str,
+    ) {
+        if let Err(e) = self
+            .db
+            .update_workflow_run(
+                community_id,
+                run_id,
+                RunStatus::Failed,
+                step_index,
+                trace_json,
+                Some(reason),
+            )
+            .await
+        {
+            tracing::error!(
+                run_id = %run_id,
+                "Failed to update run to Failed after approval-suspend error: {e}"
+            );
         }
     }
 
@@ -423,12 +562,13 @@ impl WorkflowEngine {
             let def_clone = def.clone();
             let ctx_clone = trigger_ctx.clone();
 
+            let workflow_id = workflow.id;
             tokio::spawn(async move {
                 let result =
                     executor::execute_run(&engine, community_id, run_id, &def_clone, &ctx_clone)
                         .await;
                 engine
-                    .finalize_run(community_id, run_id, result, None)
+                    .finalize_run(community_id, workflow_id, run_id, result, None)
                     .await;
             });
         }
@@ -717,6 +857,7 @@ impl WorkflowEngine {
                 let engine = Arc::clone(self);
                 let def_clone = def.clone();
                 let ctx_clone = trigger_ctx.clone();
+                let workflow_id = workflow.id;
                 tokio::spawn(async move {
                     let result = executor::execute_run(
                         &engine,
@@ -727,7 +868,7 @@ impl WorkflowEngine {
                     )
                     .await;
                     engine
-                        .finalize_run(community_id, run_id, result, None)
+                        .finalize_run(community_id, workflow_id, run_id, result, None)
                         .await;
                 });
             }
@@ -1042,6 +1183,83 @@ fn trigger_matches_event(trigger: &TriggerDef, kind_u32: u32) -> bool {
         TriggerDef::DiffPosted { .. } => kind_u32 == KIND_STREAM_MESSAGE_DIFF,
         // Schedule and Webhook triggers are not fired by channel events.
         TriggerDef::Schedule { .. } | TriggerDef::Webhook => false,
+    }
+}
+
+/// Shared test-only DB setup helpers, used by both this module's and
+/// `executor`'s Postgres-gated integration tests.
+#[cfg(test)]
+pub(crate) mod tests_support {
+    use buzz_core::tenant::CommunityId;
+    use uuid::Uuid;
+
+    pub(crate) async fn setup_db() -> buzz_db::Db {
+        let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_owned());
+        buzz_db::Db::new(&buzz_db::DbConfig {
+            database_url,
+            ..Default::default()
+        })
+        .await
+        .expect("connect test DB")
+    }
+
+    /// Create a community, a channel owned by `creator`, and add `member` as a
+    /// plain member. Returns `(community, channel)`.
+    pub(crate) async fn setup_channel(
+        db: &buzz_db::Db,
+        creator: &[u8],
+        member: &[u8],
+    ) -> (CommunityId, Uuid) {
+        let host = format!("wftest-{}.example", Uuid::new_v4().simple());
+        let community = match db
+            .create_community_with_owner(&host, &hex::encode(creator))
+            .await
+            .expect("create community")
+        {
+            buzz_db::CreateCommunityWithOwnerResult::Created(rec) => rec.id,
+            other => panic!("unexpected community create result: {other:?}"),
+        };
+        db.ensure_user(community, creator)
+            .await
+            .expect("creator user");
+        db.ensure_user(community, member)
+            .await
+            .expect("member user");
+        let channel_id = Uuid::new_v4();
+        db.create_channel_with_id(
+            community,
+            channel_id,
+            &format!("ch-{}", channel_id.simple()),
+            buzz_db::channel::ChannelType::Stream,
+            buzz_db::channel::ChannelVisibility::Open,
+            None,
+            creator,
+            None,
+        )
+        .await
+        .expect("create channel");
+        // `create_channel_with_id` already seats `creator` as the channel's
+        // owner-member. When `member == creator` (callers that only need a
+        // single-pubkey channel), adding them again as a plain `Member` would
+        // hit the last-owner demotion guard (`add_member` in
+        // `buzz-db/src/channel.rs`, added alongside the kind:9000 role-change
+        // fix) since it's the same active membership row being downgraded.
+        // Only add a second membership when the caller actually asked for a
+        // distinct member.
+        if member != creator {
+            db.add_member(
+                community,
+                channel_id,
+                member,
+                buzz_db::channel::MemberRole::Member,
+                Some(creator),
+            )
+            .await
+            .expect("add member");
+        }
+        (community, channel_id)
     }
 }
 
@@ -1706,60 +1924,7 @@ steps:
 
     // -- SEC-006: event-path regression (requires Postgres) ----------------
 
-    async fn setup_db() -> buzz_db::Db {
-        let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
-            .or_else(|_| std::env::var("DATABASE_URL"))
-            .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_owned());
-        buzz_db::Db::new(&buzz_db::DbConfig {
-            database_url,
-            ..Default::default()
-        })
-        .await
-        .expect("connect test DB")
-    }
-
-    /// Create a community, a channel owned by `creator`, and add `member` as a
-    /// plain member. Returns `(community, channel)`.
-    async fn setup_channel(db: &buzz_db::Db, creator: &[u8], member: &[u8]) -> (CommunityId, Uuid) {
-        let host = format!("sec006-{}.example", Uuid::new_v4().simple());
-        let community = match db
-            .create_community_with_owner(&host, &hex::encode(creator))
-            .await
-            .expect("create community")
-        {
-            buzz_db::CreateCommunityWithOwnerResult::Created(rec) => rec.id,
-            other => panic!("unexpected community create result: {other:?}"),
-        };
-        db.ensure_user(community, creator)
-            .await
-            .expect("creator user");
-        db.ensure_user(community, member)
-            .await
-            .expect("member user");
-        let channel_id = Uuid::new_v4();
-        db.create_channel_with_id(
-            community,
-            channel_id,
-            &format!("ch-{}", channel_id.simple()),
-            buzz_db::channel::ChannelType::Stream,
-            buzz_db::channel::ChannelVisibility::Open,
-            None,
-            creator,
-            None,
-        )
-        .await
-        .expect("create channel");
-        db.add_member(
-            community,
-            channel_id,
-            member,
-            buzz_db::channel::MemberRole::Member,
-            Some(creator),
-        )
-        .await
-        .expect("add member");
-        (community, channel_id)
-    }
+    use tests_support::{setup_channel, setup_db};
 
     fn message_event(channel_id: Uuid) -> buzz_core::StoredEvent {
         let keys = nostr::Keys::generate();

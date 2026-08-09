@@ -830,66 +830,11 @@ impl Default for EventQueue {
 }
 
 /// Parsed thread relationship from NIP-10 `e` tags.
-#[derive(Debug, Clone, Default)]
-pub struct ThreadTags {
-    /// Root event ID (hex). Present for all thread replies.
-    pub root_event_id: Option<String>,
-    /// Parent event ID (hex). For direct replies to root, equals root.
-    pub parent_event_id: Option<String>,
-    /// Mentioned pubkeys from `p` tags (hex).
-    pub mentioned_pubkeys: Vec<String>,
-}
-
-/// Parse NIP-10 thread tags from a Nostr event.
 ///
-/// Detection logic (per research doc §4c):
-/// - Find an `e` tag with `root` marker → its value is `root_event_id`
-/// - Find an `e` tag with `reply` marker → its value is `parent_event_id`
-/// - If only `reply` marker found (direct reply to root), root == parent
-/// - `p` tags → mentioned pubkeys
-///
-/// NOTE: Only handles NIP-10 marker-based format (preferred). The deprecated
-/// positional format (no markers, `["e", id, relay_url]`) is not supported —
-/// Buzz always generates marker-based tags (see relay messages.rs:762-783).
-pub fn parse_thread_tags(event: &Event) -> ThreadTags {
-    let mut root = None;
-    let mut reply = None;
-    let mut mentions = Vec::new();
-
-    for tag in event.tags.iter() {
-        let parts = tag.as_slice();
-        match parts.first().map(|s| s.as_str()) {
-            Some("e") if parts.len() >= 4 => {
-                let id = &parts[1];
-                let marker = &parts[3];
-                match marker.as_str() {
-                    "root" => root = Some(id.clone()),
-                    "reply" => reply = Some(id.clone()),
-                    _ => {}
-                }
-            }
-            Some("p") if parts.len() >= 2 => {
-                mentions.push(parts[1].clone());
-            }
-            _ => {}
-        }
-    }
-
-    // For direct replies to root: single "reply" tag, no "root" tag.
-    // In that case, root == parent.
-    let (root_event_id, parent_event_id) = match (root, reply) {
-        (Some(r), Some(p)) => (Some(r), Some(p)),
-        (Some(r), None) => (Some(r.clone()), Some(r)),
-        (None, Some(p)) => (Some(p.clone()), Some(p)),
-        (None, None) => (None, None),
-    };
-
-    ThreadTags {
-        root_event_id,
-        parent_event_id,
-        mentioned_pubkeys: mentions,
-    }
-}
+/// Moved to `buzz_core::thread` so non-ACP crates (e.g. `buzz-relay`'s
+/// agent-step resume hook) can parse thread tags without depending on
+/// `buzz-acp`. Re-exported here so existing in-crate references keep working.
+pub use buzz_core::thread::{parse_thread_tags, ThreadTags};
 
 /// Extract a leading slash command from message content.
 ///
@@ -1559,6 +1504,35 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
         s
     };
     sections.push(event_section);
+
+    // Workflow-step framing: the harness posts the agent's final message
+    // text as the step's completion reply, so the agent must not try to
+    // post one itself (shell-approval walls make `buzz` CLI calls fail for
+    // some agents, wasting the turn). Tag check only — this is advisory
+    // wording, so relay-signature verification isn't needed here.
+    let is_workflow_step =
+        last_event.event.tags.iter().any(|t| {
+            t.as_slice().first().map(|s| s.as_str()) == Some(buzz_core::thread::TAG_WORKFLOW)
+        });
+    if is_workflow_step {
+        sections.push(
+            "[Workflow step]\n\
+             This is a workflow step assigned to you. When your turn ends, your \
+             final message text is posted to the workflow thread automatically as \
+             your completion reply. Do NOT run `buzz` CLI or shell commands to \
+             post a reply. Do the work, then end with one short message stating \
+             the outcome (or what you still need).\n\
+             If later workflow steps need data from you, end that final message \
+             with a fenced completion block; its `outputs` keys become \
+             `{{steps.<this step>.output.<key>}}` for subsequent steps:\n\
+             ```completion\n\
+             status: success   # or: failed\n\
+             outputs:\n\
+             \x20 key: value\n\
+             ```"
+            .to_string(),
+        );
+    }
 
     // 4c. Closing note for cancel + re-prompt.
     if has_cancelled {
@@ -2902,67 +2876,8 @@ mod tests {
             .unwrap()
     }
 
-    #[test]
-    fn test_parse_thread_tags_no_tags() {
-        let event = make_event("plain message");
-        let tags = parse_thread_tags(&event);
-        assert!(tags.root_event_id.is_none());
-        assert!(tags.parent_event_id.is_none());
-        assert!(tags.mentioned_pubkeys.is_empty());
-    }
-
-    #[test]
-    fn test_parse_thread_tags_direct_reply() {
-        // Direct reply to root: single "reply" tag.
-        let event = make_event_with_tags(
-            "reply to root",
-            vec![vec!["e".into(), "abc123".into(), "".into(), "reply".into()]],
-        );
-        let tags = parse_thread_tags(&event);
-        assert_eq!(tags.root_event_id.as_deref(), Some("abc123"));
-        assert_eq!(tags.parent_event_id.as_deref(), Some("abc123"));
-    }
-
-    #[test]
-    fn test_parse_thread_tags_nested_reply() {
-        // Nested reply: root + reply tags.
-        let event = make_event_with_tags(
-            "nested reply",
-            vec![
-                vec!["e".into(), "root123".into(), "".into(), "root".into()],
-                vec!["e".into(), "parent456".into(), "".into(), "reply".into()],
-            ],
-        );
-        let tags = parse_thread_tags(&event);
-        assert_eq!(tags.root_event_id.as_deref(), Some("root123"));
-        assert_eq!(tags.parent_event_id.as_deref(), Some("parent456"));
-    }
-
-    #[test]
-    fn test_parse_thread_tags_with_mentions() {
-        let event = make_event_with_tags(
-            "hey @alice",
-            vec![
-                vec!["p".into(), "alice_pubkey".into()],
-                vec!["p".into(), "bob_pubkey".into()],
-            ],
-        );
-        let tags = parse_thread_tags(&event);
-        assert!(tags.root_event_id.is_none());
-        assert_eq!(tags.mentioned_pubkeys, vec!["alice_pubkey", "bob_pubkey"]);
-    }
-
-    #[test]
-    fn test_parse_thread_tags_root_only() {
-        // Only root marker, no reply marker — root == parent.
-        let event = make_event_with_tags(
-            "reply",
-            vec![vec!["e".into(), "root123".into(), "".into(), "root".into()]],
-        );
-        let tags = parse_thread_tags(&event);
-        assert_eq!(tags.root_event_id.as_deref(), Some("root123"));
-        assert_eq!(tags.parent_event_id.as_deref(), Some("root123"));
-    }
+    // `parse_thread_tags` / `ThreadTags` unit tests moved to
+    // `buzz_core::thread` alongside the implementation.
 
     #[test]
     fn test_format_prompt_with_channel_info() {
