@@ -855,18 +855,20 @@ fn filters_are_nip43_membership_only(filters: &[Filter]) -> bool {
 }
 
 /// Extract a channel UUID from a single filter's `#h` tag.
+///
+/// Only pushes `channel_id` when the filter carries exactly one `#h` value —
+/// mirrors `extract_channel_from_filter` in `api/bridge.rs`. A multi-value
+/// `#h` must NOT collapse to the first value: doing so silently narrows the
+/// SQL query to one arbitrary channel (BTreeSet iteration order) and drops
+/// every other requested channel from the result set, even though those
+/// channels are still present in `channel_ids` from `apply_access_scope_to_query`.
 fn extract_channel_id_from_filter(filter: &Filter) -> Option<uuid::Uuid> {
-    for (tag_key, tag_values) in filter.generic_tags.iter() {
-        let key = tag_key.to_string();
-        if key == "h" {
-            for val in tag_values {
-                if let Ok(id) = val.parse::<uuid::Uuid>() {
-                    return Some(id);
-                }
-            }
-        }
+    let h_tag = nostr::SingleLetterTag::lowercase(nostr::Alphabet::H);
+    let values = filter.generic_tags.get(&h_tag)?;
+    if values.len() != 1 {
+        return None;
     }
-    None
+    values.iter().next()?.parse::<uuid::Uuid>().ok()
 }
 
 /// Convert a single NIP-01 filter into an [`EventQuery`] for the database.
@@ -1584,6 +1586,74 @@ mod tests {
             filter_with_channel(channel_id),
         ];
         assert_eq!(extract_channel_id_from_filters(&filters), Some(channel_id));
+    }
+
+    #[test]
+    fn test_extract_channel_id_from_filter_single_h_value() {
+        let channel_id = uuid::Uuid::new_v4();
+        assert_eq!(
+            extract_channel_id_from_filter(&filter_with_channel(channel_id)),
+            Some(channel_id)
+        );
+    }
+
+    #[test]
+    fn test_extract_channel_id_from_filter_no_h_tag() {
+        assert_eq!(extract_channel_id_from_filter(&Filter::new()), None);
+    }
+
+    /// Regression for a bug where a multi-value `#h` filter (e.g. the desktop
+    /// app requesting workflows across all 27 channels a user belongs to)
+    /// collapsed to the first UUID `BTreeSet` iteration produced, silently
+    /// narrowing `EventQuery.channel_id` to one arbitrary channel and
+    /// excluding every other requested channel's events from the SQL query —
+    /// even though `apply_access_scope_to_query` still listed them all in
+    /// `channel_ids`. A multi-value `#h` filter must not push a `channel_id`
+    /// at all; scoping is left entirely to `channel_ids`.
+    #[test]
+    fn test_extract_channel_id_from_filter_multi_h_values_returns_none() {
+        let channel_a = uuid::Uuid::new_v4();
+        let channel_b = uuid::Uuid::new_v4();
+        let filter = Filter::new()
+            .custom_tag(
+                SingleLetterTag::lowercase(Alphabet::H),
+                channel_a.to_string(),
+            )
+            .custom_tag(
+                SingleLetterTag::lowercase(Alphabet::H),
+                channel_b.to_string(),
+            );
+        assert_eq!(extract_channel_id_from_filter(&filter), None);
+    }
+
+    /// End-to-end regression at the `EventQuery` construction boundary: a
+    /// multi-#h filter must produce `channel_id: None` so the DB layer relies
+    /// solely on the (correct, full) `channel_ids` access-scope list rather
+    /// than an accidental single-channel narrowing.
+    #[tokio::test]
+    async fn test_build_event_query_from_filter_multi_h_leaves_channel_id_none() {
+        let channel_a = uuid::Uuid::new_v4();
+        let channel_b = uuid::Uuid::new_v4();
+        let filter = Filter::new()
+            .kind(nostr::Kind::Custom(30620))
+            .custom_tag(
+                SingleLetterTag::lowercase(Alphabet::H),
+                channel_a.to_string(),
+            )
+            .custom_tag(
+                SingleLetterTag::lowercase(Alphabet::H),
+                channel_b.to_string(),
+            );
+        let channel_id = extract_channel_id_from_filter(&filter);
+        let query = filter_to_query_params(
+            &filter,
+            channel_id,
+            buzz_core::tenant::CommunityId::from_uuid(uuid::Uuid::nil()),
+        );
+        assert_eq!(
+            query.channel_id, None,
+            "multi-#h filter must not narrow EventQuery.channel_id to a single channel"
+        );
     }
 
     #[test]
