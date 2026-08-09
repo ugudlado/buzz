@@ -6,6 +6,7 @@ use crate::{
     app_state::AppState,
     events,
     relay::{parse_command_response, query_relay, submit_event},
+    relay_http::get_relay_json,
 };
 
 // ── Wire shapes (snake_case, consumed by tauriWorkflows.ts) ──────────────────
@@ -117,30 +118,22 @@ pub async fn get_workflow(
         .ok_or_else(|| "workflow not found".to_string())
 }
 
+/// Fetch runs for a workflow via the relay's `GET /api/workflows/{id}/runs`
+/// bridge (NIP-98 signed). Returns a bare array — the frontend wrapper
+/// (`getWorkflowRuns`) does `raw.map(fromRawWorkflowRun)`, so a wrapped
+/// `{ runs: [...] }` shape would make `.map()` throw and crash the detail
+/// panel.
 #[tauri::command]
 pub async fn get_workflow_runs(
     workflow_id: String,
     limit: Option<u32>,
-    _state: State<'_, AppState>,
+    state: State<'_, AppState>,
 ) -> Result<Vec<Value>, String> {
-    // TODO(workflow-runs): Run reconstruction is a clearly-scoped follow-up.
-    // The authoritative run record the frontend's `WorkflowRun` shape needs
-    // (status / current_step / execution_trace / error_message) lives in the
-    // relay DB and is not exposed to the desktop client as a single queryable
-    // record. If the relay starts emitting lifecycle events (46001–46007, …),
-    // folding that stream into `WorkflowRun` would be another viable design.
-    // The important bit for this command is that raw lifecycle events are not
-    // the `RawWorkflowRun` contract.
-    //
-    // Until then we return a bare empty array — NOT a raw-event wrapper. The
-    // frontend wrapper (`getWorkflowRuns`) does `raw.map(fromRawWorkflowRun)`,
-    // so it must receive an array; the wrapped `{ runs: [...] }` shape would
-    // make `.map()` throw and crash the detail panel (the same TypeError class
-    // as the original page bug). Raw lifecycle events also don't carry the
-    // `id`/`workflow_id`/`status`/… fields `RawWorkflowRun` expects, so an
-    // empty list is the honest, safe placeholder.
-    let _ = (workflow_id, limit);
-    Ok(Vec::new())
+    let mut path = format!("/api/workflows/{workflow_id}/runs");
+    if let Some(limit) = limit {
+        path.push_str(&format!("?limit={limit}"));
+    }
+    get_relay_json(&state, &path).await
 }
 
 // ── Writes ───────────────────────────────────────────────────────────────────
@@ -250,19 +243,18 @@ pub async fn trigger_workflow(
 
 // ── Approvals ────────────────────────────────────────────────────────────────
 
+/// Fetch approval gates for a run via the relay's
+/// `GET /api/workflows/{id}/runs/{run_id}/approvals` bridge (NIP-98 signed).
+/// Returns a bare array — the frontend's `getRunApprovals` does
+/// `raw.map(fromRawApproval)`.
 #[tauri::command]
 pub async fn get_run_approvals(
     workflow_id: String,
     run_id: String,
-    _state: State<'_, AppState>,
+    state: State<'_, AppState>,
 ) -> Result<Vec<Value>, String> {
-    // TODO(workflow-runs): Like runs (see `get_workflow_runs`), reconstructing
-    // approvals into the frontend's `WorkflowApproval` shape from lifecycle
-    // events (46010/46011/46012) is a clearly-scoped follow-up tracked under
-    // TODO(workflow-runs). Return a bare empty array so the frontend's
-    // `getRunApprovals` (`raw.map(fromRawApproval)`) is safe.
-    let _ = (workflow_id, run_id);
-    Ok(Vec::new())
+    let path = format!("/api/workflows/{workflow_id}/runs/{run_id}/approvals");
+    get_relay_json(&state, &path).await
 }
 
 #[tauri::command]

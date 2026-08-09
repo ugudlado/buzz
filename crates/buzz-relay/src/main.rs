@@ -1022,11 +1022,86 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // Workflow agent-step expiry + crash-recovery sweeper for
-    // `workflow_agent_steps` (`AssignToAgent` suspensions). Every pod runs
-    // this independently — the sweep's UPDATE...RETURNING is the
-    // at-most-once boundary per row. Each tick does two things:
-    //   1. Move overdue `pending` rows to `expired` and fail their runs.
+    // Workflow approval expiry sweeper: periodically move overdue
+    // `workflow_approvals` rows (status='pending' AND expires_at < now()) to
+    // 'expired' and fail their associated workflow runs. Every pod runs this
+    // independently — the sweep's UPDATE...RETURNING is the at-most-once
+    // boundary per row, so concurrent sweeps across pods just divide the
+    // backlog rather than double-acting on any single approval.
+    {
+        let sweep_state = Arc::clone(&state);
+        let interval_secs = std::env::var("BUZZ_APPROVAL_SWEEP_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(60)
+            .max(1);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                match sweep_state.db.sweep_expired_approvals(100).await {
+                    Ok(expired) => {
+                        for approval in &expired {
+                            let reason = "approval expired";
+                            let run = match sweep_state
+                                .db
+                                .get_workflow_run(approval.community_id, approval.run_id)
+                                .await
+                            {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    tracing::error!(
+                                        run_id = %approval.run_id,
+                                        "Approval sweep: failed to load run to finalize: {e}"
+                                    );
+                                    continue;
+                                }
+                            };
+                            // Only fail runs still waiting — a run may have
+                            // already resumed (approved) or been denied
+                            // between the approval row expiring and this tick.
+                            if run.status != buzz_db::workflow::RunStatus::WaitingApproval {
+                                continue;
+                            }
+                            if let Err(e) = sweep_state
+                                .db
+                                .update_workflow_run(
+                                    approval.community_id,
+                                    approval.run_id,
+                                    buzz_db::workflow::RunStatus::Failed,
+                                    approval.step_index,
+                                    &run.execution_trace,
+                                    Some(reason),
+                                )
+                                .await
+                            {
+                                tracing::error!(
+                                    run_id = %approval.run_id,
+                                    "Approval sweep: failed to fail expired run: {e}"
+                                );
+                            }
+                        }
+                        if !expired.is_empty() {
+                            tracing::info!(
+                                count = expired.len(),
+                                "Swept expired workflow approvals"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("Approval sweep tick failed: {e}");
+                    }
+                }
+            }
+        });
+    }
+
+    // Workflow agent-step expiry + crash-recovery sweeper: mirrors the
+    // approval sweeper above but for `workflow_agent_steps`
+    // (`AssignToAgent` suspensions). Each tick does two things:
+    //   1. Move overdue `pending` rows to `expired` and fail their runs
+    //      (exactly the approval sweeper's pattern).
     //   2. Retry rows stuck `done` while their run is still
     //      `waiting_agent` — the crash window between
     //      `try_resume_agent_step`'s CAS and its resume call (e.g. the pod
