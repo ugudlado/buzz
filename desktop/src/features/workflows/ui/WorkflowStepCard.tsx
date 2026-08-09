@@ -29,13 +29,6 @@ function BackendSupportHint({ action }: { action: StepFormState["action"] }) {
           this step.
         </p>
       );
-    case "request_approval":
-      return (
-        <p className="rounded-md border border-amber-500/30 bg-amber-500/10 px-2 py-1 text-xs text-amber-700">
-          Backend note: approval gates still stop runs with WF-08; approval
-          records are not persisted yet.
-        </p>
-      );
     default:
       return null;
   }
@@ -213,7 +206,6 @@ function StepConfigFields({
     case "request_approval":
       return (
         <div className="space-y-2">
-          <BackendSupportHint action={step.action} />
           <div className="space-y-1.5">
             <FieldLabel htmlFor={`${prefix}-from`}>From (approver)</FieldLabel>
             <Input

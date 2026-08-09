@@ -110,6 +110,15 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             post(api::invites::accept_policy),
         )
         .route("/api/invites/claim", post(api::invites::claim_invite))
+        // Workflow run + approval reads (NIP-98 auth + channel-membership gate)
+        .route(
+            "/api/workflows/{workflow_id}/runs",
+            get(api::workflows::list_workflow_runs),
+        )
+        .route(
+            "/api/workflows/{workflow_id}/runs/{run_id}/approvals",
+            get(api::workflows::list_run_approvals),
+        )
         // Moderation queue reads (NIP-98 auth + mod-authz gate, L6)
         .route("/moderation/reports", get(api::bridge::moderation_reports))
         .route("/moderation/audit", get(api::bridge::moderation_audit))

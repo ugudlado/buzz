@@ -1187,6 +1187,62 @@ pub async fn update_approval_by_stored_hash(
     Ok(affected > 0)
 }
 
+/// A `workflow_approvals` row that was swept from `pending` to `expired`
+/// because its `expires_at` elapsed. Carries enough to finalize the
+/// associated `workflow_runs` row as `Failed`.
+#[derive(Debug, Clone)]
+pub struct ExpiredApproval {
+    /// Community that owns the approval and its run.
+    pub community_id: CommunityId,
+    /// The run that was waiting on this approval.
+    pub run_id: Uuid,
+    /// Zero-based index of the step that requested approval.
+    pub step_index: i32,
+}
+
+/// Sweep overdue `workflow_approvals` rows (`status = 'pending' AND
+/// expires_at < now()`) to `status = 'expired'`.
+///
+/// Returns one [`ExpiredApproval`] per swept row so the caller can finalize
+/// each associated `workflow_runs` row as `Failed` — this function only
+/// touches `workflow_approvals`, never `workflow_runs`, so run finalization
+/// stays in the workflow engine's `finalize_run` path rather than being
+/// duplicated here.
+///
+/// `LIMIT` bounds a single sweep tick so a large backlog (e.g. after
+/// downtime) is drained incrementally across ticks rather than in one
+/// unbounded UPDATE.
+pub async fn sweep_expired_approvals(pool: &PgPool, limit: i64) -> Result<Vec<ExpiredApproval>> {
+    let limit = limit.clamp(1, LIST_MAX_LIMIT);
+    let rows = sqlx::query(
+        r#"
+        UPDATE workflow_approvals
+        SET status = 'expired'
+        WHERE (community_id, token) IN (
+            SELECT community_id, token
+            FROM workflow_approvals
+            WHERE status = 'pending' AND expires_at < NOW()
+            LIMIT $1
+        )
+        RETURNING community_id, run_id, step_index
+        "#,
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|row| {
+            let community_id: Uuid = row.try_get("community_id")?;
+            Ok(ExpiredApproval {
+                community_id: CommunityId::from_uuid(community_id),
+                run_id: row.try_get("run_id")?,
+                step_index: row.try_get("step_index")?,
+            })
+        })
+        .collect()
+}
+
 // -- Agent-step CRUD ------------------------------------------------------------
 
 /// Status of an `AssignToAgent` suspension. Stored as ENUM in
@@ -1389,7 +1445,8 @@ pub struct ExpiredAgentStep {
 /// Sweep overdue `workflow_agent_steps` rows (`status = 'pending' AND
 /// expires_at < now()`) to `status = 'expired'`.
 ///
-/// Returns one [`ExpiredAgentStep`] per
+/// Mirrors [`sweep_expired_approvals`] exactly so the relay-side periodic
+/// sweeper task can extend to call both. Returns one [`ExpiredAgentStep`] per
 /// swept row so the caller can finalize each associated `workflow_runs` row
 /// as `Failed` — this function only touches `workflow_agent_steps`, never
 /// `workflow_runs`.

@@ -4171,6 +4171,18 @@ impl Db {
         .await
     }
 
+    /// Sweep overdue `workflow_approvals` rows to `status = 'expired'`.
+    ///
+    /// Returns one entry per swept row; callers are responsible for
+    /// finalizing the associated `workflow_runs` row (this call only touches
+    /// `workflow_approvals`). `limit` bounds one sweep tick.
+    pub async fn sweep_expired_approvals(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<workflow::ExpiredApproval>> {
+        workflow::sweep_expired_approvals(&self.pool, limit).await
+    }
+
     /// Create an agent-assignment step (`AssignToAgent` suspension).
     pub async fn create_agent_step(
         &self,

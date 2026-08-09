@@ -231,31 +231,18 @@ impl WorkflowEngine {
 
                 if let Some(suspend) = result.suspend {
                     match suspend.reason {
-                        executor::SuspendReason::Approval { .. } => {
-                            // Approval gates are not yet implemented (WF-08).
-                            // Fail explicitly rather than creating unreachable WaitingApproval rows.
-                            tracing::warn!(
-                                run_id = %run_id,
-                                step_index = result.step_index,
-                                "Workflow hit approval gate — not yet implemented, marking as failed"
-                            );
-                            if let Err(e) = self
-                                .db
-                                .update_workflow_run(
-                                    community_id,
-                                    run_id,
-                                    RunStatus::Failed,
-                                    step_count,
-                                    &trace_json,
-                                    Some("approval gates not yet implemented — see WF-08"),
-                                )
-                                .await
-                            {
-                                tracing::error!(
-                                    run_id = %run_id,
-                                    "Failed to update run to Failed (approval gate): {e}"
-                                );
-                            }
+                        executor::SuspendReason::Approval { approver_spec } => {
+                            self.suspend_run_for_approval(
+                                community_id,
+                                run_id,
+                                step_count,
+                                &trace_json,
+                                &suspend.resume_token,
+                                Some(suspend.step_id.as_str()),
+                                Some(approver_spec.as_str()),
+                                Some(suspend.timeout.as_str()),
+                            )
+                            .await;
                         }
                         executor::SuspendReason::AgentAssignment {
                             prompt_event_id,
@@ -320,6 +307,112 @@ impl WorkflowEngine {
                     );
                 }
             }
+        }
+    }
+
+    /// Default approval expiry when a `RequestApproval` step does not specify
+    /// (or specifies an unparseable) `timeout`. Matches `ActionDef::RequestApproval`'s
+    /// own default in `executor::dispatch_action`.
+    const DEFAULT_APPROVAL_TIMEOUT_SECS: i64 = 24 * 3600;
+
+    /// Persist an approval-request row and move the run to `WaitingApproval`.
+    ///
+    /// Called from [`finalize_run`](Self::finalize_run) when the executor
+    /// returns `approval_token = Some(..)` — i.e. execution suspended at a
+    /// `RequestApproval` step. Looks up the run's `workflow_id` (not carried by
+    /// `ExecutionResult`) to populate the approval row, then calls
+    /// [`buzz_db::workflow::create_approval`] with a raw token (stored hashed)
+    /// and a default 24h expiry when the step didn't specify one.
+    ///
+    /// On any failure to create the approval row, the run is marked `Failed`
+    /// instead — leaving it `WaitingApproval` without a corresponding approval
+    /// record would strand it forever with no way to resume.
+    #[allow(clippy::too_many_arguments)]
+    async fn suspend_run_for_approval(
+        &self,
+        community_id: CommunityId,
+        run_id: uuid::Uuid,
+        step_index: i32,
+        trace_json: &serde_json::Value,
+        token: &str,
+        step_id: Option<&str>,
+        approver_spec: Option<&str>,
+        timeout: Option<&str>,
+    ) {
+        let step_id = step_id.unwrap_or_default();
+        let approver_spec = approver_spec.unwrap_or("any");
+
+        let workflow_id = match self.db.get_workflow_run(community_id, run_id).await {
+            Ok(run) => run.workflow_id,
+            Err(e) => {
+                tracing::error!(
+                    run_id = %run_id,
+                    "Failed to load run for approval suspension: {e}"
+                );
+                self.fail_run_after_suspend_error(
+                    community_id,
+                    run_id,
+                    step_index,
+                    trace_json,
+                    "failed to load workflow run while creating approval gate",
+                )
+                .await;
+                return;
+            }
+        };
+
+        let expires_at = timeout
+            .and_then(|t| executor::parse_duration_secs(t).ok())
+            .map(|secs| Utc::now() + chrono::Duration::seconds(secs as i64))
+            .unwrap_or_else(|| {
+                Utc::now() + chrono::Duration::seconds(Self::DEFAULT_APPROVAL_TIMEOUT_SECS)
+            });
+
+        let params = buzz_db::workflow::CreateApprovalParams {
+            community_id,
+            token,
+            workflow_id,
+            run_id,
+            step_id,
+            step_index,
+            approver_spec,
+            expires_at,
+        };
+
+        if let Err(e) = self.db.create_approval(params).await {
+            tracing::error!(run_id = %run_id, "Failed to create approval record: {e}");
+            self.fail_run_after_suspend_error(
+                community_id,
+                run_id,
+                step_index,
+                trace_json,
+                "failed to persist approval gate",
+            )
+            .await;
+            return;
+        }
+
+        tracing::info!(
+            run_id = %run_id,
+            step_id = %step_id,
+            "Workflow run suspended — awaiting approval"
+        );
+        if let Err(e) = self
+            .db
+            .update_workflow_run(
+                community_id,
+                run_id,
+                RunStatus::WaitingApproval,
+                step_index,
+                trace_json,
+                None,
+            )
+            .await
+        {
+            tracing::error!(
+                run_id = %run_id,
+                "Failed to update run to WaitingApproval: {e}"
+            );
         }
     }
 
@@ -407,8 +500,9 @@ impl WorkflowEngine {
         }
     }
 
-    /// Mark a run `Failed` after `suspend_run_for_agent_step` could not create
-    /// its gating row — leaving the run in `WaitingAgent` with no such
+    /// Mark a run `Failed` after `suspend_run_for_agent_step` /
+    /// `suspend_run_for_approval` could not create its gating row — leaving
+    /// the run in `WaitingAgent`/`WaitingApproval` with no such
     /// record would strand it with no path to resume.
     async fn fail_run_after_suspend_error(
         &self,
