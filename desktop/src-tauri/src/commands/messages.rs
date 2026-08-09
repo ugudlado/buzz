@@ -1,12 +1,14 @@
 use nostr::{Event, EventId, Keys, PublicKey};
 use tauri::{AppHandle, State};
 
-mod forum;
+// pub(crate) so command_registry can name the commands by full module path —
+// generate_handler! needs the `__cmd__*` macros, which `pub use` of the bare
+// functions does not re-export.
+pub(crate) mod forum;
 
 use forum::{
     apply_link_preview_suppression, fetch_agent_owner_pubkeys, link_preview_suppression_targets,
 };
-pub use forum::{get_forum_posts, get_forum_thread};
 
 use crate::{
     app_state::AppState,
