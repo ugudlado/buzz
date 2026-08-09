@@ -511,6 +511,68 @@ impl ChannelInfoResolver {
     }
 }
 
+/// Per-channel resolved repo working directory, cached after the first
+/// lookup for each channel — same shape as [`ChannelInfoResolver`]. `None`
+/// is cached too (channel has no linked repo, or no matching local clone),
+/// so repeat misses don't re-query on every new session creation.
+#[derive(Debug, Clone)]
+pub struct RepoCwdResolver {
+    cache: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<Uuid, Option<String>>>>,
+    rest_client: RestClient,
+    /// The nest's `REPOS` directory (`{static cwd}/REPOS`) — buzz-acp's own
+    /// process cwd is already the nest root (set by the desktop app at
+    /// spawn time via `default_agent_workdir()`), so no separate discovery
+    /// is needed here.
+    repos_root: std::path::PathBuf,
+}
+
+impl RepoCwdResolver {
+    pub fn new(rest_client: RestClient, harness_cwd: &str) -> Self {
+        Self {
+            cache: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            rest_client,
+            repos_root: std::path::PathBuf::from(harness_cwd).join("REPOS"),
+        }
+    }
+
+    /// Resolve the local repo directory bound to `channel_id`, if any,
+    /// falling back to `None` (caller uses the harness's default cwd) when
+    /// the channel has no linked repo, the repo has no matching local
+    /// clone, or the owner pubkey is unknown.
+    pub async fn resolve(
+        &self,
+        channel_id: Uuid,
+        owner_pubkey: Option<&nostr::PublicKey>,
+    ) -> Option<String> {
+        if let Some(cached) = self
+            .cache
+            .read()
+            .ok()
+            .and_then(|cache| cache.get(&channel_id).cloned())
+        {
+            return cached;
+        }
+
+        let resolved = async {
+            let owner_pubkey = owner_pubkey?;
+            let (repo_dtag, clone_url) =
+                find_repo_for_channel(channel_id, owner_pubkey, &self.rest_client).await?;
+            crate::repo_paths::find_local_repo_dir(
+                &self.repos_root,
+                &repo_dtag,
+                clone_url.as_deref(),
+            )
+            .map(|p| p.display().to_string())
+        }
+        .await;
+
+        if let Ok(mut cache) = self.cache.write() {
+            cache.insert(channel_id, resolved.clone());
+        }
+        resolved
+    }
+}
+
 pub struct PromptContext {
     pub mcp_servers: Vec<McpServer>,
     pub initial_message: Option<String>,
@@ -571,6 +633,10 @@ pub struct PromptContext {
     /// the startup NIP-11 fetch failed — the workflow bypass simply never
     /// triggers in that case, existing `respond_to` behavior is unaffected.
     pub relay_pubkey: Option<nostr::PublicKey>,
+    /// Resolves a channel's linked repo (if any) to its local clone
+    /// directory, for use as the ACP session `cwd` instead of the harness's
+    /// static default — see [`RepoCwdResolver`].
+    pub repo_cwd: RepoCwdResolver,
 }
 
 impl AgentPool {
@@ -889,9 +955,11 @@ async fn resolve_new_session_channel_context(
 /// On error from `session_new_full()`, returns the `AcpError` — caller handles
 /// error reporting. Model-switch failures are logged and gracefully ignored
 /// (the agent proceeds with its default model).
+#[allow(clippy::too_many_arguments)]
 async fn create_session_and_apply_model(
     agent: &mut OwnedAgent,
     ctx: &PromptContext,
+    resolved_cwd: &str,
     agent_core: Option<&str>,
     agent_canvas: Option<&str>,
     channel_name: Option<&str>,
@@ -908,7 +976,7 @@ async fn create_session_and_apply_model(
     let combined_system_prompt = with_canvas(
         with_core(
             with_team(
-                framed_system_prompt(&ctx.cwd, ctx.base_prompt, ctx.system_prompt.as_deref()),
+                framed_system_prompt(resolved_cwd, ctx.base_prompt, ctx.system_prompt.as_deref()),
                 ctx.team_instructions.as_deref(),
             ),
             agent_core,
@@ -930,7 +998,7 @@ async fn create_session_and_apply_model(
     let resp = agent
         .acp
         .session_new_full(
-            &ctx.cwd,
+            resolved_cwd,
             mcp_servers,
             session_new_system_prompt(
                 is_goose,
@@ -1024,11 +1092,17 @@ async fn create_session_and_apply_model(
     // Apply permission mode if not the agent's built-in default AND the agent
     // advertises the requested mode in session/new. Agents that don't support
     // the mode (e.g., goose crashes on unrecognized set_config_option values)
-    // are safely skipped — the harness auto-approves via handle_permission_request.
+    // are safely skipped — the harness falls back to its fail-closed default
+    // for any interactive permission request the agent issues anyway.
     if !ctx.permission_mode.is_default()
         && agent_supports_mode(&resp.raw, ctx.permission_mode.as_wire_str())
     {
         apply_permission_mode(&mut agent.acp, &resp.session_id, &ctx.permission_mode).await?;
+        // Record the mode on the client so a stray session/request_permission
+        // (e.g. the adapter only partially honors set_config_option) is
+        // handled per-mode rather than always rejected — see
+        // `AcpClient::handle_permission_request`.
+        agent.acp.set_permission_mode(ctx.permission_mode);
     }
 
     Ok(resp.session_id)
@@ -1156,7 +1230,7 @@ fn agent_supports_mode(session_new_result: &serde_json::Value, mode_wire: &str) 
 /// Set the session permission mode via `session/set_config_option`.
 ///
 /// Non-fatal for most errors: logs and proceeds. The agent falls back to its
-/// default mode, which still works via per-tool auto-approval in
+/// default mode, and any interactive permission request is rejected by
 /// `handle_permission_request`.
 ///
 /// **Fatal exception:** if the agent process exits (e.g., goose crashes on
@@ -1197,7 +1271,7 @@ async fn apply_permission_mode(
         Ok(Err(e)) => {
             tracing::warn!(
                 target: "pool::permission",
-                "failed to set permission mode {wire:?}: {e} — falling back to per-tool auto-approval"
+                "failed to set permission mode {wire:?}: {e} — falling back to per-tool rejection"
             );
         }
         Err(_) => {
@@ -1605,6 +1679,17 @@ pub async fn run_prompt_task(
             if let Some(sid) = agent.state.sessions.get(cid) {
                 (sid.clone(), false)
             } else {
+                // Resolve the channel's linked repo (if any) to its local
+                // clone directory, so the session starts there instead of
+                // the harness's default cwd — one relay round trip on this
+                // channel's first session, cached thereafter (same
+                // amortization as the core/canvas fetches above).
+                let resolved_cwd = ctx
+                    .repo_cwd
+                    .resolve(*cid, ctx.agent_owner_pubkey.as_ref())
+                    .await
+                    .unwrap_or_else(|| ctx.cwd.clone());
+
                 // The title is channel-qualified (`Agent · #channel`) so one
                 // agent in several channels doesn't produce identical session
                 // rows; `title_channel` comes from the single resolve above and
@@ -1612,6 +1697,7 @@ pub async fn run_prompt_task(
                 match create_session_and_apply_model(
                     &mut agent,
                     &ctx,
+                    &resolved_cwd,
                     agent_core.as_deref(),
                     agent_canvas.as_deref(),
                     title_channel.as_deref(),
@@ -1664,8 +1750,10 @@ pub async fn run_prompt_task(
             if let Some(sid) = &agent.state.heartbeat_session {
                 (sid.clone(), false)
             } else {
-                match create_session_and_apply_model(&mut agent, &ctx, None, None, None, None, None)
-                    .await
+                match create_session_and_apply_model(
+                    &mut agent, &ctx, &ctx.cwd, None, None, None, None, None,
+                )
+                .await
                 {
                     Ok(sid) => {
                         tracing::info!(
@@ -2454,6 +2542,78 @@ pub(crate) async fn fetch_channel_info(
         }
     })
     .await
+}
+
+/// Find the repo (kind:30617) bound to `channel_id` via its `buzz-channel`
+/// tag, authored by `owner_pubkey` — same binding the relay's own git ACL
+/// resolves server-side (`resolve_repo_binding` in
+/// `buzz-relay/src/api/git/binding.rs`: first `buzz-channel` tag on the repo
+/// event, fail-closed).
+///
+/// `nostr::Filter::custom_tag(s)` in this crate version only supports
+/// single-letter tags, so `buzz-channel` (multi-character) can't be filtered
+/// server-side — this queries by `kind` + `authors` instead and scans the
+/// returned tags client-side, the same pattern [`fetch_channel_info`] already
+/// uses for its own tag extraction.
+///
+/// Returns `(repo_d_tag, clone_url)` for the first matching repo event, or
+/// `None` if the owner has no repo bound to this channel, or on any
+/// query/parse failure (best-effort — the caller falls back to the harness's
+/// default cwd). `clone_url` is `None` if the repo event has no `clone` tag
+/// (still usable — see [`crate::repo_paths::find_local_repo_dir`]'s
+/// d-tag-only fallback).
+pub(crate) async fn find_repo_for_channel(
+    channel_id: Uuid,
+    owner_pubkey: &nostr::PublicKey,
+    rest: &RestClient,
+) -> Option<(String, Option<String>)> {
+    let filter = nostr::Filter::new()
+        .kind(nostr::Kind::Custom(
+            buzz_core::kind::KIND_GIT_REPO_ANNOUNCEMENT as u16,
+        ))
+        .author(*owner_pubkey);
+
+    let events = match timeout(CONTEXT_FETCH_TIMEOUT, rest.query(&[filter])).await {
+        Ok(Ok(json)) => json,
+        Ok(Err(e)) => {
+            tracing::debug!(channel_id = %channel_id, "repo-for-channel query failed: {e}");
+            return None;
+        }
+        Err(_) => {
+            tracing::debug!(channel_id = %channel_id, "repo-for-channel query timed out");
+            return None;
+        }
+    };
+    let arr = events.as_array()?;
+
+    let channel_str = channel_id.to_string();
+    for ev in arr {
+        let tags = ev.get("tags")?.as_array()?;
+        let mut d_tag: Option<String> = None;
+        let mut clone_url: Option<String> = None;
+        let mut buzz_channel: Option<String> = None;
+        for tag in tags {
+            let Some(parts) = tag.as_array() else {
+                continue;
+            };
+            let name = parts.first().and_then(|v| v.as_str());
+            let value = parts.get(1).and_then(|v| v.as_str());
+            match (name, value) {
+                (Some("d"), Some(v)) => d_tag = Some(v.to_string()),
+                (Some("clone"), Some(v)) if clone_url.is_none() => clone_url = Some(v.to_string()),
+                (Some("buzz-channel"), Some(v)) if buzz_channel.is_none() => {
+                    buzz_channel = Some(v.to_string())
+                }
+                _ => {}
+            }
+        }
+        if buzz_channel.as_deref() == Some(channel_str.as_str()) {
+            if let Some(d_tag) = d_tag {
+                return Some((d_tag, clone_url));
+            }
+        }
+    }
+    None
 }
 
 /// Fetch the latest canvas event for `channel_id` and return a rendered
@@ -6694,6 +6854,15 @@ mod tests {
             harness_name: "goose".to_string(),
             relay_url: "ws://127.0.0.1:3000".to_string(),
             relay_pubkey: None,
+            repo_cwd: RepoCwdResolver::new(
+                RestClient {
+                    http: reqwest::Client::new(),
+                    base_url: "http://127.0.0.1:0".to_string(),
+                    keys: agent_keys.clone(),
+                    auth_tag_json: None,
+                },
+                ".",
+            ),
         }
     }
 

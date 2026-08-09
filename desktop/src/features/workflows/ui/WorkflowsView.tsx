@@ -175,7 +175,7 @@ export function WorkflowsView({
         className="flex min-h-0 flex-1 flex-col overflow-y-auto px-4 pb-4 pt-4"
         data-scroll-restoration-id="workflows-list"
       >
-        <div className="mb-4 flex items-center justify-between">
+        <div className="mb-4 flex items-center justify-between gap-2">
           <div className="flex items-center gap-2">
             <h2 className="text-lg font-semibold">Workflows</h2>
             <Button
@@ -190,10 +190,15 @@ export function WorkflowsView({
               />
             </Button>
           </div>
-          <Button onClick={() => setDialogState({ mode: "create" })} size="sm">
-            <Plus className="mr-1 h-4 w-4" />
-            Create Workflow
-          </Button>
+          <div className="flex shrink-0 items-center gap-2">
+            <Button
+              onClick={() => setDialogState({ mode: "create" })}
+              size="sm"
+            >
+              <Plus className="mr-1 h-4 w-4" />
+              Create Workflow
+            </Button>
+          </div>
         </div>
 
         {allWorkflowsQuery.isLoading ? (

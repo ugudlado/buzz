@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use clap::ValueEnum;
-use nostr::Keys;
+use nostr::{Keys, ToBech32};
 use thiserror::Error;
 use url::Url;
 use uuid::Uuid;
@@ -116,8 +116,8 @@ impl std::fmt::Display for RespondTo {
 ///
 /// - `default` — agent's built-in behaviour (permission requests per tool call).
 /// - `acceptEdits` — auto-approve file edits, still ask for other tools.
-/// - `bypassPermissions` — skip the permission flow entirely.
-/// - `dontAsk` — never prompt; reject anything that would require permission.
+/// - `dontAsk` — never prompt; auto-approve anything that would otherwise
+///   require an interactive permission the harness can't show.
 /// - `plan` — planning-only mode (no tool execution).
 #[derive(Debug, Clone, Copy, PartialEq, clap::ValueEnum)]
 pub enum PermissionMode {
@@ -127,7 +127,8 @@ pub enum PermissionMode {
     /// Auto-approve file edits, still ask for other tools.
     #[value(alias = "acceptEdits")]
     AcceptEdits,
-    /// Skip the permission flow entirely.
+    /// Skip the permission flow entirely (upstream alias — treated like
+    /// `DontAsk`: unattended auto-approval).
     #[value(alias = "bypassPermissions")]
     BypassPermissions,
     /// Never prompt; reject anything that would require permission.
@@ -432,13 +433,12 @@ pub struct CliArgs {
     /// Permission mode for agents that support `session/set_config_option`
     /// with `configId: "mode"` (e.g. `claude-agent-acp`).
     ///
-    /// Defaults to `bypassPermissions` which skips the per-tool-call
-    /// permission flow. Set to `default` to restore the agent's built-in
-    /// behaviour.
+    /// Defaults to `dontAsk`, which rejects operations that need interactive
+    /// approval because Buzz does not expose a human permission prompt.
     #[arg(
         long,
         env = "BUZZ_ACP_PERMISSION_MODE",
-        default_value = "bypass-permissions",
+        default_value = "dont-ask",
         value_enum
     )]
     pub permission_mode: PermissionMode,
@@ -1047,6 +1047,20 @@ impl Config {
         let mut persona_env_vars = Vec::new();
         let model = args.model;
 
+        // Bind the spawned agent subprocess's signing identity to this
+        // agent's own key. `AcpClient::spawn` applies this entry
+        // unconditionally (unlike other persona env vars, which defer to an
+        // already-set parent value) — anything the subprocess shells out to
+        // (the `buzz` CLI, in particular) reads `BUZZ_PRIVATE_KEY` directly
+        // to sign its own events, so an inherited/ambient value here would
+        // silently misattribute the agent's messages to another identity.
+        persona_env_vars.push((
+            "BUZZ_PRIVATE_KEY".to_string(),
+            keys.secret_key()
+                .to_bech32()
+                .expect("secret key bech32 encoding should never fail"),
+        ));
+
         // Inject CODEX_CONFIG so the @agentclientprotocol/codex-acp adapter (1.x)
         // opens the Seatbelt network sandbox for buzz-cli (an MCP subprocess). No-op
         // for non-Codex agents or unparseable relay URLs.
@@ -1469,7 +1483,7 @@ mod tests {
             memory_enabled: true,
             model: None,
             session_title: None,
-            permission_mode: PermissionMode::BypassPermissions,
+            permission_mode: PermissionMode::DontAsk,
             respond_to: RespondTo::Anyone,
             respond_to_allowlist: HashSet::new(),
             allowed_respond_to: Vec::new(),
@@ -2270,10 +2284,6 @@ channels = "ALL"
     fn test_permission_mode_wire_strings() {
         assert_eq!(PermissionMode::Default.as_wire_str(), "default");
         assert_eq!(PermissionMode::AcceptEdits.as_wire_str(), "acceptEdits");
-        assert_eq!(
-            PermissionMode::BypassPermissions.as_wire_str(),
-            "bypassPermissions"
-        );
         assert_eq!(PermissionMode::DontAsk.as_wire_str(), "dontAsk");
         assert_eq!(PermissionMode::Plan.as_wire_str(), "plan");
     }
@@ -2281,7 +2291,6 @@ channels = "ALL"
     #[test]
     fn test_permission_mode_is_default() {
         assert!(PermissionMode::Default.is_default());
-        assert!(!PermissionMode::BypassPermissions.is_default());
         assert!(!PermissionMode::AcceptEdits.is_default());
         assert!(!PermissionMode::DontAsk.is_default());
         assert!(!PermissionMode::Plan.is_default());
@@ -2289,20 +2298,17 @@ channels = "ALL"
 
     #[test]
     fn test_permission_mode_display() {
-        assert_eq!(
-            format!("{}", PermissionMode::BypassPermissions),
-            "bypassPermissions"
-        );
+        assert_eq!(format!("{}", PermissionMode::DontAsk), "dontAsk");
         assert_eq!(format!("{}", PermissionMode::Default), "default");
     }
 
     #[test]
     fn test_summary_includes_permission_mode() {
         let mut config = test_config(SubscribeMode::Mentions);
-        config.permission_mode = PermissionMode::BypassPermissions;
+        config.permission_mode = PermissionMode::DontAsk;
         let s = config.summary();
         assert!(
-            s.contains("permission_mode=bypassPermissions"),
+            s.contains("permission_mode=dontAsk"),
             "summary should include permission_mode, got: {s}"
         );
     }
@@ -2319,9 +2325,9 @@ channels = "ALL"
     }
 
     #[test]
-    fn test_default_config_uses_bypass_permissions() {
+    fn test_default_config_rejects_interactive_permissions() {
         let config = test_config(SubscribeMode::Mentions);
-        assert_eq!(config.permission_mode, PermissionMode::BypassPermissions);
+        assert_eq!(config.permission_mode, PermissionMode::DontAsk);
     }
 
     #[test]
@@ -2332,7 +2338,6 @@ channels = "ALL"
         let cases = [
             ("default", PermissionMode::Default),
             ("accept-edits", PermissionMode::AcceptEdits),
-            ("bypass-permissions", PermissionMode::BypassPermissions),
             ("dont-ask", PermissionMode::DontAsk),
             ("plan", PermissionMode::Plan),
         ];
@@ -2347,14 +2352,12 @@ channels = "ALL"
 
     #[test]
     fn test_permission_mode_value_enum_camel_case_aliases() {
-        // Operators may set env vars using the camelCase wire-format strings
-        // (e.g. BUZZ_ACP_PERMISSION_MODE=bypassPermissions). The #[value(alias)]
-        // attributes ensure these parse correctly.
+        // Operators may set env vars using the camelCase wire-format strings.
+        // The #[value(alias)] attributes ensure these parse correctly.
         use clap::ValueEnum;
         let cases = [
             ("default", PermissionMode::Default),
             ("acceptEdits", PermissionMode::AcceptEdits),
-            ("bypassPermissions", PermissionMode::BypassPermissions),
             ("dontAsk", PermissionMode::DontAsk),
             ("plan", PermissionMode::Plan),
         ];
