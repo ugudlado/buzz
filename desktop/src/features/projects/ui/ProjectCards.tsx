@@ -342,7 +342,11 @@ function RepositoryUnavailableIndicator({
   );
 }
 
-export function EmptyState() {
+export function EmptyState({
+  onCreateProject,
+}: {
+  onCreateProject?: () => void;
+}) {
   return (
     <div className="flex flex-1 flex-col items-center justify-center gap-3 px-4 py-16 text-center">
       <Folders className="h-10 w-10 text-muted-foreground/40" />
@@ -352,6 +356,11 @@ export function EmptyState() {
           Projects published to this relay will appear here.
         </p>
       </div>
+      {onCreateProject ? (
+        <Button className="mt-2" onClick={onCreateProject} size="sm">
+          Create project
+        </Button>
+      ) : null}
     </div>
   );
 }

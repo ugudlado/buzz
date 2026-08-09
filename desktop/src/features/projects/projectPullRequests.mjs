@@ -361,6 +361,7 @@ export function eventToProjectPullRequest(
     content: pullRequest.content,
     tags: getImetaTags(pullRequest),
     author: pullRequest.pubkey,
+    authorKind: "nostr",
     createdAt: pullRequest.created_at,
     repoAddress: getTag(pullRequest, "a") ?? null,
     channelId: getTag(pullRequest, "h") ?? null,

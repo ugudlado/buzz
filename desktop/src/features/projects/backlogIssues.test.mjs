@@ -45,9 +45,16 @@ test("task maps to ProjectIssue with a synthetic id", () => {
   assert.equal(issue.status, "In Progress");
   assert.equal(issue.repoAddress, REPO_A);
   assert.equal(issue.author, "spidey");
+  assert.equal(issue.authorKind, "backlog");
   assert.ok(issue.createdAt > 0);
   assert.ok(issue.updatedAt > issue.createdAt);
   assert.deepEqual(issue.labels, ["bug"]);
+});
+
+test("unassigned task falls back to a plain-text label", () => {
+  const issue = backlogTaskToProjectIssue({ ...TASK, assignee: null }, REPO_A);
+  assert.equal(issue.author, "Unassigned");
+  assert.equal(issue.authorKind, "backlog");
 });
 
 test("fetch groups repos by backlog project (one request per project)", async () => {

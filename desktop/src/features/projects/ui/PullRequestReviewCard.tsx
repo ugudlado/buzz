@@ -202,7 +202,9 @@ export function PullRequestReviewCard({
             <Button
               className="h-8 gap-1.5 px-3"
               data-testid="open-pull-request-on-github"
-              onClick={() => window.open(githubUrl, "_blank", "noopener")}
+              onClick={() =>
+                window.open(githubUrl, "_blank", "noopener,noreferrer")
+              }
               size="xs"
               type="button"
               variant="secondary"

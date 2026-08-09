@@ -353,7 +353,11 @@ async function createProjectPullRequestComment({
 
   const recipients = new Set([
     project.owner.toLowerCase(),
-    pullRequest.author.toLowerCase(),
+    // GitHub PR authors are a login, not a pubkey — can't be tagged as a
+    // Nostr recipient.
+    ...(pullRequest.authorKind === "nostr"
+      ? [pullRequest.author.toLowerCase()]
+      : []),
     ...pullRequest.recipients.map((recipient) => recipient.toLowerCase()),
     ...mentionPubkeys.map((pubkey) => pubkey.toLowerCase()),
   ]);

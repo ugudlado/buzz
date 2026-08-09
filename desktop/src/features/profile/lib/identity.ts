@@ -88,6 +88,33 @@ export function mergeCurrentProfileIntoLookup(
   };
 }
 
+/**
+ * Resolves an issue/PR `author` field into render-safe identity info,
+ * respecting the `authorKind` discriminant: a `"nostr"` author is a real
+ * pubkey and goes through the normal profile/avatar pipeline; a
+ * `"github"`/`"backlog"` author is an external login or display name and
+ * must render as plain text — no avatar lookup, no pubkey truncation.
+ */
+export function resolveWorkItemAuthor(input: {
+  author: string;
+  authorKind: "nostr" | "github" | "backlog";
+  profiles?: UserProfileLookup;
+}): {
+  pubkey: string | null;
+  label: string;
+  profile: UserProfileSummary | null;
+} {
+  const { author, authorKind, profiles } = input;
+  if (authorKind !== "nostr") {
+    return { pubkey: null, label: author, profile: null };
+  }
+  return {
+    pubkey: author,
+    label: resolveUserLabel({ profiles, pubkey: author }),
+    profile: getResolvedProfile(author, profiles),
+  };
+}
+
 export function resolveUserLabel(input: {
   pubkey: string;
   currentPubkey?: string;

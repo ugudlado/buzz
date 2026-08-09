@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { formatOwnerLabel, profileLookupsEqual } from "./identity.ts";
+import {
+  formatOwnerLabel,
+  profileLookupsEqual,
+  resolveWorkItemAuthor,
+} from "./identity.ts";
 
 const OWNER_PUBKEY =
   "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -30,6 +34,43 @@ test("formatOwnerLabel calls the viewer-owned agent's owner you", () => {
 
 test("formatOwnerLabel returns null when verified ownership is absent", () => {
   assert.equal(formatOwnerLabel(null, OWNER_PUBKEY, {}), null);
+});
+
+// Regression coverage for the GitHub/Backlog author-as-pubkey bug: a
+// login or display name must never be fed into the pubkey/avatar pipeline
+// (which would fall through resolveUserLabel -> truncatePubkey and render
+// garbage like "octocat…octoc" instead of the plain login).
+test("resolveWorkItemAuthor: a Nostr author resolves through the profile pipeline", () => {
+  const result = resolveWorkItemAuthor({
+    author: OWNER_PUBKEY,
+    authorKind: "nostr",
+    profiles: { [OWNER_PUBKEY]: summary({ displayName: "Ada" }) },
+  });
+  assert.equal(result.pubkey, OWNER_PUBKEY);
+  assert.equal(result.label, "Ada");
+  assert.ok(result.profile);
+});
+
+test("resolveWorkItemAuthor: a GitHub login renders as plain text, not a truncated pubkey", () => {
+  const result = resolveWorkItemAuthor({
+    author: "octocat",
+    authorKind: "github",
+    profiles: {},
+  });
+  assert.equal(result.pubkey, null);
+  assert.equal(result.label, "octocat");
+  assert.equal(result.profile, null);
+});
+
+test("resolveWorkItemAuthor: a Backlog display name renders as plain text", () => {
+  const result = resolveWorkItemAuthor({
+    author: "Jane Doe",
+    authorKind: "backlog",
+    profiles: {},
+  });
+  assert.equal(result.pubkey, null);
+  assert.equal(result.label, "Jane Doe");
+  assert.equal(result.profile, null);
 });
 
 test("profileLookupsEqual: same reference is equal", () => {

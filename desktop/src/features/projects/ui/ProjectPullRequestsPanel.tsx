@@ -31,7 +31,10 @@ import {
   relativeTime,
 } from "@/features/projects/lib/projectsViewHelpers";
 import { canReviewProjectPullRequest } from "@/features/projects/pullRequestReviews";
-import type { UserProfileLookup } from "@/features/profile/lib/identity";
+import {
+  resolveWorkItemAuthor,
+  type UserProfileLookup,
+} from "@/features/profile/lib/identity";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import { cn } from "@/shared/lib/cn";
 import { normalizePubkey } from "@/shared/lib/pubkey";
@@ -48,7 +51,7 @@ import {
   CommitHashChip,
   labelForPubkey,
   pluralize,
-  profileForPubkey,
+  PullRequestAuthorIdentity,
   pullRequestMembers,
   pullRequestStatusBadgeClassName,
   pullRequestStatusClassName,
@@ -62,8 +65,18 @@ import { ProjectRichContent } from "./ProjectRichContent";
 import { PullRequestReviewersRow } from "./PullRequestReviewersRow";
 import { PullRequestReviewCard } from "./PullRequestReviewCard";
 
+/** Dedupe/filter key for a pull request author: normalized pubkey for
+ * Nostr authors, the raw GitHub login otherwise (normalizing would
+ * lowercase a login and corrupt grouping). */
+function pullRequestAuthorFilterKey(pullRequest: ProjectPullRequest): string {
+  return pullRequest.authorKind === "nostr"
+    ? normalizePubkey(pullRequest.author)
+    : pullRequest.author;
+}
+
 function PullRequestCommitRow({
   author,
+  authorKind = "nostr",
   branch,
   createdAt,
   hash,
@@ -72,6 +85,7 @@ function PullRequestCommitRow({
   profiles,
 }: {
   author: string;
+  authorKind?: "nostr" | "github";
   branch: string | null;
   createdAt: number;
   hash: string | null;
@@ -79,8 +93,12 @@ function PullRequestCommitRow({
   onOpenCommit?: (commitHash: string) => void;
   profiles?: UserProfileLookup;
 }) {
-  const authorProfile = profileForPubkey(author, profiles);
-  const authorLabel = labelForPubkey(author, profiles);
+  const resolvedAuthor = resolveWorkItemAuthor({
+    author,
+    authorKind,
+    profiles,
+  });
+  const authorLabel = resolvedAuthor.label;
   const openCommit =
     hash && onOpenCommit ? () => onOpenCommit(hash) : undefined;
 
@@ -91,14 +109,16 @@ function PullRequestCommitRow({
           <ProfileIdentityButton
             avatarClassName="shrink-0"
             avatarSize="xs"
-            avatarUrl={authorProfile?.avatarUrl ?? null}
-            isAgent={authorProfile?.isAgent === true}
+            avatarUrl={resolvedAuthor.profile?.avatarUrl ?? null}
+            isAgent={resolvedAuthor.profile?.isAgent === true}
             label={authorLabel}
-            pubkey={author}
+            pubkey={resolvedAuthor.pubkey}
             showLabel={false}
           />
           <span className="truncate">
-            <ProfileAuthorName pubkey={author}>{authorLabel}</ProfileAuthorName>{" "}
+            <ProfileAuthorName pubkey={resolvedAuthor.pubkey}>
+              {authorLabel}
+            </ProfileAuthorName>{" "}
             authored{" "}
             <span title={formatExactTimestamp(createdAt)}>
               {relativeTime(createdAt)}
@@ -140,8 +160,12 @@ function PullRequestRow({
   profiles?: UserProfileLookup;
   pullRequest: ProjectPullRequest;
 }) {
-  const authorProfile = profileForPubkey(pullRequest.author, profiles);
-  const authorLabel = labelForPubkey(pullRequest.author, profiles);
+  const author = resolveWorkItemAuthor({
+    author: pullRequest.author,
+    authorKind: pullRequest.authorKind,
+    profiles,
+  });
+  const authorLabel = author.label;
   const StatusIcon =
     pullRequest.status === "Closed" || pullRequest.status === "Draft"
       ? X
@@ -156,14 +180,14 @@ function PullRequestRow({
           <ProfileIdentityButton
             avatarClassName="shrink-0"
             avatarSize="xs"
-            avatarUrl={authorProfile?.avatarUrl ?? null}
-            isAgent={authorProfile?.isAgent === true}
+            avatarUrl={author.profile?.avatarUrl ?? null}
+            isAgent={author.profile?.isAgent === true}
             label={authorLabel}
-            pubkey={pullRequest.author}
+            pubkey={author.pubkey}
             showLabel={false}
           />
           <span className="truncate">
-            <ProfileAuthorName pubkey={pullRequest.author}>
+            <ProfileAuthorName pubkey={author.pubkey}>
               {authorLabel}
             </ProfileAuthorName>{" "}
             created this pull request{" "}
@@ -227,7 +251,11 @@ export function PullRequestDetailHeader({
   profiles?: UserProfileLookup;
   pullRequest: ProjectPullRequest;
 }) {
-  const authorLabel = labelForPubkey(pullRequest.author, profiles);
+  const authorLabel = resolveWorkItemAuthor({
+    author: pullRequest.author,
+    authorKind: pullRequest.authorKind,
+    profiles,
+  }).label;
 
   return (
     <header className="min-w-0 space-y-1 p-4 pb-4">
@@ -240,13 +268,17 @@ export function PullRequestDetailHeader({
       <p className="flex items-center gap-1 text-xs font-medium text-muted-foreground">
         <GitPullRequest className="h-3.5 w-3.5" />
         <span className="flex min-w-0 items-center gap-1">
-          <AuthorIdentity
+          <PullRequestAuthorIdentity
             avatarSize="xs"
             profiles={profiles}
-            pubkey={pullRequest.author}
+            pullRequest={pullRequest}
             showLabel={false}
           />
-          <ProfileAuthorName pubkey={pullRequest.author}>
+          <ProfileAuthorName
+            pubkey={
+              pullRequest.authorKind === "nostr" ? pullRequest.author : null
+            }
+          >
             {authorLabel}
           </ProfileAuthorName>
         </span>
@@ -275,8 +307,6 @@ export function PullRequestMetaRail({
   stacked?: boolean;
 }) {
   const identityQuery = useIdentityQuery();
-  const authorProfile = profileForPubkey(pullRequest.author, profiles);
-  const authorLabel = labelForPubkey(pullRequest.author, profiles);
   const targetBranch =
     pullRequest.targetBranch || project.defaultBranch || "default branch";
   const sourceBranch = pullRequest.branchName || "unknown branch";
@@ -320,13 +350,10 @@ export function PullRequestMetaRail({
         </OverviewRailSection>
       ) : null}
       <OverviewRailSection title="Author">
-        <ProfileIdentityButton
-          align="center"
+        <PullRequestAuthorIdentity
           avatarSize="xs"
-          avatarUrl={authorProfile?.avatarUrl ?? null}
-          isAgent={authorProfile?.isAgent === true}
-          label={authorLabel}
-          pubkey={pullRequest.author}
+          profiles={profiles}
+          pullRequest={pullRequest}
         />
       </OverviewRailSection>
       <OverviewRailSection title="Branches">
@@ -455,6 +482,7 @@ export function ProjectPullRequestDetail({
         <div className="divide-y divide-border/50">
           <PullRequestCommitRow
             author={pullRequest.author}
+            authorKind={pullRequest.authorKind}
             branch={pullRequest.branchName}
             createdAt={pullRequest.createdAt}
             hash={pullRequest.commit}
@@ -821,14 +849,18 @@ export function PullRequestsPanel({
   }, [pullRequests]);
 
   const authorOptions = React.useMemo(() => {
-    const distinct = new Set<string>();
+    const distinct = new Map<string, ProjectPullRequest>();
     for (const pullRequest of pullRequests) {
-      distinct.add(normalizePubkey(pullRequest.author));
+      distinct.set(pullRequestAuthorFilterKey(pullRequest), pullRequest);
     }
-    return [...distinct]
-      .map((pubkey) => ({
-        label: labelForPubkey(pubkey, profiles),
-        value: pubkey,
+    return [...distinct.entries()]
+      .map(([key, pullRequest]) => ({
+        label: resolveWorkItemAuthor({
+          author: pullRequest.author,
+          authorKind: pullRequest.authorKind,
+          profiles,
+        }).label,
+        value: key,
       }))
       .sort((a, b) => a.label.localeCompare(b.label));
   }, [profiles, pullRequests]);
@@ -849,7 +881,7 @@ export function PullRequestsPanel({
       }
       if (
         authorFilter.length > 0 &&
-        !authorFilter.includes(normalizePubkey(pullRequest.author))
+        !authorFilter.includes(pullRequestAuthorFilterKey(pullRequest))
       ) {
         return false;
       }

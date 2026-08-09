@@ -4,7 +4,10 @@ import { normalizePubkey } from "@/shared/lib/pubkey";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/shared/ui/tooltip";
 import { UserAvatar } from "@/shared/ui/UserAvatar";
 
-/** Compact work-item author identity with a minimal hover summary. */
+/** Compact work-item author identity with a minimal hover summary.
+ * `pubkey: null` renders `label` as plain text with no avatar lookup or
+ * profile popover — for external (GitHub/Backlog) authors that aren't a
+ * real Nostr pubkey. */
 export function ProjectAuthorIdentity({
   label,
   profiles,
@@ -13,11 +16,36 @@ export function ProjectAuthorIdentity({
 }: {
   label: string;
   profiles?: UserProfileLookup;
-  pubkey: string;
+  pubkey: string | null;
   testId?: string;
 }) {
-  const profile = profiles?.[normalizePubkey(pubkey)];
+  const profile = pubkey ? profiles?.[normalizePubkey(pubkey)] : undefined;
   const roleLabel = profile?.isAgent === true ? "Agent" : "Person";
+
+  const avatar = (
+    <UserAvatar
+      accent={profile?.isAgent === true}
+      avatarUrl={profile?.avatarUrl ?? null}
+      displayName={label}
+      fallbackDelayMs={0}
+      size="xs"
+      testId={testId ? `${testId}-avatar` : undefined}
+    />
+  );
+
+  if (!pubkey) {
+    return (
+      <span
+        className="inline-flex items-center gap-1 align-middle"
+        data-testid={testId}
+      >
+        {avatar}
+        <span data-testid={testId ? `${testId}-label` : undefined}>
+          {label}
+        </span>
+      </span>
+    );
+  }
 
   return (
     <span className="inline-flex align-middle">
@@ -33,14 +61,7 @@ export function ProjectAuthorIdentity({
               data-testid={testId}
               type="button"
             >
-              <UserAvatar
-                accent={profile?.isAgent === true}
-                avatarUrl={profile?.avatarUrl ?? null}
-                displayName={label}
-                fallbackDelayMs={0}
-                size="xs"
-                testId={testId ? `${testId}-avatar` : undefined}
-              />
+              {avatar}
               <span data-testid={testId ? `${testId}-label` : undefined}>
                 {label}
               </span>

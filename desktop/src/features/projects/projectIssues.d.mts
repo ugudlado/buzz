@@ -16,6 +16,14 @@ export type ProjectIssueComment = {
   createdAt: number;
 };
 
+/**
+ * Discriminates what `author` (and comment `author`) actually holds:
+ * `"nostr"` is a real 64-hex pubkey safe to feed into profile/avatar
+ * lookups; `"github"`/`"backlog"` are an external login or display name
+ * that must render as plain text only.
+ */
+export type ProjectIssueAuthorKind = "nostr" | "github" | "backlog";
+
 export type ProjectIssue = {
   id: string;
   /** Human-facing short id (e.g. Backlog "ORC-12"); falls back to id prefix. */
@@ -24,6 +32,7 @@ export type ProjectIssue = {
   content: string;
   tags: string[][];
   author: string;
+  authorKind: ProjectIssueAuthorKind;
   createdAt: number;
   repoAddress: string | null;
   channelId: string | null;

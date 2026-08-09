@@ -108,6 +108,7 @@ export function eventToProjectIssue(
     content: issue.content,
     tags: getImetaTags(issue),
     author: issue.pubkey,
+    authorKind: "nostr",
     createdAt: issue.created_at,
     repoAddress: getTag(issue, "a") ?? null,
     channelId: getTag(issue, "h") ?? null,

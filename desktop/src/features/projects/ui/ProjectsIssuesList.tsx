@@ -9,7 +9,7 @@ import type {
 import { relativeTime } from "@/features/projects/lib/projectsViewHelpers";
 import type { ProjectWorkItemSection } from "@/features/projects/projectWorkItems";
 import {
-  resolveUserLabel,
+  resolveWorkItemAuthor,
   type UserProfileLookup,
 } from "@/features/profile/lib/identity";
 import { cn } from "@/shared/lib/cn";
@@ -69,7 +69,11 @@ function IssueHeader({
   profiles?: UserProfileLookup;
   project: Project;
 }) {
-  const authorLabel = resolveUserLabel({ profiles, pubkey: issue.author });
+  const author = resolveWorkItemAuthor({
+    author: issue.author,
+    authorKind: issue.authorKind,
+    profiles,
+  });
 
   return (
     <div className="-mt-0.5 min-w-0 flex-1">
@@ -92,9 +96,9 @@ function IssueHeader({
         <span className="inline-flex items-center gap-1">
           <span>by</span>
           <ProjectAuthorIdentity
-            label={authorLabel}
+            label={author.label}
             profiles={profiles}
-            pubkey={issue.author}
+            pubkey={author.pubkey}
             testId={authorTestId}
           />
         </span>

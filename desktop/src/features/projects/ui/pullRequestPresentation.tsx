@@ -2,7 +2,10 @@ import type {
   ProjectPullRequest,
   Repository as Project,
 } from "@/features/projects/hooks";
-import type { UserProfileLookup } from "@/features/profile/lib/identity";
+import {
+  resolveWorkItemAuthor,
+  type UserProfileLookup,
+} from "@/features/profile/lib/identity";
 import type { ChannelMember } from "@/shared/api/types";
 import { normalizePubkey, truncatePubkey } from "@/shared/lib/pubkey";
 import { ProfileIdentityButton } from "./ProjectProfileIdentity";
@@ -54,7 +57,7 @@ export function pullRequestMembers(
   return [
     ...new Set([
       project.owner,
-      pullRequest.author,
+      ...(pullRequest.authorKind === "nostr" ? [pullRequest.author] : []),
       ...project.contributors,
       ...pullRequest.recipients,
     ]),
@@ -93,6 +96,41 @@ export function AuthorIdentity({
       isAgent={profile?.isAgent === true}
       label={labelForPubkey(pubkey, profiles)}
       pubkey={pubkey}
+      role={role}
+      showLabel={showLabel}
+    />
+  );
+}
+
+/** Like {@link AuthorIdentity}, but for a pull request's top-level `author`,
+ * which may be a GitHub login rather than a Nostr pubkey — renders plain
+ * text with no avatar lookup or profile popover for non-Nostr authors. */
+export function PullRequestAuthorIdentity({
+  avatarSize = "md",
+  profiles,
+  pullRequest,
+  role,
+  showLabel = true,
+}: {
+  avatarSize?: "xs" | "sm" | "md";
+  profiles?: UserProfileLookup;
+  pullRequest: ProjectPullRequest;
+  role?: React.ReactNode;
+  showLabel?: boolean;
+}) {
+  const author = resolveWorkItemAuthor({
+    author: pullRequest.author,
+    authorKind: pullRequest.authorKind,
+    profiles,
+  });
+  return (
+    <ProfileIdentityButton
+      align="center"
+      avatarSize={avatarSize}
+      avatarUrl={author.profile?.avatarUrl ?? null}
+      isAgent={author.profile?.isAgent === true}
+      label={author.label}
+      pubkey={author.pubkey}
       role={role}
       showLabel={showLabel}
     />
