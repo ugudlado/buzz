@@ -175,7 +175,11 @@ fn check_custom_emoji_url(url: &str) -> Result<(), SdkError> {
 }
 
 /// Emit NIP-10 e-tags for a `ThreadRef`.
-fn thread_tags(thread_ref: &ThreadRef, tags: &mut Vec<Tag>) -> Result<(), SdkError> {
+/// Append the NIP-10 `e` tags for `thread_ref` to `tags`, using the Buzz
+/// client convention: a direct reply to the root carries a single `reply`
+/// marker; a nested reply carries `root` + `reply`. This is the one place
+/// that convention is emitted — desktop `buildReplyTags` mirrors it.
+pub fn thread_tags(thread_ref: &ThreadRef, tags: &mut Vec<Tag>) -> Result<(), SdkError> {
     let root = thread_ref.root_event_id.to_hex();
     let parent = thread_ref.parent_event_id.to_hex();
     if root == parent {

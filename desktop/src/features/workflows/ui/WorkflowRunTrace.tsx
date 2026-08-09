@@ -23,6 +23,7 @@ function StepStatusBadge({ status }: { status: string }) {
     cancelled: "secondary",
     skipped: "secondary",
     waiting_approval: "warning",
+    waiting_agent: "warning",
   };
 
   return (
@@ -42,6 +43,7 @@ function StepStatusIcon({ status }: { status: string }) {
     case "skipped":
       return <SkipForward className="h-4 w-4 text-muted-foreground" />;
     case "waiting_approval":
+    case "waiting_agent":
       return <Clock className="h-4 w-4 text-amber-500" />;
     default:
       return <Clock className="h-4 w-4 text-blue-500" />;

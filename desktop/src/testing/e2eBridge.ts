@@ -3353,7 +3353,8 @@ type RawWorkflowRun = {
     | "completed"
     | "failed"
     | "cancelled"
-    | "waiting_approval";
+    | "waiting_approval"
+    | "waiting_agent";
   current_step: number | null;
   execution_trace: RawWorkflowTraceEntry[];
   started_at: number | null;

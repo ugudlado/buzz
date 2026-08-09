@@ -82,6 +82,8 @@ pub enum RunStatus {
     Running,
     /// Run is suspended waiting for an approval gate.
     WaitingApproval,
+    /// Run is suspended waiting for an assigned agent's reply.
+    WaitingAgent,
     /// Run finished successfully.
     Completed,
     /// Run terminated with an error.
@@ -96,6 +98,7 @@ impl fmt::Display for RunStatus {
             RunStatus::Pending => write!(f, "pending"),
             RunStatus::Running => write!(f, "running"),
             RunStatus::WaitingApproval => write!(f, "waiting_approval"),
+            RunStatus::WaitingAgent => write!(f, "waiting_agent"),
             RunStatus::Completed => write!(f, "completed"),
             RunStatus::Failed => write!(f, "failed"),
             RunStatus::Cancelled => write!(f, "cancelled"),
@@ -110,6 +113,7 @@ impl FromStr for RunStatus {
             "pending" => Ok(RunStatus::Pending),
             "running" => Ok(RunStatus::Running),
             "waiting_approval" => Ok(RunStatus::WaitingApproval),
+            "waiting_agent" => Ok(RunStatus::WaitingAgent),
             "completed" => Ok(RunStatus::Completed),
             "failed" => Ok(RunStatus::Failed),
             "cancelled" => Ok(RunStatus::Cancelled),
@@ -920,6 +924,68 @@ pub async fn update_workflow_run(
     Ok(())
 }
 
+/// CAS a run's status `waiting_approval|waiting_agent -> running` before
+/// resuming it from a completed agent step or approval. Guards against two
+/// concurrent resume attempts for the same run (e.g. a crash-recovery sweep
+/// racing a still-in-flight live resume) both proceeding to execute subsequent
+/// steps — only the CAS winner should call `execute_from_step`. Returns
+/// `Ok(false)` if the run was not in a waiting status (already resumed or
+/// otherwise transitioned); callers should treat that as a no-op.
+pub async fn try_mark_run_resuming(
+    pool: &PgPool,
+    community_id: CommunityId,
+    id: Uuid,
+) -> Result<bool> {
+    let affected = sqlx::query(
+        r#"
+        UPDATE workflow_runs
+        SET status = 'running'::run_status
+        WHERE community_id = $1 AND id = $2
+          AND status IN ('waiting_approval'::run_status, 'waiting_agent'::run_status)
+        "#,
+    )
+    .bind(community_id.as_uuid())
+    .bind(id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+
+    Ok(affected > 0)
+}
+
+/// Fail a run that is still `waiting_agent`, in one conditional UPDATE —
+/// used by the expiry sweeper so a run that resumed between the step row
+/// expiring and this call is left alone (no fetch-then-update race).
+/// Preserves the existing `execution_trace`. Returns whether the run was
+/// transitioned.
+pub async fn fail_run_if_waiting_agent(
+    pool: &PgPool,
+    community_id: CommunityId,
+    id: Uuid,
+    current_step: i32,
+    error: &str,
+) -> Result<bool> {
+    let affected = sqlx::query(
+        r#"
+        UPDATE workflow_runs
+        SET status = 'failed'::run_status,
+            current_step = $1,
+            error_message = $2,
+            completed_at = NOW()
+        WHERE community_id = $3 AND id = $4 AND status = 'waiting_agent'
+        "#,
+    )
+    .bind(current_step)
+    .bind(error)
+    .bind(community_id.as_uuid())
+    .bind(id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+
+    Ok(affected > 0)
+}
+
 // -- Approval CRUD ------------------------------------------------------------
 
 /// Parameters for creating a new approval request.
@@ -1121,6 +1187,314 @@ pub async fn update_approval_by_stored_hash(
     Ok(affected > 0)
 }
 
+// -- Agent-step CRUD ------------------------------------------------------------
+
+/// Status of an `AssignToAgent` suspension. Stored as ENUM in
+/// `workflow_agent_steps`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentStepStatus {
+    /// The assignment message was sent; awaiting the agent's reply.
+    Pending,
+    /// The agent replied and the run was resumed.
+    Done,
+    /// The assignment window elapsed without a reply.
+    Expired,
+    /// The assignment could not be resumed (e.g. malformed reply).
+    Failed,
+}
+
+impl fmt::Display for AgentStepStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AgentStepStatus::Pending => write!(f, "pending"),
+            AgentStepStatus::Done => write!(f, "done"),
+            AgentStepStatus::Expired => write!(f, "expired"),
+            AgentStepStatus::Failed => write!(f, "failed"),
+        }
+    }
+}
+
+impl FromStr for AgentStepStatus {
+    type Err = DbError;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "pending" => Ok(AgentStepStatus::Pending),
+            "done" => Ok(AgentStepStatus::Done),
+            "expired" => Ok(AgentStepStatus::Expired),
+            "failed" => Ok(AgentStepStatus::Failed),
+            other => Err(DbError::InvalidData(format!(
+                "unknown agent step status: {other}"
+            ))),
+        }
+    }
+}
+
+/// A `workflow_agent_steps` row: an `AssignToAgent` suspension awaiting the
+/// mentioned agent's reply.
+#[derive(Debug, Clone)]
+pub struct AgentStepRecord {
+    /// Hex event id of the `@mention` message that requested the agent's work.
+    pub prompt_event_id: String,
+    /// The workflow this assignment belongs to.
+    pub workflow_id: Uuid,
+    /// The run waiting on this assignment.
+    pub run_id: Uuid,
+    /// The step ID that requested the assignment.
+    pub step_id: String,
+    /// Zero-based index of the step in the workflow.
+    pub step_index: i32,
+    /// Compressed public key bytes of the mentioned agent.
+    pub agent_pubkey: Vec<u8>,
+    /// Current lifecycle status of the assignment.
+    pub status: AgentStepStatus,
+    /// The agent's completion output, filled in on resume.
+    pub output: Option<serde_json::Value>,
+    /// When this assignment expires if the agent has not replied.
+    pub expires_at: DateTime<Utc>,
+    /// When the assignment was created.
+    pub created_at: DateTime<Utc>,
+    /// When the CAS to a terminal status (e.g. `done`) committed. `None`
+    /// while still `pending`.
+    pub resolved_at: Option<DateTime<Utc>>,
+}
+
+/// Parameters for creating a new agent-assignment step.
+pub struct CreateAgentStepParams<'a> {
+    /// Server-resolved community that owns the workflow/run this step gates.
+    pub community_id: CommunityId,
+    /// Hex event id of the `@mention` message — the public identifier for
+    /// this assignment (there is no secret to hash, unlike approval tokens).
+    pub prompt_event_id: &'a str,
+    /// The workflow this assignment belongs to.
+    pub workflow_id: Uuid,
+    /// The run waiting on this assignment.
+    pub run_id: Uuid,
+    /// The step ID that requested the assignment.
+    pub step_id: &'a str,
+    /// Zero-based index of the step in the workflow.
+    pub step_index: i32,
+    /// Compressed public key bytes of the mentioned agent.
+    pub agent_pubkey: &'a [u8],
+    /// When this assignment expires if the agent has not replied.
+    pub expires_at: DateTime<Utc>,
+}
+
+/// Insert a new agent-assignment step with `status = 'pending'`.
+pub async fn create_agent_step(pool: &PgPool, params: CreateAgentStepParams<'_>) -> Result<()> {
+    let CreateAgentStepParams {
+        community_id,
+        prompt_event_id,
+        workflow_id,
+        run_id,
+        step_id,
+        step_index,
+        agent_pubkey,
+        expires_at,
+    } = params;
+
+    sqlx::query(
+        r#"
+        INSERT INTO workflow_agent_steps
+            (community_id, prompt_event_id, workflow_id, run_id, step_id, step_index, agent_pubkey, status, expires_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8)
+        "#,
+    )
+    .bind(community_id.as_uuid())
+    .bind(prompt_event_id)
+    .bind(workflow_id)
+    .bind(run_id)
+    .bind(step_id)
+    .bind(step_index)
+    .bind(agent_pubkey)
+    .bind(expires_at)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+/// Fetch an agent-assignment step by its prompt event id.
+pub async fn get_agent_step(
+    pool: &PgPool,
+    community_id: CommunityId,
+    prompt_event_id: &str,
+) -> Result<AgentStepRecord> {
+    let row = sqlx::query(
+        r#"
+        SELECT prompt_event_id, workflow_id, run_id, step_id, step_index, agent_pubkey,
+               status::text AS status, output, expires_at, created_at, resolved_at
+        FROM workflow_agent_steps
+        WHERE community_id = $1 AND prompt_event_id = $2
+        "#,
+    )
+    .bind(community_id.as_uuid())
+    .bind(prompt_event_id)
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| DbError::NotFound("agent step (prompt_event_id)".to_string()))?;
+
+    row_to_agent_step_record(row)
+}
+
+/// Update an agent step's status and optional output.
+///
+/// # TOCTOU safety
+/// The WHERE clause includes `AND status = 'pending'` so that two concurrent
+/// resume attempts (e.g. a duplicate reply and the expiry sweeper) cannot both
+/// succeed. If the step was already resolved (status != 'pending'), the
+/// UPDATE touches 0 rows and this function returns `Ok(false)`. Callers should
+/// treat `false` as a conflict/no-op — this is the double-resume guard.
+pub async fn update_agent_step_by_prompt_event_id(
+    pool: &PgPool,
+    community_id: CommunityId,
+    prompt_event_id: &str,
+    status: AgentStepStatus,
+    output: Option<&serde_json::Value>,
+) -> Result<bool> {
+    let status_str = status.to_string();
+    let affected = sqlx::query(
+        r#"
+        UPDATE workflow_agent_steps
+        SET status = $1::agent_step_status,
+            output = COALESCE($2, output),
+            resolved_at = NOW()
+        WHERE community_id = $3 AND prompt_event_id = $4 AND status = 'pending'
+        "#,
+    )
+    .bind(&status_str)
+    .bind(output)
+    .bind(community_id.as_uuid())
+    .bind(prompt_event_id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+
+    Ok(affected > 0)
+}
+
+/// A `workflow_agent_steps` row that was swept from `pending` to `expired`
+/// because its `expires_at` elapsed. Carries enough to finalize the
+/// associated `workflow_runs` row as `Failed`.
+#[derive(Debug, Clone)]
+pub struct ExpiredAgentStep {
+    /// Community that owns the agent step and its run.
+    pub community_id: CommunityId,
+    /// The run that was waiting on this assignment.
+    pub run_id: Uuid,
+    /// Zero-based index of the step that requested the assignment.
+    pub step_index: i32,
+}
+
+/// Sweep overdue `workflow_agent_steps` rows (`status = 'pending' AND
+/// expires_at < now()`) to `status = 'expired'`.
+///
+/// Returns one [`ExpiredAgentStep`] per
+/// swept row so the caller can finalize each associated `workflow_runs` row
+/// as `Failed` — this function only touches `workflow_agent_steps`, never
+/// `workflow_runs`.
+///
+/// `LIMIT` bounds a single sweep tick so a large backlog is drained
+/// incrementally across ticks rather than in one unbounded UPDATE.
+pub async fn sweep_expired_agent_steps(pool: &PgPool, limit: i64) -> Result<Vec<ExpiredAgentStep>> {
+    let limit = limit.clamp(1, LIST_MAX_LIMIT);
+    let rows = sqlx::query(
+        r#"
+        UPDATE workflow_agent_steps
+        SET status = 'expired'
+        WHERE (community_id, prompt_event_id) IN (
+            SELECT community_id, prompt_event_id
+            FROM workflow_agent_steps
+            WHERE status = 'pending' AND expires_at < NOW()
+            LIMIT $1
+        )
+        RETURNING community_id, run_id, step_index
+        "#,
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|row| {
+            let community_id: Uuid = row.try_get("community_id")?;
+            Ok(ExpiredAgentStep {
+                community_id: CommunityId::from_uuid(community_id),
+                run_id: row.try_get("run_id")?,
+                step_index: row.try_get("step_index")?,
+            })
+        })
+        .collect()
+}
+
+/// A `workflow_agent_steps` row that reached `status = 'done'` (its CAS
+/// succeeded) but whose run is still `waiting_agent` — the crash window
+/// between the CAS and the resume call (e.g. a pod restart in between).
+#[derive(Debug, Clone)]
+pub struct StuckDoneAgentStep {
+    /// Community that owns the agent step and its run.
+    pub community_id: CommunityId,
+    /// Hex event id of the `@mention` message — needed to re-fetch the full
+    /// row (including `output`) for the retry.
+    pub prompt_event_id: String,
+    /// The run that should have resumed but did not.
+    pub run_id: Uuid,
+}
+
+/// Find `workflow_agent_steps` rows stuck `done` while their run is still
+/// `waiting_agent` — i.e. the CAS to `done` committed but the relay
+/// crashed (or errored) before resuming execution. The periodic sweeper
+/// retries these to close the crash window described in the design doc.
+///
+/// Bounded by `min_age_secs` so an in-flight resume (still between its CAS
+/// and its `execute_from_step` call, same request) is not raced by the
+/// sweeper — only rows whose `resolved_at` (when the CAS to `done`
+/// committed, not when the row was created) is older than that grace period
+/// are considered stuck. Results are capped at [`LIST_MAX_LIMIT`].
+///
+/// `r.current_step = s.step_index` is required in addition to `r.status =
+/// 'waiting_agent'` — without it, a step that resumed successfully and
+/// advanced the run to a *later* suspended step (e.g. the next
+/// `assign_to_agent`) still matches on `status` alone forever, since
+/// `resolved_at` never changes once the row is `done`. Every subsequent
+/// sweep tick would then "recover" the same stale row, rewinding the run
+/// back to just past it and re-dispatching whatever step follows — clobbering
+/// real progress on the step the run is actually waiting on.
+pub async fn list_stuck_done_agent_steps(
+    pool: &PgPool,
+    min_age_secs: i64,
+    limit: i64,
+) -> Result<Vec<StuckDoneAgentStep>> {
+    let limit = limit.clamp(1, LIST_MAX_LIMIT);
+    let rows = sqlx::query(
+        r#"
+        SELECT s.community_id, s.prompt_event_id, s.run_id
+        FROM workflow_agent_steps s
+        JOIN workflow_runs r ON r.community_id = s.community_id AND r.id = s.run_id
+        WHERE s.status = 'done'
+          AND r.status = 'waiting_agent'
+          AND r.current_step = s.step_index
+          AND s.resolved_at < NOW() - ($1 || ' seconds')::interval
+        LIMIT $2
+        "#,
+    )
+    .bind(min_age_secs.to_string())
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|row| {
+            let community_id: Uuid = row.try_get("community_id")?;
+            Ok(StuckDoneAgentStep {
+                community_id: CommunityId::from_uuid(community_id),
+                prompt_event_id: row.try_get("prompt_event_id")?,
+                run_id: row.try_get("run_id")?,
+            })
+        })
+        .collect()
+}
+
 // -- Row mappers --------------------------------------------------------------
 
 fn row_to_workflow_record(row: sqlx::postgres::PgRow) -> Result<WorkflowRecord> {
@@ -1192,6 +1566,28 @@ fn row_to_approval_record(row: sqlx::postgres::PgRow) -> Result<ApprovalRecord> 
         note: row.try_get("note")?,
         expires_at: row.try_get("expires_at")?,
         created_at: row.try_get("created_at")?,
+    })
+}
+
+fn row_to_agent_step_record(row: sqlx::postgres::PgRow) -> Result<AgentStepRecord> {
+    let workflow_id: Uuid = row.try_get("workflow_id")?;
+    let run_id: Uuid = row.try_get("run_id")?;
+
+    let status_str: String = row.try_get("status")?;
+    let status = status_str.parse::<AgentStepStatus>()?;
+
+    Ok(AgentStepRecord {
+        prompt_event_id: row.try_get("prompt_event_id")?,
+        workflow_id,
+        run_id,
+        step_id: row.try_get("step_id")?,
+        step_index: row.try_get("step_index")?,
+        agent_pubkey: row.try_get("agent_pubkey")?,
+        status,
+        output: row.try_get("output")?,
+        expires_at: row.try_get("expires_at")?,
+        created_at: row.try_get("created_at")?,
+        resolved_at: row.try_get("resolved_at")?,
     })
 }
 
@@ -1267,6 +1663,7 @@ mod tests {
         assert_eq!(RunStatus::Pending.to_string(), "pending");
         assert_eq!(RunStatus::Running.to_string(), "running");
         assert_eq!(RunStatus::WaitingApproval.to_string(), "waiting_approval");
+        assert_eq!(RunStatus::WaitingAgent.to_string(), "waiting_agent");
         assert_eq!(RunStatus::Completed.to_string(), "completed");
         assert_eq!(RunStatus::Failed.to_string(), "failed");
         assert_eq!(RunStatus::Cancelled.to_string(), "cancelled");
@@ -1278,6 +1675,7 @@ mod tests {
             "pending",
             "running",
             "waiting_approval",
+            "waiting_agent",
             "completed",
             "failed",
             "cancelled",
@@ -2397,6 +2795,543 @@ mod tests {
         assert!(
             enabled_b.iter().any(|w| w.id == wf_departing_b),
             "same owner's workflow in a different channel must be untouched"
+        );
+    }
+
+    // -- Agent-step CRUD + CAS -------------------------------------------------
+
+    /// Insert a `workflow_agent_steps` row for `(workflow_id, community)`
+    /// under a fresh run, `status = 'pending'`. Returns the run id and the
+    /// prompt event id used as the row's identifier.
+    async fn make_pending_agent_step(
+        pool: &PgPool,
+        community: CommunityId,
+        workflow_id: Uuid,
+        prompt_event_id: &str,
+        agent_pubkey: &[u8],
+        expires_at: DateTime<Utc>,
+    ) -> Uuid {
+        let run_id = create_workflow_run(pool, community, workflow_id, None, None)
+            .await
+            .expect("create run");
+        create_agent_step(
+            pool,
+            CreateAgentStepParams {
+                community_id: community,
+                prompt_event_id,
+                workflow_id,
+                run_id,
+                step_id: "assign-1",
+                step_index: 0,
+                agent_pubkey,
+                expires_at,
+            },
+        )
+        .await
+        .expect("create agent step");
+        run_id
+    }
+
+    /// Basic round-trip: create a pending agent step, fetch it back, and
+    /// confirm every field matches what was inserted.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn agent_step_create_and_get_round_trips_fields() {
+        let pool = setup_pool().await;
+        let community = make_community(&pool).await;
+        let (workflow_id, _) = make_workflow_in(&pool, community).await;
+
+        let prompt_event_id = format!("evt-{}", Uuid::new_v4().simple());
+        let agent_pubkey = vec![0x42; 32];
+        let expires_at = Utc::now() + chrono::Duration::minutes(30);
+
+        let run_id = make_pending_agent_step(
+            &pool,
+            community,
+            workflow_id,
+            &prompt_event_id,
+            &agent_pubkey,
+            expires_at,
+        )
+        .await;
+
+        let record = get_agent_step(&pool, community, &prompt_event_id)
+            .await
+            .expect("get agent step");
+
+        assert_eq!(record.prompt_event_id, prompt_event_id);
+        assert_eq!(record.workflow_id, workflow_id);
+        assert_eq!(record.run_id, run_id);
+        assert_eq!(record.step_id, "assign-1");
+        assert_eq!(record.step_index, 0);
+        assert_eq!(record.agent_pubkey, agent_pubkey);
+        assert_eq!(record.status, AgentStepStatus::Pending);
+        assert!(record.output.is_none());
+    }
+
+    /// A single successful CAS transition writes both the new status and the
+    /// output, and a second attempt against the now-non-pending row is a
+    /// documented no-op (`Ok(false)`) rather than an error or a silent
+    /// overwrite.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn agent_step_cas_update_then_second_attempt_is_noop() {
+        let pool = setup_pool().await;
+        let community = make_community(&pool).await;
+        let (workflow_id, _) = make_workflow_in(&pool, community).await;
+
+        let prompt_event_id = format!("evt-{}", Uuid::new_v4().simple());
+        let agent_pubkey = vec![0x7a; 32];
+        let expires_at = Utc::now() + chrono::Duration::minutes(30);
+        make_pending_agent_step(
+            &pool,
+            community,
+            workflow_id,
+            &prompt_event_id,
+            &agent_pubkey,
+            expires_at,
+        )
+        .await;
+
+        let output = serde_json::json!({"summary": "all good"});
+        let first = update_agent_step_by_prompt_event_id(
+            &pool,
+            community,
+            &prompt_event_id,
+            AgentStepStatus::Done,
+            Some(&output),
+        )
+        .await
+        .expect("first CAS update");
+        assert!(first, "first transition from pending must win");
+
+        let record = get_agent_step(&pool, community, &prompt_event_id)
+            .await
+            .expect("get after update");
+        assert_eq!(record.status, AgentStepStatus::Done);
+        assert_eq!(record.output.as_ref(), Some(&output));
+
+        // Second attempt: row is no longer `pending`, so the CAS predicate
+        // matches zero rows. Must report `false`, not error, and must not
+        // clobber the already-recorded output.
+        let other_output = serde_json::json!({"summary": "should not land"});
+        let second = update_agent_step_by_prompt_event_id(
+            &pool,
+            community,
+            &prompt_event_id,
+            AgentStepStatus::Failed,
+            Some(&other_output),
+        )
+        .await
+        .expect("second CAS update (no-op)");
+        assert!(
+            !second,
+            "second transition must lose — row already resolved"
+        );
+
+        let record_after = get_agent_step(&pool, community, &prompt_event_id)
+            .await
+            .expect("get after second attempt");
+        assert_eq!(
+            record_after.status,
+            AgentStepStatus::Done,
+            "status must remain from the first, winning transition"
+        );
+        assert_eq!(
+            record_after.output.as_ref(),
+            Some(&output),
+            "output must remain from the first, winning transition"
+        );
+    }
+
+    /// The double-resume guard under real concurrency: fire two CAS updates
+    /// at the same row from concurrent tasks. Exactly one must win — this is
+    /// the scenario prerequisite #4 in the design doc calls out (a duplicate
+    /// agent reply racing the expiry sweeper, or two replies racing each
+    /// other) and is the reason the CAS predicate exists at all.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn agent_step_concurrent_cas_only_one_winner() {
+        let pool = setup_pool().await;
+        let community = make_community(&pool).await;
+        let (workflow_id, _) = make_workflow_in(&pool, community).await;
+
+        let prompt_event_id = format!("evt-{}", Uuid::new_v4().simple());
+        let agent_pubkey = vec![0x99; 32];
+        let expires_at = Utc::now() + chrono::Duration::minutes(30);
+        make_pending_agent_step(
+            &pool,
+            community,
+            workflow_id,
+            &prompt_event_id,
+            &agent_pubkey,
+            expires_at,
+        )
+        .await;
+
+        let pool_a = pool.clone();
+        let pool_b = pool.clone();
+        let id_a = prompt_event_id.clone();
+        let id_b = prompt_event_id.clone();
+
+        let task_a = tokio::spawn(async move {
+            let output = serde_json::json!({"winner": "a"});
+            update_agent_step_by_prompt_event_id(
+                &pool_a,
+                community,
+                &id_a,
+                AgentStepStatus::Done,
+                Some(&output),
+            )
+            .await
+        });
+        let task_b = tokio::spawn(async move {
+            let output = serde_json::json!({"winner": "b"});
+            update_agent_step_by_prompt_event_id(
+                &pool_b,
+                community,
+                &id_b,
+                AgentStepStatus::Failed,
+                Some(&output),
+            )
+            .await
+        });
+
+        let (result_a, result_b) = tokio::join!(task_a, task_b);
+        let won_a = result_a.expect("task a join").expect("task a query");
+        let won_b = result_b.expect("task b join").expect("task b query");
+
+        assert_ne!(
+            won_a, won_b,
+            "exactly one concurrent CAS transition must win, never both or neither"
+        );
+
+        let final_record = get_agent_step(&pool, community, &prompt_event_id)
+            .await
+            .expect("get final state");
+        assert_ne!(
+            final_record.status,
+            AgentStepStatus::Pending,
+            "the winning task must have moved the row out of pending"
+        );
+    }
+
+    /// `sweep_expired_agent_steps` only touches rows that are both `pending`
+    /// and past `expires_at`; a pending-but-not-yet-expired row and an
+    /// already-`done` expired-looking row are both left untouched.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn sweep_expired_agent_steps_only_sweeps_pending_and_overdue() {
+        let pool = setup_pool().await;
+        let community = make_community(&pool).await;
+        let (workflow_id, _) = make_workflow_in(&pool, community).await;
+
+        // Backdated + still pending: must be swept.
+        let overdue_id = format!("evt-{}", Uuid::new_v4().simple());
+        let overdue_run = make_pending_agent_step(
+            &pool,
+            community,
+            workflow_id,
+            &overdue_id,
+            &[0x11; 32],
+            Utc::now() - chrono::Duration::minutes(5),
+        )
+        .await;
+
+        // Not yet expired: must NOT be swept.
+        let fresh_id = format!("evt-{}", Uuid::new_v4().simple());
+        make_pending_agent_step(
+            &pool,
+            community,
+            workflow_id,
+            &fresh_id,
+            &[0x22; 32],
+            Utc::now() + chrono::Duration::minutes(30),
+        )
+        .await;
+
+        // Backdated but already resolved: must NOT be swept (not pending).
+        let resolved_id = format!("evt-{}", Uuid::new_v4().simple());
+        make_pending_agent_step(
+            &pool,
+            community,
+            workflow_id,
+            &resolved_id,
+            &[0x33; 32],
+            Utc::now() - chrono::Duration::minutes(5),
+        )
+        .await;
+        update_agent_step_by_prompt_event_id(
+            &pool,
+            community,
+            &resolved_id,
+            AgentStepStatus::Done,
+            None,
+        )
+        .await
+        .expect("resolve before sweep");
+
+        let swept = sweep_expired_agent_steps(&pool, 100).await.expect("sweep");
+        let swept_run_ids: Vec<Uuid> = swept.iter().map(|s| s.run_id).collect();
+
+        assert!(
+            swept_run_ids.contains(&overdue_run),
+            "overdue pending row must be swept"
+        );
+        assert_eq!(
+            swept_run_ids
+                .iter()
+                .filter(|id| **id == overdue_run)
+                .count(),
+            1,
+            "overdue row must be swept exactly once"
+        );
+
+        let overdue_after = get_agent_step(&pool, community, &overdue_id)
+            .await
+            .expect("get overdue after sweep");
+        assert_eq!(overdue_after.status, AgentStepStatus::Expired);
+
+        let fresh_after = get_agent_step(&pool, community, &fresh_id)
+            .await
+            .expect("get fresh after sweep");
+        assert_eq!(
+            fresh_after.status,
+            AgentStepStatus::Pending,
+            "not-yet-expired row must be left alone"
+        );
+
+        let resolved_after = get_agent_step(&pool, community, &resolved_id)
+            .await
+            .expect("get resolved after sweep");
+        assert_eq!(
+            resolved_after.status,
+            AgentStepStatus::Done,
+            "already-resolved row must be left alone even if its expiry passed"
+        );
+    }
+
+    /// `list_stuck_done_agent_steps` finds rows whose CAS to `done` committed
+    /// but whose run never resumed (still `waiting_agent`), and only once
+    /// they clear the `min_age_secs` grace period — this is the crash-window
+    /// recovery path the design doc calls out (CAS succeeds, then the relay
+    /// dies before calling resume).
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn list_stuck_done_agent_steps_finds_only_aged_stuck_rows() {
+        let pool = setup_pool().await;
+        let community = make_community(&pool).await;
+        let (workflow_id, _) = make_workflow_in(&pool, community).await;
+
+        // Stuck: done, run still waiting_agent, old enough.
+        let stuck_id = format!("evt-{}", Uuid::new_v4().simple());
+        let stuck_run = make_pending_agent_step(
+            &pool,
+            community,
+            workflow_id,
+            &stuck_id,
+            &[0x44; 32],
+            Utc::now() + chrono::Duration::minutes(30),
+        )
+        .await;
+        update_agent_step_by_prompt_event_id(
+            &pool,
+            community,
+            &stuck_id,
+            AgentStepStatus::Done,
+            None,
+        )
+        .await
+        .expect("mark done");
+        update_workflow_run(
+            &pool,
+            community,
+            stuck_run,
+            RunStatus::WaitingAgent,
+            0,
+            &serde_json::json!([]),
+            None,
+        )
+        .await
+        .expect("mark run waiting_agent");
+
+        // Not stuck: run already resolved to completed after its step went done.
+        let resolved_id = format!("evt-{}", Uuid::new_v4().simple());
+        let resolved_run = make_pending_agent_step(
+            &pool,
+            community,
+            workflow_id,
+            &resolved_id,
+            &[0x55; 32],
+            Utc::now() + chrono::Duration::minutes(30),
+        )
+        .await;
+        update_agent_step_by_prompt_event_id(
+            &pool,
+            community,
+            &resolved_id,
+            AgentStepStatus::Done,
+            None,
+        )
+        .await
+        .expect("mark done");
+        update_workflow_run(
+            &pool,
+            community,
+            resolved_run,
+            RunStatus::Completed,
+            1,
+            &serde_json::json!([]),
+            None,
+        )
+        .await
+        .expect("mark run completed");
+
+        // With a large min_age, nothing qualifies as "aged" yet (rows were
+        // just created), proving the age gate actually filters.
+        let none_yet = list_stuck_done_agent_steps(&pool, 3600, 100)
+            .await
+            .expect("list with large min_age");
+        assert!(
+            none_yet.iter().all(|s| s.run_id != stuck_run),
+            "freshly-created stuck row must not qualify before its grace period elapses"
+        );
+
+        // With min_age_secs = 0, the stuck row qualifies immediately; the
+        // resolved-run row never does, regardless of age.
+        let stuck = list_stuck_done_agent_steps(&pool, 0, 100)
+            .await
+            .expect("list with zero min_age");
+        let stuck_run_ids: Vec<Uuid> = stuck.iter().map(|s| s.run_id).collect();
+        assert!(
+            stuck_run_ids.contains(&stuck_run),
+            "done step with still-waiting run must be reported stuck"
+        );
+        assert!(
+            !stuck_run_ids.contains(&resolved_run),
+            "done step whose run already completed must not be reported stuck"
+        );
+    }
+
+    /// A step that resumed successfully and advanced the run past itself to
+    /// a later suspended step must never be reported stuck again, even
+    /// though it stays `done` with an aging `resolved_at` forever. Before
+    /// the `r.current_step = s.step_index` guard, this row would match on
+    /// `status = 'waiting_agent'` alone on every subsequent sweep tick,
+    /// rewinding the run back to just past it and re-dispatching the later
+    /// step from scratch each time — the exact bug behind a stuck-forever
+    /// re-dispatch loop.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn list_stuck_done_agent_steps_ignores_earlier_step_run_has_moved_past() {
+        let pool = setup_pool().await;
+        let community = make_community(&pool).await;
+        let (workflow_id, _) = make_workflow_in(&pool, community).await;
+
+        let first_id = format!("evt-{}", Uuid::new_v4().simple());
+        let run_id = make_pending_agent_step(
+            &pool,
+            community,
+            workflow_id,
+            &first_id,
+            &[0x77; 32],
+            Utc::now() + chrono::Duration::minutes(30),
+        )
+        .await;
+        update_agent_step_by_prompt_event_id(
+            &pool,
+            community,
+            &first_id,
+            AgentStepStatus::Done,
+            None,
+        )
+        .await
+        .expect("mark first step done");
+
+        // Run resumed and suspended again on a later step (index 1) — still
+        // waiting_agent, but current_step has moved on from the first
+        // step's index 0.
+        update_workflow_run(
+            &pool,
+            community,
+            run_id,
+            RunStatus::WaitingAgent,
+            1,
+            &serde_json::json!([]),
+            None,
+        )
+        .await
+        .expect("mark run waiting on later step");
+
+        let stuck = list_stuck_done_agent_steps(&pool, 0, 100)
+            .await
+            .expect("list with zero min_age");
+        assert!(
+            stuck.iter().all(|s| s.run_id != run_id),
+            "done step the run has already advanced past must not be reported stuck"
+        );
+    }
+
+    /// Regression test for the sweeper double-execute race: `created_at` is
+    /// assignment time, not CAS-to-done time, so a step created long ago but
+    /// only just resolved (the normal case — default timeout is 24h) must
+    /// NOT be treated as stuck. Only `resolved_at` age should gate the
+    /// sweeper; backdating `created_at` alone must not trigger it.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn list_stuck_done_agent_steps_ignores_old_created_at_with_fresh_resolved_at() {
+        let pool = setup_pool().await;
+        let community = make_community(&pool).await;
+        let (workflow_id, _) = make_workflow_in(&pool, community).await;
+
+        let id = format!("evt-{}", Uuid::new_v4().simple());
+        let run_id = make_pending_agent_step(
+            &pool,
+            community,
+            workflow_id,
+            &id,
+            &[0x66; 32],
+            Utc::now() + chrono::Duration::minutes(30),
+        )
+        .await;
+
+        // Backdate created_at to simulate a long-pending assignment (e.g. the
+        // agent took 20 hours to reply), while resolved_at is set fresh by
+        // the CAS below — exactly the divergence the old created_at-based
+        // grace window got wrong.
+        sqlx::query(
+            "UPDATE workflow_agent_steps SET created_at = NOW() - INTERVAL '20 hours' WHERE community_id = $1 AND prompt_event_id = $2",
+        )
+        .bind(community.as_uuid())
+        .bind(&id)
+        .execute(&pool)
+        .await
+        .expect("backdate created_at");
+
+        update_agent_step_by_prompt_event_id(&pool, community, &id, AgentStepStatus::Done, None)
+            .await
+            .expect("mark done");
+        update_workflow_run(
+            &pool,
+            community,
+            run_id,
+            RunStatus::WaitingAgent,
+            0,
+            &serde_json::json!([]),
+            None,
+        )
+        .await
+        .expect("mark run waiting_agent");
+
+        // A 30-second grace period (the sweeper's real default) must NOT
+        // flag this row as stuck — it was only just resolved, regardless of
+        // how old created_at is.
+        let not_stuck = list_stuck_done_agent_steps(&pool, 30, 100)
+            .await
+            .expect("list with realistic min_age");
+        assert!(
+            not_stuck.iter().all(|s| s.run_id != run_id),
+            "a step resolved moments ago must not be reported stuck just because created_at is old"
         );
     }
 }

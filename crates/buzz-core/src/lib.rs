@@ -38,6 +38,8 @@ pub mod private_managed_agent;
 pub mod relay;
 /// Tenant identity — the server-resolved community key carried on scoped paths.
 pub mod tenant;
+/// NIP-10 thread relationship parsing (root/parent event ids, mentions).
+pub mod thread;
 /// Schnorr signature and event ID verification.
 pub mod verification;
 
@@ -46,6 +48,7 @@ pub use event::StoredEvent;
 pub use nostr::{Event, EventId, Filter, Keys, Kind, PublicKey};
 pub use presence::PresenceStatus;
 pub use tenant::{normalize_host, CommunityId, TenantContext};
+pub use thread::{parse_thread_tags, ThreadTags};
 pub use verification::verify_event;
 
 #[cfg(any(test, feature = "test-utils"))]

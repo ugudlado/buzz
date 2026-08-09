@@ -113,7 +113,8 @@ function isActiveWorkflowRunStatus(status: WorkflowRunStatus) {
   return (
     status === "pending" ||
     status === "running" ||
-    status === "waiting_approval"
+    status === "waiting_approval" ||
+    status === "waiting_agent"
   );
 }
 
@@ -147,9 +148,17 @@ export function useWorkflowRunsQuery(workflowId: string | null) {
     refetchInterval: (query) => {
       if (!appFocused) return false;
       const runs = query.state.data as WorkflowRun[] | undefined;
-      return runs?.some((run) => isActiveWorkflowRunStatus(run.status))
+      if (!runs?.some((run) => isActiveWorkflowRunStatus(run.status))) {
+        return false;
+      }
+      // Suspended runs (waiting on an agent reply or approver) change at
+      // human/agent cadence — poll gently; only actively-executing runs
+      // warrant the tight loop.
+      return runs.some(
+        (run) => run.status === "pending" || run.status === "running",
+      )
         ? 1_000
-        : false;
+        : 10_000;
     },
     ...workflowRunsFocusRefetchPolicy,
   });

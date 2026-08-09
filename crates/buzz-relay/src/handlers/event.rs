@@ -557,6 +557,33 @@ async fn dispatch_persistent_event_inner(
         });
     }
 
+    // Sibling check to the workflow-trigger block above: a kind:9 chat
+    // message may itself be an agent's reply to a suspended `AssignToAgent`
+    // step (the step's `@mention` prompt was sent as an ordinary kind:9
+    // message, so completion replies arrive the same way — this is a
+    // distinct concern from "does this event trigger a NEW workflow run").
+    // A non-match just falls through; every event still gets normal handling
+    // either way.
+    // Cheap synchronous pre-check before spawning: only a reply can resume an
+    // agent step (`buzz:completion-of` tag, or any `e` tag for the NIP-10
+    // parent fallback). Ordinary top-level chat messages — the vast majority
+    // of kind:9 traffic — skip the spawn + event clone + DB lookup entirely.
+    if kind_u32 == buzz_core::kind::KIND_STREAM_MESSAGE
+        && stored_event.event.tags.iter().any(|t| {
+            matches!(
+                t.as_slice().first().map(|s| s.as_str()),
+                Some("e") | Some(buzz_core::thread::TAG_COMPLETION_OF)
+            )
+        })
+    {
+        let state = Arc::clone(state);
+        let tenant = tenant.clone();
+        let event = stored_event.event.clone();
+        tokio::spawn(async move {
+            crate::handlers::command_executor::try_resume_agent_step(&tenant, &state, &event).await;
+        });
+    }
+
     matches.len()
 }
 

@@ -144,6 +144,31 @@ pub enum ActionDef {
         /// Duration string (e.g. `"5m"`, `"1h"`).
         duration: String,
     },
+    /// Suspend execution and hand off to a channel-member agent.
+    ///
+    /// Posts `"@{agent} {instruction}"` to the workflow's channel — the same
+    /// `@Name` mention mechanism a human author would use — and pauses the run
+    /// until the mentioned agent replies. Resume is handled by a later relay
+    /// hook (not implemented by this action definition alone).
+    AssignToAgent {
+        /// Display name of the channel-member agent to mention (e.g. `"Lep"`).
+        agent: String,
+        /// Optional hex pubkey of the target agent. When set, this is the
+        /// authoritative identity: dispatch verifies it directly against
+        /// channel membership instead of resolving `agent` by name. This
+        /// disambiguates same-named agents and survives an agent being
+        /// renamed after the workflow was authored. When absent (the
+        /// default), resolution falls back to case-insensitive exact-name
+        /// matching against channel members, as before.
+        #[serde(default)]
+        agent_pubkey: Option<String>,
+        /// Instruction text appended after the `@mention`.
+        instruction: String,
+        /// Duration string (e.g. `"24h"`) after which the assignment expires.
+        /// Defaults to 24h.
+        #[serde(default)]
+        timeout: Option<String>,
+    },
 }
 
 impl WorkflowDef {
@@ -202,6 +227,39 @@ impl WorkflowDef {
                     "duplicate step id: {}",
                     step.id
                 )));
+            }
+
+            if let ActionDef::AssignToAgent {
+                agent,
+                agent_pubkey,
+                instruction,
+                ..
+            } = &step.action
+            {
+                if agent.trim().is_empty() {
+                    return Err(WorkflowError::InvalidDefinition(format!(
+                        "step '{}': assign_to_agent requires a non-empty 'agent'",
+                        step.id
+                    )));
+                }
+                if instruction.trim().is_empty() {
+                    return Err(WorkflowError::InvalidDefinition(format!(
+                        "step '{}': assign_to_agent requires a non-empty 'instruction'",
+                        step.id
+                    )));
+                }
+                if let Some(pk) = agent_pubkey {
+                    let trimmed = pk.trim();
+                    if trimmed.is_empty()
+                        || trimmed.len() != 64
+                        || !trimmed.chars().all(|c| c.is_ascii_hexdigit())
+                    {
+                        return Err(WorkflowError::InvalidDefinition(format!(
+                            "step '{}': assign_to_agent 'agent_pubkey' must be a 64-char hex pubkey",
+                            step.id
+                        )));
+                    }
+                }
             }
         }
 
@@ -359,9 +417,10 @@ mod tests {
             "  - id: hook\n    action: call_webhook\n    url: https://hooks.example.com/notify\n    method: POST\n",
             "  - id: approve\n    action: request_approval\n    from: '@manager'\n    message: Approve?\n    timeout: 4h\n",
             "  - id: wait\n    action: delay\n    duration: 5m\n",
+            "  - id: assign\n    action: assign_to_agent\n    agent: Lep\n    instruction: Investigate\n",
         );
         let (def, _) = parse_yaml(yaml).expect("parse failed");
-        assert_eq!(def.steps.len(), 7);
+        assert_eq!(def.steps.len(), 8);
 
         assert!(matches!(
             &def.steps[0].action,
@@ -385,6 +444,10 @@ mod tests {
             ActionDef::RequestApproval { .. }
         ));
         assert!(matches!(&def.steps[6].action, ActionDef::Delay { .. }));
+        assert!(matches!(
+            &def.steps[7].action,
+            ActionDef::AssignToAgent { .. }
+        ));
     }
 
     #[test]
@@ -887,5 +950,130 @@ mod tests {
             trigger,
             TriggerDef::DiffPosted { filter: Some(_) }
         ));
+    }
+
+    #[test]
+    fn parse_assign_to_agent_action() {
+        let yaml = concat!(
+            "name: Assign Agent\ntrigger:\n  on: webhook\n",
+            "steps:\n",
+            "  - id: assign\n    action: assign_to_agent\n",
+            "    agent: Lep\n    instruction: Please investigate the failing build\n",
+            "    timeout: 4h\n",
+        );
+        let (def, json) = parse_yaml(yaml).expect("parse failed");
+        match &def.steps[0].action {
+            ActionDef::AssignToAgent {
+                agent,
+                agent_pubkey,
+                instruction,
+                timeout,
+            } => {
+                assert_eq!(agent, "Lep");
+                assert_eq!(instruction, "Please investigate the failing build");
+                assert_eq!(timeout.as_deref(), Some("4h"));
+                assert!(agent_pubkey.is_none());
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
+
+        let reparsed: WorkflowDef = serde_json::from_str(&json).expect("json round-trip");
+        assert!(matches!(
+            &reparsed.steps[0].action,
+            ActionDef::AssignToAgent { .. }
+        ));
+    }
+
+    #[test]
+    fn parse_assign_to_agent_without_timeout_defaults_to_none() {
+        let yaml = concat!(
+            "name: Assign Agent\ntrigger:\n  on: webhook\n",
+            "steps:\n  - id: assign\n    action: assign_to_agent\n",
+            "    agent: Lep\n    instruction: Investigate\n",
+        );
+        let (def, _) = parse_yaml(yaml).expect("parse failed");
+        match &def.steps[0].action {
+            ActionDef::AssignToAgent { timeout, .. } => assert!(timeout.is_none()),
+            other => panic!("unexpected action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_assign_to_agent_with_pubkey_round_trips() {
+        let pubkey = "a".repeat(64);
+        let yaml = format!(
+            "name: Assign Agent\ntrigger:\n  on: webhook\nsteps:\n  - id: assign\n    action: assign_to_agent\n    agent: Lep\n    agent_pubkey: \"{pubkey}\"\n    instruction: Investigate\n",
+        );
+        let (def, json) = parse_yaml(&yaml).expect("parse failed");
+        match &def.steps[0].action {
+            ActionDef::AssignToAgent { agent_pubkey, .. } => {
+                assert_eq!(agent_pubkey.as_deref(), Some(pubkey.as_str()));
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
+        let reparsed: WorkflowDef = serde_json::from_str(&json).expect("json round-trip");
+        match &reparsed.steps[0].action {
+            ActionDef::AssignToAgent { agent_pubkey, .. } => {
+                assert_eq!(agent_pubkey.as_deref(), Some(pubkey.as_str()));
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_assign_to_agent_malformed_pubkey() {
+        let yaml = concat!(
+            "name: Assign Agent\ntrigger:\n  on: webhook\n",
+            "steps:\n  - id: assign\n    action: assign_to_agent\n",
+            "    agent: Lep\n    agent_pubkey: not-hex\n    instruction: Investigate\n",
+        );
+        let err = parse_yaml(yaml).expect_err("expected validation error");
+        assert!(err.to_string().contains("agent_pubkey"));
+    }
+
+    #[test]
+    fn validate_rejects_assign_to_agent_empty_agent() {
+        let yaml = concat!(
+            "name: Assign Agent\ntrigger:\n  on: webhook\n",
+            "steps:\n  - id: assign\n    action: assign_to_agent\n",
+            "    agent: ''\n    instruction: Investigate\n",
+        );
+        let err = parse_yaml(yaml).unwrap_err();
+        match &err {
+            WorkflowError::InvalidDefinition(msg) => {
+                assert!(msg.contains("agent"), "expected 'agent' in: {msg}");
+            }
+            other => panic!("expected InvalidDefinition, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_assign_to_agent_whitespace_only_agent() {
+        let yaml = concat!(
+            "name: Assign Agent\ntrigger:\n  on: webhook\n",
+            "steps:\n  - id: assign\n    action: assign_to_agent\n",
+            "    agent: '   '\n    instruction: Investigate\n",
+        );
+        let err = parse_yaml(yaml).unwrap_err();
+        assert!(matches!(err, WorkflowError::InvalidDefinition(_)));
+    }
+
+    #[test]
+    fn validate_rejects_assign_to_agent_empty_instruction() {
+        let yaml = concat!(
+            "name: Assign Agent\ntrigger:\n  on: webhook\n",
+            "steps:\n  - id: assign\n    action: assign_to_agent\n",
+            "    agent: Lep\n    instruction: '   '\n",
+        );
+        let err = parse_yaml(yaml).unwrap_err();
+        match &err {
+            WorkflowError::InvalidDefinition(msg) => {
+                assert!(
+                    msg.contains("instruction"),
+                    "expected 'instruction' in: {msg}"
+                );
+            }
+            other => panic!("expected InvalidDefinition, got: {other}"),
+        }
     }
 }

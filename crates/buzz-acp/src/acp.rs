@@ -214,6 +214,10 @@ pub struct AcpClient {
     standard_usage: StandardUsageTracker,
     /// Known adapter identity for prompt-response usage mapping.
     standard_adapter: Option<StandardAdapterKind>,
+    /// Accumulated `agent_message_chunk` text for the current turn. Cleared
+    /// at prompt start; consumed via [`Self::take_turn_text`] to post the
+    /// agent's own words as its workflow completion reply.
+    turn_text: String,
 }
 
 /// Recursively merge `overlay` into `base`, with `overlay` winning on scalar/shape
@@ -563,6 +567,7 @@ impl AcpClient {
             goose_usage: UsageTracker::default(),
             standard_usage: StandardUsageTracker::default(),
             standard_adapter,
+            turn_text: String::new(),
         })
     }
 
@@ -790,6 +795,7 @@ impl AcpClient {
         // misattributed to this turn.
         self.goose_usage.begin_turn(session_id);
         self.standard_usage.begin_turn(session_id);
+        self.turn_text.clear();
 
         self.last_prompt_id = Some(self.next_id);
         let id = self.next_id;
@@ -899,6 +905,13 @@ impl AcpClient {
     pub(crate) fn notify_session_spawned(&mut self, session_id: &str) {
         self.goose_usage.seed_zero_baseline(session_id);
         self.standard_usage.seed_zero_baseline(session_id);
+    }
+
+    /// Consume and return the agent's accumulated message text for the most
+    /// recent turn (empty if the agent produced no message output). Used to
+    /// post the agent's own words as its workflow completion reply.
+    pub fn take_turn_text(&mut self) -> String {
+        std::mem::take(&mut self.turn_text)
     }
 
     /// Install a per-turn steer request channel for goose-native
@@ -1756,10 +1769,19 @@ impl AcpClient {
             "agent_message_chunk" => {
                 if let Some(text) = update["content"]["text"].as_str() {
                     tracing::info!(target: "acp::stream", "{text}");
+                    // Cap accumulation so a runaway turn can't grow unbounded;
+                    // the workflow completion reply only needs the closing text.
+                    if self.turn_text.len() < 16 * 1024 {
+                        self.turn_text.push_str(text);
+                    }
                 }
                 false
             }
             "tool_call" => {
+                // Keep only message text emitted AFTER the last tool call —
+                // the agent's closing statement — so the workflow completion
+                // reply is the outcome summary, not the whole turn transcript.
+                self.turn_text.clear();
                 let title = update
                     .get("title")
                     .and_then(|v| v.as_str())

@@ -606,6 +606,13 @@ pub struct PromptContext {
     /// the desktop keys per (agent, relay) pair, e.g. `session_config_captured`,
     /// mirroring the `managed_agent_runtime_lifecycle` frames.
     pub relay_url: String,
+    /// The relay's own signing pubkey, resolved once via NIP-11 at harness
+    /// startup and cached here. Used by the inbound author gate to recognize
+    /// relay-signed `buzz:workflow` dispatch messages (see
+    /// `is_relay_workflow_message` / `author_allowed` in `lib.rs`). `None` if
+    /// the startup NIP-11 fetch failed — the workflow bypass simply never
+    /// triggers in that case, existing `respond_to` behavior is unaffected.
+    pub relay_pubkey: Option<nostr::PublicKey>,
 }
 
 impl AgentPool {
@@ -1206,11 +1213,7 @@ async fn apply_model_switch(
     Ok(())
 }
 
-/// Set the session permission mode via `session/set_config_option`.
-///
-/// Non-fatal for most errors: logs and proceeds. The agent falls back
-/// to its default permission mode (`"default"`), which still works via
-/// Check if the agent's `session/new` response advertises a given mode ID
+/// Check whether the agent's `session/new` response advertises a given mode ID
 /// in `result.modes.availableModes[].id`. Returns `false` if the modes
 /// field is absent or the mode isn't listed.
 fn agent_supports_mode(session_new_result: &serde_json::Value, mode_wire: &str) -> bool {
@@ -1226,7 +1229,11 @@ fn agent_supports_mode(session_new_result: &serde_json::Value, mode_wire: &str) 
         .unwrap_or(false)
 }
 
-/// per-tool auto-approval in `handle_permission_request`.
+/// Set the session permission mode via `session/set_config_option`.
+///
+/// Non-fatal for most errors: logs and proceeds. The agent falls back to its
+/// default mode, which still works via per-tool auto-approval in
+/// `handle_permission_request`.
 ///
 /// **Fatal exception:** if the agent process exits (e.g., goose crashes on
 /// unrecognized methods), returns `Err(AgentExited)` so the caller can respawn.
@@ -2300,6 +2307,11 @@ pub async fn run_prompt_task(
                             Some(buzz_core::agent_turn_metric::StopReason::EndTurn),
                         )
                         .await;
+                        spawn_workflow_completion_if_applicable(
+                            &ctx,
+                            batch.as_ref(),
+                            agent.acp.take_turn_text(),
+                        );
                         send_prompt_result(
                             &result_tx,
                             &turn_id,
@@ -2374,6 +2386,11 @@ pub async fn run_prompt_task(
             )
             .await;
 
+            spawn_workflow_completion_if_applicable(
+                &ctx,
+                batch.as_ref(),
+                agent.acp.take_turn_text(),
+            );
             send_prompt_result(
                 &result_tx,
                 &turn_id,
@@ -3564,6 +3581,45 @@ fn parse_nostr_dm_response(json: serde_json::Value, limit: u32) -> Option<Conver
     })
 }
 
+/// On a cleanly-successful turn, spawn buzz-acp's own signed completion
+/// reply if the triggering batch's last event was a relay-signed
+/// `buzz:workflow` dispatch (an `assign_to_agent` prompt) — see
+/// `post_workflow_completion`'s doc comment for why buzz-acp posts this
+/// itself rather than relying on the agent's own `buzz` CLI tool call.
+///
+/// Must be called BEFORE `batch` is moved into `send_prompt_result`/
+/// `requeue_batch_if_queue` on the success path (those calls pass `None`
+/// for `batch` on success — the original is otherwise unrecoverable once
+/// this function returns).
+fn spawn_workflow_completion_if_applicable(
+    ctx: &PromptContext,
+    batch: Option<&FlushBatch>,
+    turn_text: String,
+) {
+    let Some(batch) = batch else { return };
+    let Some(be) = batch.events.last() else {
+        return;
+    };
+    if !crate::is_relay_workflow_message(&be.event, ctx.relay_pubkey.as_ref()) {
+        return;
+    }
+    let rest = ctx.rest_client.clone();
+    let channel_id = batch.channel_id;
+    let prompt_event_id = be.event.id;
+    // The prompt is itself a reply inside the run's flat thread — the relay
+    // rejects any reply whose declared root doesn't match thread ancestry,
+    // so reuse the prompt's own thread root. A prompt with no thread tags IS
+    // the thread root (first step of a run).
+    let root_event_id = buzz_core::thread::parse_thread_tags(&be.event)
+        .root_event_id
+        .and_then(|hex| hex.parse().ok())
+        .unwrap_or(prompt_event_id);
+    tokio::spawn(async move {
+        post_workflow_completion(&rest, channel_id, root_event_id, prompt_event_id, turn_text)
+            .await;
+    });
+}
+
 /// Return the batch for requeue only in Queue mode; drop it in Drop mode.
 #[inline]
 fn requeue_batch_if_queue(ctx: &PromptContext, batch: Option<FlushBatch>) -> Option<FlushBatch> {
@@ -4173,6 +4229,101 @@ pub(crate) async fn post_failure_notice(
         Ok(Ok(_)) => {}
         Ok(Err(e)) => tracing::warn!(channel = %channel_id, "failure notice failed: {e}"),
         Err(_) => tracing::warn!(channel = %channel_id, "failure notice timed out"),
+    }
+}
+
+/// Best-effort: post a synthesized `completion` block reply to a workflow's
+/// `assign_to_agent` prompt, once this agent's ACP turn for that prompt ends
+/// cleanly.
+///
+/// This is buzz-acp's OWN signed reply — not the agent's own `buzz` CLI tool
+/// call (which cursor-agent's shell tool, empirically, does not sign with
+/// this agent's own key; see the `BUZZ_PRIVATE_KEY` investigation in
+/// `crates/buzz-acp/src/config.rs`/`acp.rs`). Posting it directly from
+/// buzz-acp guarantees the correct signing identity, satisfying the relay's
+/// `try_resume_agent_step` author check (`crates/buzz-relay/src/handlers/
+/// command_executor.rs`) unconditionally.
+///
+/// Stopgap content only: `status: success, outputs: {}` — this does NOT
+/// capture whatever the agent actually produced (its real reply text is
+/// generated inside cursor-agent's own tool call, not visible to buzz-acp
+/// today; see the design note in the workflow-completion investigation).
+/// Downstream `{{steps.<id>.output.X}}` references will resolve to nothing
+/// until a richer capture mechanism is built. Good enough to unblock a
+/// chain's *progression* even though per-step data handoff isn't captured
+/// yet.
+pub(crate) async fn post_workflow_completion(
+    rest: &crate::relay::RestClient,
+    channel_id: Uuid,
+    root_event_id: nostr::EventId,
+    prompt_event_id: nostr::EventId,
+    turn_text: String,
+) {
+    // The agent replies in its own words; the machine-readable part lives in
+    // the `buzz:completion-of` tag (turn ended = step done, relay-side). An
+    // agent that produced no message text still needs a reply to resume the
+    // run, hence the fallback.
+    let turn_text = turn_text.trim();
+    let content = if turn_text.is_empty() {
+        "Done."
+    } else {
+        turn_text
+    };
+    // Reply directly to the run's thread root so the whole run reads as one
+    // flat thread in clients (nested replies collapse behind an expander).
+    // The prompt this completes is carried in a `buzz:completion-of` tag,
+    // which the relay's resume matcher prefers over the NIP-10 parent.
+    let thread_ref = buzz_sdk::ThreadRef {
+        root_event_id,
+        parent_event_id: root_event_id,
+    };
+    let builder =
+        match buzz_sdk::build_message(channel_id, content, Some(&thread_ref), &[], false, &[]) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(
+                    prompt_event_id = %prompt_event_id,
+                    "workflow completion: build failed: {e}"
+                );
+                return;
+            }
+        };
+    let builder = match nostr::Tag::parse([
+        buzz_core::thread::TAG_COMPLETION_OF,
+        &prompt_event_id.to_hex(),
+    ]) {
+        Ok(tag) => builder.tag(tag),
+        Err(e) => {
+            tracing::warn!(
+                prompt_event_id = %prompt_event_id,
+                "workflow completion: completion-of tag failed: {e}"
+            );
+            return;
+        }
+    };
+    let event = match builder.sign_with_keys(&rest.keys) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!(
+                prompt_event_id = %prompt_event_id,
+                "workflow completion: sign failed: {e}"
+            );
+            return;
+        }
+    };
+    match tokio::time::timeout(Duration::from_secs(5), rest.submit_event(&event)).await {
+        Ok(Ok(_)) => tracing::info!(
+            prompt_event_id = %prompt_event_id,
+            "workflow completion: reply posted"
+        ),
+        Ok(Err(e)) => tracing::warn!(
+            prompt_event_id = %prompt_event_id,
+            "workflow completion: reply failed: {e}"
+        ),
+        Err(_) => tracing::warn!(
+            prompt_event_id = %prompt_event_id,
+            "workflow completion: reply timed out"
+        ),
     }
 }
 
@@ -7493,6 +7644,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             memory_enabled: false,
             harness_name: "goose".to_string(),
             relay_url: "ws://127.0.0.1:3000".to_string(),
+            relay_pubkey: None,
         }
     }
 

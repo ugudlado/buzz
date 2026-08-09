@@ -10,7 +10,7 @@ use std::sync::{Arc, Weak};
 
 use buzz_core::kind::KIND_STREAM_MESSAGE;
 use buzz_core::tenant::CommunityId;
-use buzz_workflow::action_sink::{ActionSink, ActionSinkError};
+use buzz_workflow::action_sink::{ActionSink, ActionSinkError, ThreadAnchor};
 use chrono::Utc;
 use nostr::{EventBuilder, Kind, Tag};
 use tracing::info;
@@ -169,6 +169,35 @@ impl RelayActionSink {
     }
 }
 
+/// Fetch `(display_name, pubkey_hex)` pairs for a channel's active members
+/// that have a display name set. Shared by `send_message`'s free-text mention
+/// resolution and `resolve_agent`'s exact-name lookup so both see the same
+/// membership snapshot.
+async fn named_channel_members(
+    state: &AppState,
+    community_id: CommunityId,
+    channel_id: Uuid,
+) -> Result<Vec<(String, String)>, ActionSinkError> {
+    let members = state
+        .db
+        .get_members(community_id, channel_id)
+        .await
+        .map_err(|e| ActionSinkError::Database(e.to_string()))?;
+    let member_pubkeys: Vec<Vec<u8>> = members.iter().map(|m| m.pubkey.clone()).collect();
+    let users = state
+        .db
+        .get_users_bulk(community_id, &member_pubkeys)
+        .await
+        .map_err(|e| ActionSinkError::Database(e.to_string()))?;
+    Ok(users
+        .into_iter()
+        .filter_map(|u| {
+            let name = u.display_name?;
+            Some((name, nostr::PublicKey::from_slice(&u.pubkey).ok()?.to_hex()))
+        })
+        .collect())
+}
+
 impl ActionSink for RelayActionSink {
     fn send_message(
         &self,
@@ -176,10 +205,12 @@ impl ActionSink for RelayActionSink {
         channel_id: &str,
         text: &str,
         author_pubkey: &str,
+        reply_to: Option<&ThreadAnchor>,
     ) -> Pin<Box<dyn Future<Output = Result<String, ActionSinkError>> + Send + '_>> {
         let channel_id = channel_id.to_owned();
         let text = text.to_owned();
         let author_pubkey = author_pubkey.to_owned();
+        let reply_to = reply_to.cloned();
 
         Box::pin(async move {
             // 0. Upgrade weak reference — fails only during shutdown.
@@ -257,37 +288,40 @@ impl ActionSink for RelayActionSink {
             //    - `buzz:workflow` tag prevents recursive workflow triggering
             //    - one `p` tag per `@Name` that resolves to a channel member,
             //      so mentioned agents are woken (wake is `p`-tag gated)
+            //    - when `reply_to` is set, NIP-10 `e` tags with `root`/`reply`
+            //      markers thread this message into an existing conversation
+            //      (used to chain a multi-step assign_to_agent run into one
+            //      thread rather than independent top-level messages)
             let mut tags = vec![
                 Tag::parse(["p", &author_pubkey_hex])
                     .map_err(|e| ActionSinkError::EventBuild(format!("p tag: {e}")))?,
                 Tag::parse(["h", &channel_id_canonical])
                     .map_err(|e| ActionSinkError::EventBuild(format!("h tag: {e}")))?,
-                Tag::parse(["buzz:workflow", "true"])
+                Tag::parse([buzz_core::thread::TAG_WORKFLOW, "true"])
                     .map_err(|e| ActionSinkError::EventBuild(format!("workflow tag: {e}")))?,
             ];
+            if let Some(anchor) = &reply_to {
+                // buzz-sdk emits the client convention (direct reply to root
+                // → single `reply` marker; the client derives thread
+                // membership from `reply`, so a root-only tag would render
+                // as a top-level message).
+                let root_event_id = anchor.root_event_id.parse().map_err(|e| {
+                    ActionSinkError::InvalidInput(format!("invalid root_event_id: {e}"))
+                })?;
+                let thread_ref = buzz_sdk::ThreadRef {
+                    root_event_id,
+                    parent_event_id: root_event_id,
+                };
+                buzz_sdk::thread_tags(&thread_ref, &mut tags)
+                    .map_err(|e| ActionSinkError::EventBuild(format!("thread e tags: {e}")))?;
+            }
 
             // Resolve `@Name` mentions to channel-member pubkeys and append a
             // `p` tag for each (skipping the author, already tagged above). A
             // resolution failure must not drop the message, so log and proceed
             // with the base tags.
-            let members = state
-                .db
-                .get_members(tenant.community(), channel_uuid)
-                .await
-                .map_err(|e| ActionSinkError::Database(e.to_string()))?;
-            let member_pubkeys: Vec<Vec<u8>> = members.iter().map(|m| m.pubkey.clone()).collect();
-            let users = state
-                .db
-                .get_users_bulk(tenant.community(), &member_pubkeys)
-                .await
-                .map_err(|e| ActionSinkError::Database(e.to_string()))?;
-            let named_members: Vec<(String, String)> = users
-                .into_iter()
-                .filter_map(|u| {
-                    let name = u.display_name?;
-                    Some((name, nostr::PublicKey::from_slice(&u.pubkey).ok()?.to_hex()))
-                })
-                .collect();
+            let named_members =
+                named_channel_members(&state, tenant.community(), channel_uuid).await?;
             for mentioned in resolve_mention_pubkeys(&text, &named_members) {
                 if mentioned == author_pubkey_hex {
                     continue;
@@ -321,16 +355,35 @@ impl ActionSink for RelayActionSink {
             );
 
             // 4. Persist event with thread metadata (matches REST handler path).
-            //    Workflow messages are always top-level: depth=0, no parent/root.
+            //    Workflow messages are top-level (depth=0, no parent/root) unless
+            //    `reply_to` threads them into an existing run's conversation.
+            let (root_bytes, root_created, parent_bytes, parent_created, depth) = match &reply_to {
+                Some(anchor) => {
+                    let root_id = hex::decode(&anchor.root_event_id).map_err(|e| {
+                        ActionSinkError::InvalidInput(format!("invalid root_event_id: {e}"))
+                    })?;
+                    let root_ts = chrono::DateTime::from_timestamp(anchor.root_created_at, 0)
+                        .unwrap_or(event_created_at);
+                    // Flat run thread: the parent IS the root, depth is 1.
+                    (
+                        Some(root_id.clone()),
+                        Some(root_ts),
+                        Some(root_id),
+                        Some(root_ts),
+                        1,
+                    )
+                }
+                None => (None, None, None, None, 0),
+            };
             let thread_meta = Some(buzz_db::event::ThreadMetadataParams {
                 event_id: &event_id_bytes,
                 event_created_at,
                 channel_id: channel_uuid,
-                parent_event_id: None,
-                parent_event_created_at: None,
-                root_event_id: None,
-                root_event_created_at: None,
-                depth: 0,
+                parent_event_id: parent_bytes.as_deref(),
+                parent_event_created_at: parent_created,
+                root_event_id: root_bytes.as_deref(),
+                root_event_created_at: root_created,
+                depth,
                 broadcast: false,
             });
 
@@ -360,6 +413,92 @@ impl ActionSink for RelayActionSink {
             }
 
             Ok(event_id_hex)
+        })
+    }
+
+    fn resolve_agent(
+        &self,
+        community_id: CommunityId,
+        channel_id: &str,
+        name: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, ActionSinkError>> + Send + '_>> {
+        let channel_id = channel_id.to_owned();
+        let name = name.to_owned();
+
+        Box::pin(async move {
+            let state = self
+                .state
+                .upgrade()
+                .ok_or_else(|| ActionSinkError::Database("relay is shutting down".into()))?;
+
+            let channel_uuid = Uuid::parse_str(&channel_id)
+                .map_err(|e| ActionSinkError::InvalidInput(format!("invalid UUID: {e}")))?;
+
+            let named_members = named_channel_members(&state, community_id, channel_uuid).await?;
+
+            // Case-insensitive exact match only — no substring/fuzzy matching,
+            // mirroring `resolve_mention_pubkeys`'s own matching contract. A
+            // name matching zero or more than one distinct pubkey is
+            // unresolved/ambiguous and returns `None` rather than guessing.
+            let needle = name.trim().to_lowercase();
+            if needle.is_empty() {
+                return Ok(None);
+            }
+
+            let mut matched: Option<Vec<u8>> = None;
+            for (member_name, pubkey_hex) in &named_members {
+                if member_name.to_lowercase() != needle {
+                    continue;
+                }
+                let pubkey_bytes = nostr::PublicKey::from_hex(pubkey_hex)
+                    .map(|pk| pk.to_bytes().to_vec())
+                    .map_err(|e| {
+                        ActionSinkError::InvalidInput(format!("invalid member pubkey: {e}"))
+                    })?;
+                match &matched {
+                    None => matched = Some(pubkey_bytes),
+                    Some(existing) if existing != &pubkey_bytes => return Ok(None), // ambiguous
+                    Some(_) => {}
+                }
+            }
+
+            Ok(matched)
+        })
+    }
+
+    fn verify_agent_membership(
+        &self,
+        community_id: CommunityId,
+        channel_id: &str,
+        pubkey_hex: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, ActionSinkError>> + Send + '_>> {
+        let channel_id = channel_id.to_owned();
+        let pubkey_hex = pubkey_hex.to_owned();
+
+        Box::pin(async move {
+            let state = self
+                .state
+                .upgrade()
+                .ok_or_else(|| ActionSinkError::Database("relay is shutting down".into()))?;
+
+            let channel_uuid = Uuid::parse_str(&channel_id)
+                .map_err(|e| ActionSinkError::InvalidInput(format!("invalid UUID: {e}")))?;
+
+            let target = nostr::PublicKey::from_hex(pubkey_hex.trim())
+                .map_err(|e| ActionSinkError::InvalidInput(format!("invalid pubkey: {e}")))?
+                .to_bytes()
+                .to_vec();
+
+            let members = state
+                .db
+                .get_members(community_id, channel_uuid)
+                .await
+                .map_err(|e| ActionSinkError::Database(e.to_string()))?;
+
+            Ok(members
+                .into_iter()
+                .find(|m| m.pubkey == target)
+                .map(|m| m.pubkey))
         })
     }
 }
@@ -676,6 +815,7 @@ mod integration_tests {
                 &channel.id.to_string(),
                 "heads up @Robby — please take a look",
                 &author_hex,
+                None,
             )
             .await
             .expect("send_message");

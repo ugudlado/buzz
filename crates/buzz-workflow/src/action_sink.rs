@@ -37,6 +37,26 @@ impl From<ActionSinkError> for crate::WorkflowError {
     }
 }
 
+/// Boxed future returned by [`ActionSink::resolve_agent`].
+type ResolveAgentFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, ActionSinkError>> + Send + 'a>>;
+
+/// The NIP-10 thread root a new `assign_to_agent` prompt should reply to, so
+/// a multi-step run reads as one flat conversation (every prompt/announce
+/// replies directly to the root, depth 1) instead of independent top-level
+/// (prompt, reply) pairs per step.
+///
+/// Both fields are known to the caller without a DB round-trip: the executor
+/// carries them forward in the run's own trace/step-output state (set by the
+/// run's first `assign_to_agent` prompt).
+#[derive(Debug, Clone)]
+pub struct ThreadAnchor {
+    /// Hex event id of the run's first `assign_to_agent` prompt (thread root).
+    pub root_event_id: String,
+    /// Unix seconds `created_at` of the root event.
+    pub root_created_at: i64,
+}
+
 /// Interface for workflow actions that produce side effects.
 ///
 /// Implemented by the relay to provide direct DB/event access to the executor.
@@ -57,6 +77,11 @@ pub trait ActionSink: Send + Sync {
     /// - `text`: message body (must not be empty/whitespace-only)
     /// - `author_pubkey`: hex-encoded pubkey of the workflow owner (used for
     ///   the `p` attribution tag; the relay keypair signs the event)
+    /// - `reply_to`: when `Some(anchor)`, the message is published as a
+    ///   NIP-10 threaded reply (`e` tags with `root`/`reply` markers)
+    ///   instead of a top-level message. Used to chain a multi-step
+    ///   `assign_to_agent` run into one conversation. `None` posts
+    ///   top-level, as before.
     ///
     /// Returns the event ID hex string on success.
     fn send_message(
@@ -65,5 +90,42 @@ pub trait ActionSink: Send + Sync {
         channel_id: &str,
         text: &str,
         author_pubkey: &str,
+        reply_to: Option<&ThreadAnchor>,
     ) -> Pin<Box<dyn Future<Output = Result<String, ActionSinkError>> + Send + '_>>;
+
+    /// Resolve a display name to the hex pubkey of exactly one active member
+    /// of `channel_id`.
+    ///
+    /// Used by `AssignToAgent` to validate the target agent *before* sending
+    /// the assignment message — `send_message`'s own `@Name` mention
+    /// resolution silently omits the `p` tag for unknown or ambiguous names
+    /// (see `resolve_mention_pubkeys`), which would otherwise let an
+    /// unresolvable agent name "succeed" while waking no one. Matching is
+    /// case-insensitive exact-name (no substring/fuzzy matching), mirroring
+    /// `send_message`'s own mention resolver.
+    ///
+    /// Returns `Ok(None)` when the name matches zero or more than one member
+    /// (ambiguous); callers should treat that as a step failure, not a
+    /// silent no-op.
+    fn resolve_agent<'a>(
+        &'a self,
+        community_id: CommunityId,
+        channel_id: &'a str,
+        name: &'a str,
+    ) -> ResolveAgentFuture<'a>;
+
+    /// Verify that `pubkey_hex` is an active member of `channel_id`.
+    ///
+    /// Used by `AssignToAgent` when the step definition carries an explicit
+    /// `agent_pubkey` — the authoritative identity, bypassing name-based
+    /// resolution entirely (so a duplicate/renamed display name can't cause
+    /// ambiguity or misdirection). Returns `Ok(None)` when the pubkey is not
+    /// a member of the channel; callers should treat that as a step failure,
+    /// not a silent no-op — same contract as [`ActionSink::resolve_agent`].
+    fn verify_agent_membership<'a>(
+        &'a self,
+        community_id: CommunityId,
+        channel_id: &'a str,
+        pubkey_hex: &'a str,
+    ) -> ResolveAgentFuture<'a>;
 }

@@ -198,6 +198,7 @@ export function WorkflowDialog({
             ) : null}
 
             <WorkflowFormBuilder
+              channelId={selectedChannelId || null}
               disabled={mutation.isPending}
               onChange={(yaml) => {
                 mutation.reset();

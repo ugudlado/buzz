@@ -73,7 +73,7 @@ pub(crate) enum AcpAvailabilityStatus {
 use crate::{
     author_allowed,
     config::Config,
-    event_mentions_agent, filter,
+    event_mentions_agent, filter, is_relay_workflow_message,
     relay::{HarnessRelay, RelayEventPublisher},
 };
 
@@ -383,6 +383,20 @@ pub(crate) async fn run_setup_listener(config: Config, payload: SetupPayload) ->
     let publisher = relay.event_publisher();
     let rest_client = relay.rest_client();
 
+    // Resolve the relay's own signing pubkey once via NIP-11, matching normal
+    // mode, so the setup-mode nudge gate also honors relay-signed
+    // `buzz:workflow` dispatch messages. Best-effort: failure just means the
+    // bypass never triggers here.
+    let relay_pubkey = match rest_client.fetch_relay_pubkey().await {
+        Ok(pk) => Some(pk),
+        Err(e) => {
+            tracing::warn!(
+                "setup-mode: failed to resolve relay pubkey via NIP-11 — relay-signed workflow messages will not bypass respond_to: {e}"
+            );
+            None
+        }
+    };
+
     let channel_info = crate::pool::ChannelInfoResolver::new(channel_info_map, rest_client.clone());
 
     // Deduplicate by event-id so reconnect replay cannot double-nudge.
@@ -430,11 +444,14 @@ pub(crate) async fn run_setup_listener(config: Config, payload: SetupPayload) ->
         // in DMs only owner/siblings get a nudge (fail-closed on unknown type).
         let author_hex = buzz_event.event.pubkey.to_hex();
         let is_dm = crate::is_dm_channel(buzz_event.channel_id, &channel_info).await;
+        let is_relay_workflow_msg =
+            is_relay_workflow_message(&buzz_event.event, relay_pubkey.as_ref());
         let allowed = author_allowed(
             &config.respond_to,
             &config.respond_to_allowlist,
             &author_hex,
             is_dm,
+            is_relay_workflow_msg,
             &owner_cache,
             &rest_client,
         )

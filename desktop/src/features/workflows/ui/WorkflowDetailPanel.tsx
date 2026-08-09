@@ -291,6 +291,7 @@ function RunStatusBadge({ status }: { status: string }) {
     pending: "secondary",
     cancelled: "secondary",
     waiting_approval: "warning",
+    waiting_agent: "warning",
   };
 
   return (

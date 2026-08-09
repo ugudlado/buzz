@@ -452,6 +452,43 @@ impl RestClient {
         }
         serde_json::from_str(&text).map_err(|e| RelayError::Http(e.to_string()))
     }
+
+    /// Fetch the relay's own signing pubkey via its NIP-11 relay information
+    /// document (`GET /` with `Accept: application/nostr+json`, `self` field
+    /// per NIP-43).
+    ///
+    /// Unauthenticated — no NIP-98 signing, matching `buzz-cli`'s
+    /// `BuzzClient::get_public`. Intended to be called once at harness
+    /// startup and cached: relay-signed workflow messages (the
+    /// `buzz:workflow` author-gate bypass in [`crate::author_allowed`]) need
+    /// to compare against this pubkey on every inbound event, and a NIP-11
+    /// round-trip per message would be wasteful.
+    pub async fn fetch_relay_pubkey(&self) -> Result<nostr::PublicKey, RelayError> {
+        let resp = self
+            .http
+            .get(&self.base_url)
+            .header("Accept", "application/nostr+json")
+            .send()
+            .await
+            .map_err(|e| RelayError::Http(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(RelayError::Http(format!(
+                "GET {} returned HTTP {}",
+                self.base_url,
+                resp.status()
+            )));
+        }
+        let info: Value = resp
+            .json()
+            .await
+            .map_err(|e| RelayError::Http(e.to_string()))?;
+        let self_hex = info
+            .get("self")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| RelayError::Http("relay info document missing 'self' field".into()))?;
+        nostr::PublicKey::from_hex(self_hex)
+            .map_err(|e| RelayError::Http(format!("relay info 'self' is not a valid pubkey: {e}")))
+    }
 }
 
 /// Events the harness cares about.
