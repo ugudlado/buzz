@@ -69,6 +69,41 @@ export function hasBlockMedia(childArray: React.ReactNode[]): boolean {
   return imageChildren.length >= 1;
 }
 
+/**
+ * Language + raw text of the fenced ```code child inside a markdown `pre`
+ * node. `getLanguage` is injected so this file stays out of the
+ * highlighter's import graph.
+ */
+export function scanPreFence(
+  children: React.ReactNode,
+  getLanguage: (className: string) => string,
+): { language: string; code: string } {
+  let language = "";
+  let code = "";
+  React.Children.forEach(children, (child) => {
+    if (
+      React.isValidElement<Record<string, unknown>>(child) &&
+      typeof child.props?.className === "string"
+    ) {
+      language = getLanguage(child.props.className);
+      code = String(child.props.children ?? "");
+    }
+  });
+  return { language, code };
+}
+
+/**
+ * ```completion fences in agent replies are machine protocol — the relay
+ * parses status/outputs from them to resume workflow steps. Successful ones
+ * are hidden from readers; failed ones stay visible since the reason matters.
+ */
+export function isHiddenCompletionFence(
+  language: string,
+  code: string,
+): boolean {
+  return language === "completion" && !/^\s*status:\s*failed/m.test(code);
+}
+
 export function shallowArrayEqual(a?: string[], b?: string[]): boolean {
   if (a === b) return true;
   if (!a || !b) return false;
