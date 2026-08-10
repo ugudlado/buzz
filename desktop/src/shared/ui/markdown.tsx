@@ -44,7 +44,9 @@ import {
 import {
   classifyChildren,
   hasBlockMedia,
+  isHiddenCompletionFence,
   isImageOnlyParagraph,
+  scanPreFence,
   shallowArrayEqual,
   shallowRecordEqual,
 } from "./markdownUtils";
@@ -1567,16 +1569,9 @@ function createMarkdownComponents(
       return <p>{children}</p>;
     },
     pre: ({ children }) => {
+      const { language, code } = scanPreFence(children, extractLanguage);
+      if (isHiddenCompletionFence(language, code)) return null;
       if (!interactive) return <span>{children}</span>;
-      let language = "";
-      React.Children.forEach(children, (child) => {
-        if (
-          React.isValidElement<Record<string, unknown>>(child) &&
-          typeof child.props?.className === "string"
-        ) {
-          language = extractLanguage(child.props.className);
-        }
-      });
       return (
         <MarkdownCodeBlock language={language}>{children}</MarkdownCodeBlock>
       );
