@@ -10,6 +10,9 @@ __pycache__/
 # lefthook-generated hook scripts (machine-specific)
 .hooks/
 
+# orchestrator vendored config pull (machine-local)
+.orchestrator/
+
 # Environment files (may contain secrets)
 .env
 .env.local
