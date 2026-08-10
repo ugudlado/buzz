@@ -6,13 +6,12 @@ import {
   setBacklogConnection,
 } from "@/features/projects/backlogIssues";
 import type { Repository } from "@/features/projects/hooks";
+import { PROJECT_FORM_FIELD_CLASS } from "@/features/projects/ui/projectPanelStyles";
 import { useSetRepositoryIssueTrackerMutation } from "@/features/projects/useSetRepositoryIssueTracker";
 import { Button } from "@/shared/ui/button";
-import { Dialog, DialogContent } from "@/shared/ui/dialog";
+import { ChooserDialogContent } from "@/shared/ui/chooser-dialog-content";
+import { Dialog } from "@/shared/ui/dialog";
 import { Input } from "@/shared/ui/input";
-
-const FIELD_CLASS =
-  "h-10 w-full rounded-lg border border-input bg-background px-3 text-sm font-normal outline-hidden focus:ring-1 focus:ring-ring";
 
 /**
  * Choose where a repository's issues live: Buzz-native NIP-34 events, or a
@@ -29,30 +28,24 @@ export function RepositoryIssueTrackerDialog({
   repository: Repository;
 }) {
   const mutation = useSetRepositoryIssueTrackerMutation();
-  const [kind, setKind] = React.useState<"buzz" | "backlog">(
-    repository.issueTracker.kind,
-  );
-  const [backlogProject, setBacklogProject] = React.useState(
+  const [kind, setKind] = React.useState<"buzz" | "backlog">("buzz");
+  const [backlogProject, setBacklogProject] = React.useState("");
+  const [baseUrl, setBaseUrl] = React.useState("");
+  const [token, setToken] = React.useState("");
+
+  const trackerKind = repository.issueTracker.kind;
+  const trackerProject =
     repository.issueTracker.kind === "backlog"
       ? repository.issueTracker.project
-      : "",
-  );
-  const connection = getBacklogConnection();
-  const [baseUrl, setBaseUrl] = React.useState(connection?.baseUrl ?? "");
-  const [token, setToken] = React.useState(connection?.token ?? "");
-
+      : "";
   React.useEffect(() => {
     if (!open) return;
-    setKind(repository.issueTracker.kind);
-    setBacklogProject(
-      repository.issueTracker.kind === "backlog"
-        ? repository.issueTracker.project
-        : "",
-    );
+    setKind(trackerKind);
+    setBacklogProject(trackerProject);
     const stored = getBacklogConnection();
     setBaseUrl(stored?.baseUrl ?? "");
     setToken(stored?.token ?? "");
-  }, [open, repository]);
+  }, [open, trackerKind, trackerProject]);
 
   async function handleSave(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -62,16 +55,14 @@ export function RepositoryIssueTrackerDialog({
           throw new Error("Backlog server URL and token are required.");
         }
         setBacklogConnection({ baseUrl: baseUrl.trim(), token: token.trim() });
-        await mutation.mutateAsync({
-          issueTracker: { kind: "backlog", project: backlogProject },
-          repository,
-        });
-      } else {
-        await mutation.mutateAsync({
-          issueTracker: { kind: "buzz" },
-          repository,
-        });
       }
+      await mutation.mutateAsync({
+        issueTracker:
+          kind === "backlog"
+            ? { kind: "backlog", project: backlogProject }
+            : { kind: "buzz" },
+        repository,
+      });
       toast.success(
         kind === "backlog"
           ? "Issues now tracked in Backlog."
@@ -89,18 +80,40 @@ export function RepositoryIssueTrackerDialog({
 
   return (
     <Dialog onOpenChange={onOpenChange} open={open}>
-      <DialogContent className="max-w-md">
-        <form className="space-y-4" onSubmit={handleSave}>
-          <div>
-            <h2 className="text-lg font-semibold">Issue tracker</h2>
-            <p className="text-sm text-muted-foreground">
-              Where issues for {repository.name} are tracked.
-            </p>
+      <ChooserDialogContent
+        className="max-w-md"
+        footer={
+          <div className="flex w-full justify-end gap-2">
+            <Button
+              disabled={mutation.isPending}
+              onClick={() => onOpenChange(false)}
+              type="button"
+              variant="ghost"
+            >
+              Cancel
+            </Button>
+            <Button
+              data-testid="issue-tracker-save"
+              disabled={mutation.isPending}
+              form="issue-tracker-form"
+              type="submit"
+            >
+              {mutation.isPending ? "Saving…" : "Save"}
+            </Button>
           </div>
+        }
+        headerSubtitle={`Where issues for ${repository.name} are tracked.`}
+        title="Issue tracker"
+      >
+        <form
+          className="space-y-4"
+          id="issue-tracker-form"
+          onSubmit={(event) => void handleSave(event)}
+        >
           <label className="block space-y-1.5 text-sm font-medium">
             <span>Tracker</span>
             <select
-              className={FIELD_CLASS}
+              className={PROJECT_FORM_FIELD_CLASS}
               data-testid="issue-tracker-kind"
               disabled={mutation.isPending}
               onChange={(event) =>
@@ -159,25 +172,8 @@ export function RepositoryIssueTrackerDialog({
               </label>
             </>
           ) : null}
-          <div className="flex justify-end gap-2">
-            <Button
-              disabled={mutation.isPending}
-              onClick={() => onOpenChange(false)}
-              type="button"
-              variant="ghost"
-            >
-              Cancel
-            </Button>
-            <Button
-              data-testid="issue-tracker-save"
-              disabled={mutation.isPending}
-              type="submit"
-            >
-              {mutation.isPending ? "Saving…" : "Save"}
-            </Button>
-          </div>
         </form>
-      </DialogContent>
+      </ChooserDialogContent>
     </Dialog>
   );
 }

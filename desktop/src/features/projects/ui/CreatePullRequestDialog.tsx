@@ -8,6 +8,7 @@ import {
   useRepoStateQuery,
 } from "@/features/projects/hooks";
 import { selectProjectRepository } from "@/features/projects/projectModels";
+import { PROJECT_FORM_FIELD_CLASS } from "@/features/projects/ui/projectPanelStyles";
 import { useCreateProjectPullRequestMutation } from "@/features/projects/pullRequestMutations";
 import { useProjectRepoSyncStatusQuery } from "@/features/projects/repoSyncHooks";
 
@@ -182,7 +183,7 @@ export function CreatePullRequestDialog({
         <label className="space-y-1.5 text-sm font-medium sm:col-span-2">
           <span>Repository</span>
           <select
-            className="h-10 w-full rounded-lg border border-input bg-background px-3 text-sm font-normal outline-hidden focus:ring-1 focus:ring-ring"
+            className={PROJECT_FORM_FIELD_CLASS}
             data-testid="create-pull-request-repository"
             disabled={createMutation.isPending}
             onChange={(event) => setRepositoryId(event.target.value)}
@@ -203,7 +204,7 @@ export function CreatePullRequestDialog({
         <label className="space-y-1.5 text-sm font-medium">
           <span>Base</span>
           <select
-            className="h-10 w-full rounded-lg border border-input bg-background px-3 text-sm font-normal outline-hidden focus:ring-1 focus:ring-ring"
+            className={PROJECT_FORM_FIELD_CLASS}
             data-testid="create-pull-request-base-branch"
             disabled={createMutation.isPending}
             onChange={(event) => setTargetBranch(event.target.value)}
@@ -219,7 +220,7 @@ export function CreatePullRequestDialog({
         <label className="space-y-1.5 text-sm font-medium">
           <span>Compare</span>
           <select
-            className="h-10 w-full rounded-lg border border-input bg-background px-3 text-sm font-normal outline-hidden focus:ring-1 focus:ring-ring"
+            className={PROJECT_FORM_FIELD_CLASS}
             data-testid="create-pull-request-compare-branch"
             disabled={createMutation.isPending}
             onChange={(event) => setSourceBranch(event.target.value)}

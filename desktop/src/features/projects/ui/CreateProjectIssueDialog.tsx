@@ -4,6 +4,7 @@ import { toast } from "sonner";
 import type { Project, Repository } from "@/features/projects/hooks";
 import { useCreateProjectIssueMutation } from "@/features/projects/issueMutations";
 import { selectProjectRepository } from "@/features/projects/projectModels";
+import { PROJECT_FORM_FIELD_CLASS } from "@/features/projects/ui/projectPanelStyles";
 import {
   CreateProjectWorkItemDialog,
   type CreateProjectWorkItemDialogInput,
@@ -81,7 +82,7 @@ export function CreateProjectIssueDialog({
       <label className="block space-y-1.5 text-sm font-medium">
         <span>Repository</span>
         <select
-          className="h-10 w-full rounded-lg border border-input bg-background px-3 text-sm font-normal outline-hidden focus:ring-1 focus:ring-ring"
+          className={PROJECT_FORM_FIELD_CLASS}
           data-testid="create-issue-repository"
           disabled={createMutation.isPending}
           onChange={(event) => setRepositoryId(event.target.value)}
