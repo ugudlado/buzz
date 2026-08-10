@@ -93,17 +93,15 @@ export async function fetchProjectsWorkItems<TProject extends ProjectReference>(
   ];
   // Repos tracked in Backlog get issues from the Backlog provider instead of
   // relay kind:1621 events; their pull requests stay relay-native.
-  const backlogRepos = new Map<string, string>();
-  for (const project of projects) {
-    for (const repository of project.repositories) {
-      if (repository.issueTracker?.kind === "backlog") {
-        backlogRepos.set(
-          repository.repoAddress,
-          repository.issueTracker.project,
-        );
-      }
-    }
-  }
+  const backlogRepos = new Map(
+    projects.flatMap((project) =>
+      project.repositories.flatMap((repository) =>
+        repository.issueTracker?.kind === "backlog"
+          ? [[repository.repoAddress, repository.issueTracker.project] as const]
+          : [],
+      ),
+    ),
+  );
   const backlogIssuesPromise: Promise<Map<string, ProjectIssue[]>> =
     backlogRepos.size
       ? fetchBacklogIssues(
@@ -113,10 +111,17 @@ export async function fetchProjectsWorkItems<TProject extends ProjectReference>(
           })),
         )
       : Promise.resolve(new Map());
+  // Relay issue events are only consumed for non-Backlog repos; skip the kind
+  // entirely when every repo is Backlog-tracked.
+  const hasRelayIssueRepos = repoAddresses.some(
+    (address) => !backlogRepos.has(address),
+  );
   const [rootResult, updateResult, commentResult, statusResult, backlogResult] =
     await Promise.allSettled([
       fetchEvents({
-        kinds: [KIND_GIT_ISSUE, KIND_GIT_PULL_REQUEST],
+        kinds: hasRelayIssueRepos
+          ? [KIND_GIT_ISSUE, KIND_GIT_PULL_REQUEST]
+          : [KIND_GIT_PULL_REQUEST],
         "#a": repoAddresses,
         limit: 2_000,
       }),
@@ -241,7 +246,7 @@ export async function fetchProjectsWorkItems<TProject extends ProjectReference>(
     pullRequestFailedSections.unshift("pull-request-updates");
   }
   const issueFailedSections = [...sharedFailedSections];
-  if (backlogRepos.size > 0 && backlogResult.status === "rejected") {
+  if (backlogResult.status === "rejected") {
     issueFailedSections.unshift("backlog-issues");
   }
 
