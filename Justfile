@@ -167,9 +167,21 @@ _ensure-sidecar-stubs:
 _ensure-services:
     #!/usr/bin/env bash
     set -euo pipefail
-    pg=$(docker inspect --format '{{"{{"}}.State.Health.Status{{"}}"}}' buzz-postgres 2>/dev/null || echo "not_found")
-    redis=$(docker inspect --format '{{"{{"}}.State.Health.Status{{"}}"}}' buzz-redis 2>/dev/null || echo "not_found")
-    if [[ "$pg" == "healthy" && "$redis" == "healthy" ]]; then
+    # BUZZ_EXTERNAL_POSTGRES / BUZZ_EXTERNAL_REDIS (from the environment or
+    # .env — dotenv-load is on) mean "I run this service myself (e.g.
+    # Homebrew) — don't manage it". Docker compose only starts and
+    # health-waits whichever is unset.
+    ext() { [[ -n "${!1:-}" ]]; }
+    healthy() { [[ "$(docker inspect --format '{{"{{"}}.State.Health.Status{{"}}"}}' "$1" 2>/dev/null || echo not_found)" == "healthy" ]]; }
+    ok() {
+        ext BUZZ_EXTERNAL_POSTGRES || healthy buzz-postgres || return 1
+        ext BUZZ_EXTERNAL_REDIS || healthy buzz-redis || return 1
+    }
+    if ext BUZZ_EXTERNAL_POSTGRES && ext BUZZ_EXTERNAL_REDIS; then
+        echo "Using externally managed Postgres + Redis"
+        exit 0
+    fi
+    if ok; then
         echo "Services already healthy"
         exit 0
     fi
@@ -177,9 +189,7 @@ _ensure-services:
     docker compose up -d || true
     echo -n "Waiting for services"
     for i in $(seq 1 40); do
-        pg=$(docker inspect --format '{{"{{"}}.State.Health.Status{{"}}"}}' buzz-postgres 2>/dev/null || echo "not_found")
-        redis=$(docker inspect --format '{{"{{"}}.State.Health.Status{{"}}"}}' buzz-redis 2>/dev/null || echo "not_found")
-        if [[ "$pg" == "healthy" && "$redis" == "healthy" ]]; then
+        if ok; then
             echo " ready"
             exit 0
         fi
