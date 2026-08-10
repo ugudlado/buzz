@@ -9,3 +9,7 @@ export const PROJECT_DETAIL_PANEL_CLASS =
 /** Empty or loading state using the same transparent project panel shell. */
 export const PROJECT_DETAIL_PANEL_MESSAGE_CLASS =
   "rounded-xl border border-border/60 bg-transparent p-4 text-sm text-muted-foreground";
+
+/** Native form control (e.g. `<select>`) styled to match `Input` in dialogs. */
+export const PROJECT_FORM_FIELD_CLASS =
+  "h-10 w-full rounded-lg border border-input bg-background px-3 text-sm font-normal outline-hidden focus:ring-1 focus:ring-ring";
