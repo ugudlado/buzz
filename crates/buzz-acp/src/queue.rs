@@ -1322,6 +1322,11 @@ pub struct FormatPromptArgs<'a> {
     /// For legacy agents it rides in the user message on every turn of the
     /// session, alongside `[Base]`/`[System]`/`[Agent Memory — core]`.
     pub agent_canvas: Option<&'a str>,
+    /// Rendered `[Project]` metadata section for legacy agents.
+    ///
+    /// Same delivery semantics as `agent_canvas`: modern agents receive it via
+    /// the system role in session/new; legacy agents get it in the user message.
+    pub agent_project: Option<&'a str>,
 }
 
 /// Format the `[Base]` section for the base prompt.
@@ -1400,6 +1405,10 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
     if !args.has_system_prompt_support {
         if let Some(core) = args.agent_core {
             sections.push(core.to_string());
+        }
+        // Project metadata — same delivery semantics as core for legacy agents.
+        if let Some(project) = args.agent_project {
+            sections.push(project.to_string());
         }
         // Channel canvas metadata — same delivery semantics as core for legacy agents.
         if let Some(canvas) = args.agent_canvas {

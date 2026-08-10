@@ -104,6 +104,12 @@ pub struct SessionState {
     /// fetch fails — all fail open. Cleared on session invalidation alongside
     /// `core_sections` so the next session picks up any canvas change.
     pub canvas_sections: HashMap<Uuid, String>,
+    /// channel_id → rendered `[Project]` metadata section (NIP-MP kind:30621).
+    ///
+    /// Same lifecycle as `canvas_sections`: fetched once per new channel
+    /// session, absent when no project binds the channel or the fetch fails
+    /// (fail open), cleared on session invalidation.
+    pub project_sections: HashMap<Uuid, String>,
 }
 
 impl SessionState {
@@ -126,6 +132,7 @@ impl SessionState {
         self.turn_counts.remove(channel_id);
         self.core_sections.remove(channel_id);
         self.canvas_sections.remove(channel_id);
+        self.project_sections.remove(channel_id);
         self.sessions.remove(channel_id).is_some()
     }
 
@@ -137,6 +144,7 @@ impl SessionState {
         self.heartbeat_turn_count = 0;
         self.core_sections.clear();
         self.canvas_sections.clear();
+        self.project_sections.clear();
     }
 
     #[cfg(test)]
@@ -145,6 +153,7 @@ impl SessionState {
             || self.turn_counts.contains_key(channel_id)
             || self.core_sections.contains_key(channel_id)
             || self.canvas_sections.contains_key(channel_id)
+            || self.project_sections.contains_key(channel_id)
     }
 }
 
@@ -961,25 +970,34 @@ async fn create_session_and_apply_model(
     ctx: &PromptContext,
     resolved_cwd: &str,
     agent_core: Option<&str>,
+    agent_project: Option<&str>,
     agent_canvas: Option<&str>,
     channel_name: Option<&str>,
     channel_id: Option<Uuid>,
     channel_type: Option<&str>,
 ) -> Result<String, AcpError> {
-    // Build base_prompt + system_prompt + agent core + canvas metadata into a
-    // single prompt. Standard protocol-v2 agents receive it in `session/new`;
+    // Build base_prompt + system_prompt + agent core + project + canvas metadata
+    // into a single prompt. Standard protocol-v2 agents receive it in `session/new`;
     // Goose receives it through the custom request below. Legacy agents receive
     // the same content as user-message sections via `format_prompt`. Core carries
-    // its own `[Agent Memory — core]` header, and canvas carries its own
-    // `[Channel Canvas]` header; both are appended with a blank-line separator.
+    // its own `[Agent Memory — core]` header, project its `[Project]` header, and
+    // canvas its `[Channel Canvas]` header; each is appended with a blank-line
+    // separator.
     let is_goose = agent.agent_name == "goose";
     let combined_system_prompt = with_canvas(
-        with_core(
-            with_team(
-                framed_system_prompt(resolved_cwd, ctx.base_prompt, ctx.system_prompt.as_deref()),
-                ctx.team_instructions.as_deref(),
+        with_project(
+            with_core(
+                with_team(
+                    framed_system_prompt(
+                        resolved_cwd,
+                        ctx.base_prompt,
+                        ctx.system_prompt.as_deref(),
+                    ),
+                    ctx.team_instructions.as_deref(),
+                ),
+                agent_core,
             ),
-            agent_core,
+            agent_project,
         ),
         agent_canvas,
     );
@@ -1427,6 +1445,20 @@ fn with_canvas(prompt: Option<String>, canvas: Option<&str>) -> Option<String> {
     }
 }
 
+/// Append the `[Project]` metadata section onto the accumulated system prompt.
+///
+/// The project section already carries its `[Project]` header (from
+/// `render_project_section`), so it is joined with a blank-line separator.
+/// Either side may be absent.
+fn with_project(prompt: Option<String>, project: Option<&str>) -> Option<String> {
+    match (prompt, project) {
+        (Some(prompt), Some(project)) => Some(format!("{prompt}\n\n{project}")),
+        (Some(prompt), None) => Some(prompt),
+        (None, Some(project)) => Some(project.to_string()),
+        (None, None) => None,
+    }
+}
+
 /// Return `agent` to the pool via `result_tx`, clearing any steer receiver first.
 ///
 /// Every path that returns an `OwnedAgent` to the pool via `PromptResult` goes
@@ -1635,6 +1667,8 @@ pub async fn run_prompt_task(
     // prevents a stale revision A surviving a failed create and being re-used by
     // the next attempt after the canvas was cleared.
     let mut pending_canvas: Option<(Uuid, String)> = None;
+    // Project metadata — same I3 lifecycle as the canvas above.
+    let mut pending_project: Option<(Uuid, String)> = None;
     // Channel name for the session title, from the same single resolve the
     // canvas DM check uses — see `resolve_new_session_channel_context`.
     let mut title_channel: Option<String> = None;
@@ -1642,6 +1676,8 @@ pub async fn run_prompt_task(
     if let PromptSource::Channel(cid) = &source {
         let is_new_channel_session = !agent.state.sessions.contains_key(cid);
         let needs_canvas = is_new_channel_session && !agent.state.canvas_sections.contains_key(cid);
+        let needs_project =
+            is_new_channel_session && !agent.state.project_sections.contains_key(cid);
         if is_new_channel_session {
             let (is_dm, resolved_channel, resolved_channel_type) =
                 resolve_new_session_channel_context(&ctx.channel_info, *cid).await;
@@ -1652,6 +1688,12 @@ pub async fn run_prompt_task(
             if needs_canvas && !is_dm {
                 if let Some(section) = fetch_canvas_section(*cid, &ctx.rest_client).await {
                     pending_canvas = Some((*cid, section));
+                }
+            }
+            // Projects bind channels, not DMs — same DM gating as the canvas.
+            if needs_project && !is_dm {
+                if let Some(section) = fetch_project_section(*cid, &ctx.rest_client).await {
+                    pending_project = Some((*cid, section));
                 }
             }
         }
@@ -1673,6 +1715,17 @@ pub async fn run_prompt_task(
             .get(cid)
             .cloned()
             .or_else(|| pending_canvas.as_ref().map(|(_, s)| s.clone())),
+        PromptSource::Heartbeat => None,
+    };
+
+    // The project metadata section — channel-scoped, absent for heartbeats/DMs.
+    let agent_project: Option<String> = match &source {
+        PromptSource::Channel(cid) => agent
+            .state
+            .project_sections
+            .get(cid)
+            .cloned()
+            .or_else(|| pending_project.as_ref().map(|(_, s)| s.clone())),
         PromptSource::Heartbeat => None,
     };
 
@@ -1701,6 +1754,7 @@ pub async fn run_prompt_task(
                     &ctx,
                     &resolved_cwd,
                     agent_core.as_deref(),
+                    agent_project.as_deref(),
                     agent_canvas.as_deref(),
                     title_channel.as_deref(),
                     Some(*cid),
@@ -1714,9 +1768,12 @@ pub async fn run_prompt_task(
                             "created session {sid} for channel {cid}"
                         );
                         agent.state.sessions.insert(*cid, sid.clone());
-                        // Commit canvas only after session creation succeeds (I3).
+                        // Commit canvas/project only after session creation succeeds (I3).
                         if let Some((pending_cid, section)) = pending_canvas.take() {
                             agent.state.canvas_sections.insert(pending_cid, section);
+                        }
+                        if let Some((pending_cid, section)) = pending_project.take() {
+                            agent.state.project_sections.insert(pending_cid, section);
                         }
                         (sid, true)
                     }
@@ -1753,7 +1810,7 @@ pub async fn run_prompt_task(
                 (sid.clone(), false)
             } else {
                 match create_session_and_apply_model(
-                    &mut agent, &ctx, &ctx.cwd, None, None, None, None, None,
+                    &mut agent, &ctx, &ctx.cwd, None, None, None, None, None, None,
                 )
                 .await
                 {
@@ -1839,6 +1896,17 @@ pub async fn run_prompt_task(
                     1
                 },
                 agent_canvas.as_deref(),
+                &init_msg,
+            );
+            // Same prepend semantics for the [Project] section — the helper is
+            // generic over the section body, so it is reused rather than cloned.
+            let init_msg = prepend_canvas_for_legacy(
+                if agent.has_system_prompt_support() {
+                    2
+                } else {
+                    1
+                },
+                agent_project.as_deref(),
                 &init_msg,
             );
             let init_result = agent
@@ -2013,6 +2081,7 @@ pub async fn run_prompt_task(
                 system_prompt: ctx.system_prompt.as_deref(),
                 team_instructions: ctx.team_instructions.as_deref(),
                 agent_canvas: agent_canvas.as_deref(),
+                agent_project: agent_project.as_deref(),
             },
         )
     } else {
@@ -2810,6 +2879,200 @@ pub(crate) fn render_canvas_section(event_id: &str, timestamp: &str, channel_uui
          Last modified: {timestamp}\n\
          Fetch current content with: buzz canvas get --channel {channel_uuid}"
     )
+}
+
+/// Fetch the NIP-MP project (kind:30621) bound to `channel_id` via its
+/// `buzz-channel` tag and return a rendered `[Project]` metadata section, or
+/// `None` if no project binds the channel or on any error (all fail open).
+///
+/// `nostr::Filter::custom_tags` only supports single-letter tags, so
+/// `buzz-channel` can't be filtered server-side — this queries by kind and
+/// scans the returned tags client-side, the same pattern
+/// [`find_repo_for_channel`] uses. If several signers bind a project to the
+/// same channel, the first match in relay order wins.
+///
+/// Called at most once per new channel session; the result is cached in
+/// `SessionState::project_sections` and cleared on session invalidation.
+async fn fetch_project_section(channel_id: Uuid, rest: &RestClient) -> Option<String> {
+    let filter =
+        nostr::Filter::new().kind(nostr::Kind::Custom(buzz_core::kind::KIND_PROJECT as u16));
+
+    const PROJECT_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+    let json = match tokio::time::timeout(
+        PROJECT_FETCH_TIMEOUT,
+        rest.query(std::slice::from_ref(&filter)),
+    )
+    .await
+    {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => {
+            tracing::warn!(
+                target: "project::fetch",
+                channel = %channel_id,
+                "project query failed: {e} — emitting no section"
+            );
+            return None;
+        }
+        Err(_) => {
+            tracing::warn!(
+                target: "project::fetch",
+                channel = %channel_id,
+                timeout_ms = PROJECT_FETCH_TIMEOUT.as_millis() as u64,
+                "project fetch timed out — emitting no section"
+            );
+            return None;
+        }
+    };
+
+    let events = match json.as_array() {
+        Some(arr) => arr,
+        None => {
+            tracing::warn!(
+                target: "project::fetch",
+                channel = %channel_id,
+                "project query response is not a JSON array — emitting no section"
+            );
+            return None;
+        }
+    };
+
+    project_section_from_query_response(events, &channel_id.to_string())
+}
+
+/// Scan a kind:30621 query response for the first verified project whose
+/// `buzz-channel` tag names `channel_uuid`, and render a `[Project]` section.
+///
+/// Extracted as a pure function so tests can exercise the parsing/validation
+/// logic without async machinery or relay connectivity.
+///
+/// Events that are malformed, fail signature verification, or carry the wrong
+/// kind are skipped (logged at `warn`) rather than aborting the scan — one bad
+/// event must not hide a valid binding behind it.
+pub(crate) fn project_section_from_query_response(
+    events: &[serde_json::Value],
+    channel_uuid: &str,
+) -> Option<String> {
+    for raw in events {
+        // Cheap tag scan first: skip events that don't bind this channel
+        // before paying for deserialisation + signature verification.
+        let binds_channel = raw
+            .get("tags")
+            .and_then(|t| t.as_array())
+            .is_some_and(|tags| {
+                tags.iter().any(|tag| {
+                    tag.as_array().is_some_and(|v| {
+                        v.first().and_then(|s| s.as_str()) == Some("buzz-channel")
+                            && v.get(1).and_then(|s| s.as_str()) == Some(channel_uuid)
+                    })
+                })
+            });
+        if !binds_channel {
+            continue;
+        }
+
+        // Deserialise as a complete Nostr Event and verify id + signature —
+        // this metadata lands in the system prompt, so a tampered event must
+        // not supply it.
+        let event = match serde_json::from_value::<nostr::Event>(raw.clone()) {
+            Ok(ev) => ev,
+            Err(err) => {
+                tracing::warn!(
+                    target: "project::fetch",
+                    channel = %channel_uuid,
+                    %err,
+                    "project query returned a malformed event — skipping",
+                );
+                continue;
+            }
+        };
+        if let Err(err) = event.verify() {
+            tracing::warn!(
+                target: "project::fetch",
+                channel = %channel_uuid,
+                %err,
+                "project event failed signature verification — skipping",
+            );
+            continue;
+        }
+        if event.kind != nostr::Kind::Custom(buzz_core::kind::KIND_PROJECT as u16) {
+            tracing::warn!(
+                target: "project::fetch",
+                channel = %channel_uuid,
+                kind = %event.kind.as_u16(),
+                "project event has unexpected kind — skipping",
+            );
+            continue;
+        }
+
+        let mut slug: Option<&str> = None;
+        let mut name: Option<&str> = None;
+        let mut description: Option<&str> = None;
+        let mut member_count: usize = 0;
+        for tag in event.tags.iter() {
+            let v = tag.as_slice();
+            let (Some(tag_name), value) = (v.first(), v.get(1)) else {
+                continue;
+            };
+            match (tag_name.as_str(), value) {
+                ("d", Some(val)) => slug = Some(val),
+                ("name", Some(val)) => name = Some(val),
+                ("description", Some(val)) => description = Some(val),
+                ("a", Some(_)) => member_count += 1,
+                _ => {}
+            }
+        }
+        // NIP-MP requires a non-empty `d`; a head without one is malformed.
+        let Some(slug) = slug.filter(|s| !s.is_empty()) else {
+            tracing::warn!(
+                target: "project::fetch",
+                channel = %channel_uuid,
+                "project event has no d tag — skipping",
+            );
+            continue;
+        };
+
+        tracing::info!(
+            target: "project::fetch",
+            channel = %channel_uuid,
+            slug,
+            "injected project metadata section into system prompt"
+        );
+        return Some(render_project_section(
+            slug,
+            name,
+            description,
+            member_count,
+            &event.pubkey.to_hex(),
+        ));
+    }
+    None
+}
+
+/// Render the `[Project]` metadata section string.
+///
+/// Pure function — kept separate so unit tests can exercise rendering
+/// without async machinery or relay connectivity.
+pub(crate) fn render_project_section(
+    slug: &str,
+    name: Option<&str>,
+    description: Option<&str>,
+    member_count: usize,
+    owner_pubkey_hex: &str,
+) -> String {
+    // NIP-MP: clients fall back to the d value when name is absent.
+    let display_name = name.unwrap_or(slug);
+    let mut section = format!(
+        "[Project]\n\
+         This channel belongs to the project \"{display_name}\" (slug: {slug})."
+    );
+    if let Some(desc) = description.filter(|d| !d.trim().is_empty()) {
+        section.push_str(&format!("\nDescription: {desc}"));
+    }
+    section.push_str(&format!(
+        "\nMember repositories: {member_count}\n\
+         Fetch full details (member repo list) with: buzz projects get {slug} --owner {owner_pubkey_hex}"
+    ));
+    section
 }
 
 /// Fetch conversation context (thread or DM) for a batch before prompting.
@@ -7174,6 +7437,192 @@ mod tests {
             !section.contains("+00:00"),
             "timestamp must not use +00:00 offset"
         );
+    }
+
+    // ── project_section_from_query_response ──────────────────────────────────
+
+    /// Build a real, cryptographically signed NIP-MP project event for tests,
+    /// bound to `channel` via its `buzz-channel` tag.
+    fn make_project_event_value(
+        slug: &str,
+        name: Option<&str>,
+        description: Option<&str>,
+        member_coords: &[&str],
+        channel: &str,
+    ) -> serde_json::Value {
+        let keys = Keys::generate();
+        let mut tags = vec![
+            Tag::parse(["d", slug]).expect("d tag"),
+            Tag::parse(["buzz-channel", channel]).expect("buzz-channel tag"),
+        ];
+        if let Some(name) = name {
+            tags.push(Tag::parse(["name", name]).expect("name tag"));
+        }
+        if let Some(desc) = description {
+            tags.push(Tag::parse(["description", desc]).expect("description tag"));
+        }
+        for coord in member_coords {
+            tags.push(Tag::parse(["a", coord]).expect("a tag"));
+        }
+        let event = EventBuilder::new(Kind::Custom(buzz_core::kind::KIND_PROJECT as u16), "")
+            .tags(tags)
+            .sign_with_keys(&keys)
+            .expect("sign");
+        serde_json::to_value(&event).expect("serialise")
+    }
+
+    #[test]
+    fn test_project_section_from_query_response_happy_path() {
+        let ev = make_project_event_value(
+            "platform",
+            Some("Platform"),
+            Some("Relay, desktop, and mobile."),
+            &["30617:aaaa:buzz", "30617:bbbb:buzz-infra"],
+            CHANNEL_UUID,
+        );
+        let owner = ev["pubkey"].as_str().unwrap().to_string();
+        let section =
+            project_section_from_query_response(&[ev], CHANNEL_UUID).expect("expected Some");
+        assert!(section.starts_with("[Project]"));
+        assert!(section.contains("\"Platform\""));
+        assert!(section.contains("slug: platform"));
+        assert!(section.contains("Description: Relay, desktop, and mobile."));
+        assert!(section.contains("Member repositories: 2"));
+        assert!(section.contains(&format!("buzz projects get platform --owner {owner}")));
+    }
+
+    #[test]
+    fn test_project_section_name_falls_back_to_slug() {
+        let ev = make_project_event_value("platform", None, None, &[], CHANNEL_UUID);
+        let section =
+            project_section_from_query_response(&[ev], CHANNEL_UUID).expect("expected Some");
+        assert!(
+            section.contains("\"platform\" (slug: platform)"),
+            "display name must fall back to the d value; got: {section}"
+        );
+        assert!(
+            !section.contains("Description:"),
+            "no description line when the tag is absent"
+        );
+        assert!(section.contains("Member repositories: 0"));
+    }
+
+    #[test]
+    fn test_project_section_from_query_response_empty_array_returns_none() {
+        assert!(project_section_from_query_response(&[], CHANNEL_UUID).is_none());
+    }
+
+    #[test]
+    fn test_project_section_from_query_response_other_channel_returns_none() {
+        let ev = make_project_event_value(
+            "platform",
+            None,
+            None,
+            &[],
+            "11111111-2222-3333-4444-555555555555",
+        );
+        assert!(project_section_from_query_response(&[ev], CHANNEL_UUID).is_none());
+    }
+
+    #[test]
+    fn test_project_section_from_query_response_tampered_event_skipped() {
+        let mut ev = make_project_event_value("platform", None, None, &[], CHANNEL_UUID);
+        // Alter the content after signing so verification fails.
+        ev["content"] = serde_json::Value::String("tampered".into());
+        assert!(
+            project_section_from_query_response(&[ev], CHANNEL_UUID).is_none(),
+            "tampered event must not supply prompt metadata"
+        );
+    }
+
+    #[test]
+    fn test_project_section_scan_skips_non_matching_and_finds_later_match() {
+        let other = make_project_event_value(
+            "other",
+            None,
+            None,
+            &[],
+            "11111111-2222-3333-4444-555555555555",
+        );
+        let matching = make_project_event_value("platform", None, None, &[], CHANNEL_UUID);
+        let section = project_section_from_query_response(&[other, matching], CHANNEL_UUID)
+            .expect("expected Some");
+        assert!(section.contains("slug: platform"));
+    }
+
+    // ── render_project_section ───────────────────────────────────────────────
+
+    #[test]
+    fn test_render_project_section_produces_exact_shape() {
+        let section = render_project_section(
+            "platform",
+            Some("Platform"),
+            Some("The platform team."),
+            3,
+            "deadbeef",
+        );
+        assert_eq!(
+            section,
+            "[Project]\n\
+             This channel belongs to the project \"Platform\" (slug: platform).\n\
+             Description: The platform team.\n\
+             Member repositories: 3\n\
+             Fetch full details (member repo list) with: buzz projects get platform --owner deadbeef"
+        );
+    }
+
+    // ── with_project ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_with_project_appends_to_existing_prompt() {
+        let result = with_project(Some("base content".into()), Some("[Project]\nstuff"));
+        assert_eq!(result.unwrap(), "base content\n\n[Project]\nstuff");
+    }
+
+    #[test]
+    fn test_with_project_returns_project_alone_when_no_prompt() {
+        let result = with_project(None, Some("[Project]\nstuff"));
+        assert_eq!(result.unwrap(), "[Project]\nstuff");
+    }
+
+    #[test]
+    fn test_with_project_returns_prompt_alone_when_no_project() {
+        let result = with_project(Some("base content".into()), None);
+        assert_eq!(result.unwrap(), "base content");
+    }
+
+    #[test]
+    fn test_with_project_returns_none_when_both_absent() {
+        assert!(with_project(None, None).is_none());
+    }
+
+    // ── project_sections cache invalidation ──────────────────────────────────
+
+    #[test]
+    fn test_invalidate_channel_clears_project_section() {
+        let ch = Uuid::new_v4();
+        let mut s = SessionState::default();
+        s.project_sections.insert(ch, "[Project]\nstuff".into());
+        s.sessions.insert(ch, "sid".into());
+        s.invalidate_channel(&ch);
+        assert!(!s.project_sections.contains_key(&ch));
+    }
+
+    #[test]
+    fn test_invalidate_all_clears_project_sections() {
+        let mut s = SessionState::default();
+        s.project_sections.insert(Uuid::new_v4(), "a".into());
+        s.project_sections.insert(Uuid::new_v4(), "b".into());
+        s.invalidate_all();
+        assert!(s.project_sections.is_empty());
+    }
+
+    #[test]
+    fn test_has_channel_state_true_when_only_project_section_present() {
+        let ch = Uuid::new_v4();
+        let mut s = SessionState::default();
+        s.project_sections.insert(ch, "project".into());
+        assert!(s.has_channel_state(&ch));
     }
 
     // ── new-session channel context (one resolve, two consumers) ─────────────
