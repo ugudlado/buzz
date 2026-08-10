@@ -565,6 +565,16 @@ impl WorkflowEngine {
             return Ok(());
         }
 
+        // Workflow-authored channel messages (assign_to_agent prompts,
+        // send_message output) are plain kind:9 events but carry the
+        // buzz:workflow tag precisely so machinery output can be told apart
+        // from user messages — never re-trigger on them.
+        if event.event.tags.iter().any(|t| {
+            t.as_slice().first().map(|s| s.as_str()) == Some(buzz_core::thread::TAG_WORKFLOW)
+        }) {
+            return Ok(());
+        }
+
         let cache_key = (community_id, channel_id);
         let workflows = match self.workflow_cache.get(&cache_key) {
             Some(cached) => cached,
@@ -604,6 +614,18 @@ impl WorkflowEngine {
             };
 
             if !def.enabled || !trigger_matches_event(&def.trigger, kind_u32) {
+                continue;
+            }
+
+            // An assigned agent's completion reply is a plain kind:9 from the
+            // agent's own key — firing on it would loop the workflow on its
+            // own output forever.
+            if triggers_on_own_agent(&def, &trigger_ctx.author) {
+                tracing::debug!(
+                    workflow_id = %workflow.id,
+                    author = %trigger_ctx.author,
+                    "Skipping workflow — trigger authored by its own assigned agent"
+                );
                 continue;
             }
 
@@ -1102,6 +1124,26 @@ fn interval_prefilter_should_fire(
         last_fired.insert((community_id, workflow_id), now);
     }
     false
+}
+
+/// True when `author` (hex pubkey) is the pinned `agent_pubkey` of any
+/// `assign_to_agent` step in this workflow — such a message is the workflow's
+/// own agent replying, and firing on it would loop the workflow forever.
+///
+/// Steps without a pinned `agent_pubkey` (name-only resolution) are not
+/// matched here; their replies are still caught by the `buzz:workflow` tag
+/// guard when threaded, so the residual loop risk is a name-only agent
+/// posting untagged top-level messages.
+fn triggers_on_own_agent(def: &WorkflowDef, author: &str) -> bool {
+    def.steps.iter().any(|step| {
+        matches!(
+            &step.action,
+            ActionDef::AssignToAgent {
+                agent_pubkey: Some(pk),
+                ..
+            } if pk.eq_ignore_ascii_case(author)
+        )
+    })
 }
 
 /// Check emoji and filter-expression conditions that determine whether a
@@ -1755,6 +1797,26 @@ steps:
         };
         assert!(trigger_matches_event(&trigger, 9));
         assert!(!trigger_matches_event(&trigger, 7));
+    }
+
+    #[test]
+    fn own_agent_reply_does_not_fire_workflow() {
+        // An assign_to_agent step's completion reply is a plain kind:9 from
+        // the agent's key; firing on it would loop the workflow forever.
+        let def: WorkflowDef = serde_json::from_value(serde_json::json!({
+            "name": "say_hello",
+            "trigger": {"on": "message_posted"},
+            "steps": [{
+                "id": "s1",
+                "action": "assign_to_agent",
+                "agent": "Fizz",
+                "agent_pubkey": "0D44B9AC799A64EE",
+                "instruction": "introduce yourself"
+            }]
+        }))
+        .expect("valid definition");
+        assert!(triggers_on_own_agent(&def, "0d44b9ac799a64ee"));
+        assert!(!triggers_on_own_agent(&def, "feedface"));
     }
 
     #[test]
