@@ -164,7 +164,7 @@ function IssueGridCard({
         <div className="mt-auto border border-border/60 bg-muted/30 px-2.5 py-2">
           <div className="flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-0.5 text-xs text-foreground/80">
             <span className="font-mono text-foreground">
-              #{issue.id.slice(0, 8)}
+              #{issue.displayId ?? issue.id.slice(0, 8)}
             </span>
             {issue.comments.length > 0 ? (
               <span className="flex items-center gap-1">

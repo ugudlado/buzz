@@ -8,6 +8,12 @@
 // them unchanged; ids are prefixed `backlog:` so they can never collide with
 // 64-hex Nostr event ids in `${repoAddress}:${issue.id}` dedupe keys.
 
+import {
+  getStorageItem,
+  removeStorageItem,
+  setStorageItem,
+} from "@/shared/lib/safeStorage";
+
 import type { ProjectIssue, ProjectIssueStatus } from "./projectIssues.mjs";
 
 /** Connection to a Backlog server (user-scoped, one per app). */
@@ -21,9 +27,9 @@ const CONNECTION_KEY = "buzz-backlog-connection.v1";
 /** Read the stored Backlog connection (null when not configured). */
 export function getBacklogConnection(): BacklogConnection | null {
   if (typeof window === "undefined") return null;
+  const raw = getStorageItem(CONNECTION_KEY);
+  if (!raw) return null;
   try {
-    const raw = window.localStorage.getItem(CONNECTION_KEY);
-    if (!raw) return null;
     const parsed = JSON.parse(raw) as Partial<BacklogConnection>;
     if (!parsed.baseUrl || !parsed.token) return null;
     return { baseUrl: parsed.baseUrl, token: parsed.token };
@@ -36,19 +42,14 @@ export function getBacklogConnection(): BacklogConnection | null {
 export function setBacklogConnection(connection: BacklogConnection | null) {
   if (typeof window === "undefined") return;
   if (!connection) {
-    window.localStorage.removeItem(CONNECTION_KEY);
+    removeStorageItem(CONNECTION_KEY);
     return;
   }
-  window.localStorage.setItem(CONNECTION_KEY, JSON.stringify(connection));
+  setStorageItem(CONNECTION_KEY, JSON.stringify(connection));
 }
 
 /** Synthetic issue-id namespace for Backlog tasks. */
 export const BACKLOG_ISSUE_ID_PREFIX = "backlog:";
-
-/** True when a ProjectIssue id refers to a Backlog task. */
-export function isBacklogIssueId(issueId: string): boolean {
-  return issueId.startsWith(BACKLOG_ISSUE_ID_PREFIX);
-}
 
 /** Backlog task id from a synthetic issue id. */
 export function backlogTaskIdFromIssueId(issueId: string): string {
@@ -66,33 +67,25 @@ export type BacklogTask = {
   updatedDate?: string;
   labels: string[];
   description?: string;
-  priority?: string;
 };
 
 type BacklogDeps = {
-  connection?: BacklogConnection | null;
+  connection?: BacklogConnection;
   fetchImpl?: typeof fetch;
 };
-
-function resolveDeps(deps?: BacklogDeps): {
-  connection: BacklogConnection;
-  fetchImpl: typeof fetch;
-} {
-  const connection = deps?.connection ?? getBacklogConnection();
-  if (!connection) {
-    throw new Error(
-      "Backlog is not connected. Set the Backlog server URL and token first.",
-    );
-  }
-  return { connection, fetchImpl: deps?.fetchImpl ?? fetch };
-}
 
 async function backlogRequest(
   path: string,
   init: RequestInit,
   deps?: BacklogDeps,
 ): Promise<Response> {
-  const { connection, fetchImpl } = resolveDeps(deps);
+  const connection = deps?.connection ?? getBacklogConnection();
+  if (!connection) {
+    throw new Error(
+      "Backlog is not connected. Set the Backlog server URL and token first.",
+    );
+  }
+  const fetchImpl = deps?.fetchImpl ?? fetch;
   const base = connection.baseUrl.replace(/\/+$/, "");
   const response = await fetchImpl(`${base}${path}`, {
     ...init,
@@ -133,7 +126,8 @@ export function backlogTaskToProjectIssue(
   const createdAt = isoToUnixSeconds(task.createdDate, 0);
   return {
     id: `${BACKLOG_ISSUE_ID_PREFIX}${task.id}`,
-    title: `${task.displayId} ${task.title}`.trim(),
+    displayId: task.displayId,
+    title: task.title,
     content: task.description ?? "",
     tags: [],
     author: task.assignee?.name ?? "",
