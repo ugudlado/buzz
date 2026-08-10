@@ -94,6 +94,45 @@ function buildProjectPatchTemplate({
 
 export { buildProjectPatchTemplate };
 
+/**
+ * Rebuilds a repository announcement with one named tag replaced (or removed
+ * when `replacementTag` is null), preserving every other tag verbatim.
+ */
+function buildRepositoryTagPatchTemplate({
+  ownerAction,
+  ownerPubkey,
+  replacementTag,
+  repository,
+  tagName,
+}: {
+  ownerAction: string;
+  ownerPubkey: string;
+  replacementTag: string[] | null;
+  repository: Repository;
+  tagName: string;
+}): ProjectEventTemplate {
+  if (ownerPubkey.trim().toLowerCase() !== repository.owner.toLowerCase()) {
+    throw new Error(`Only the repository owner can ${ownerAction}.`);
+  }
+  if (!repository.eventTags) {
+    throw new Error(
+      "Repository metadata is unavailable. Refresh and try again.",
+    );
+  }
+
+  const tags = repository.eventTags
+    .filter((tag) => tag[0] !== tagName)
+    .map((tag) => [...tag]);
+  if (replacementTag) {
+    tags.push(replacementTag);
+  }
+  return {
+    kind: KIND_REPO_ANNOUNCEMENT,
+    content: repository.eventContent ?? repository.description,
+    tags,
+  };
+}
+
 export function buildRepositoryChannelBindingTemplate({
   channelId,
   ownerPubkey,
@@ -104,28 +143,16 @@ export function buildRepositoryChannelBindingTemplate({
   repository: Repository;
 }): ProjectEventTemplate {
   const normalizedChannelId = channelId.trim();
-  if (ownerPubkey.trim().toLowerCase() !== repository.owner.toLowerCase()) {
-    throw new Error("Only the repository owner can repair its access.");
-  }
   if (!isValidProjectChannelId(normalizedChannelId)) {
     throw new Error("Repository access channel is invalid.");
   }
-  if (!repository.eventTags) {
-    throw new Error(
-      "Repository metadata is unavailable. Refresh and try again.",
-    );
-  }
-
-  return {
-    kind: KIND_REPO_ANNOUNCEMENT,
-    content: repository.eventContent ?? repository.description,
-    tags: [
-      ...repository.eventTags
-        .filter((tag) => tag[0] !== "buzz-channel")
-        .map((tag) => [...tag]),
-      ["buzz-channel", normalizedChannelId],
-    ],
-  };
+  return buildRepositoryTagPatchTemplate({
+    ownerAction: "repair its access",
+    ownerPubkey,
+    replacementTag: ["buzz-channel", normalizedChannelId],
+    repository,
+    tagName: "buzz-channel",
+  });
 }
 
 /**
@@ -141,29 +168,19 @@ export function buildRepositoryIssueTrackerTemplate({
   ownerPubkey: string;
   repository: Repository;
 }): ProjectEventTemplate {
-  if (ownerPubkey.trim().toLowerCase() !== repository.owner.toLowerCase()) {
-    throw new Error("Only the repository owner can change its issue tracker.");
-  }
-  if (!repository.eventTags) {
-    throw new Error(
-      "Repository metadata is unavailable. Refresh and try again.",
-    );
-  }
   if (issueTracker.kind === "backlog" && !issueTracker.project.trim()) {
     throw new Error("A Backlog project id is required.");
   }
-
-  const tags = repository.eventTags
-    .filter((tag) => tag[0] !== "buzz-issue-tracker")
-    .map((tag) => [...tag]);
-  if (issueTracker.kind === "backlog") {
-    tags.push(["buzz-issue-tracker", "backlog", issueTracker.project.trim()]);
-  }
-  return {
-    kind: KIND_REPO_ANNOUNCEMENT,
-    content: repository.eventContent ?? repository.description,
-    tags,
-  };
+  return buildRepositoryTagPatchTemplate({
+    ownerAction: "change its issue tracker",
+    ownerPubkey,
+    replacementTag:
+      issueTracker.kind === "backlog"
+        ? ["buzz-issue-tracker", "backlog", issueTracker.project.trim()]
+        : null,
+    repository,
+    tagName: "buzz-issue-tracker",
+  });
 }
 
 export type AddedRepositoryEventTemplatesFromHead = {
