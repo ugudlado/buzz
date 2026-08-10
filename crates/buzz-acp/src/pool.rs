@@ -1174,12 +1174,14 @@ async fn create_session_and_apply_model(
         && agent_supports_mode(&resp.raw, ctx.permission_mode.as_wire_str())
     {
         apply_permission_mode(&mut agent.acp, &resp.session_id, &ctx.permission_mode).await?;
-        // Record the mode on the client so a stray session/request_permission
-        // (e.g. the adapter only partially honors set_config_option) is
-        // handled per-mode rather than always rejected — see
-        // `AcpClient::handle_permission_request`.
-        agent.acp.set_permission_mode(ctx.permission_mode);
     }
+    // Record the configured mode unconditionally — not just when the agent
+    // advertises it. Adapters that don't support set_config_option at all
+    // (e.g. cursor-agent) still issue session/request_permission per tool
+    // call; without the recorded mode those were always rejected, so a
+    // dontAsk agent had every shell command denied. See
+    // `AcpClient::handle_permission_request`.
+    agent.acp.set_permission_mode(ctx.permission_mode);
 
     Ok(resp.session_id)
 }
