@@ -1,9 +1,10 @@
 import { useChannelMembersQuery } from "@/features/channels/hooks";
 import type { ChannelMember } from "@/shared/api/types";
+import { truncatePubkey } from "@/shared/lib/pubkey";
 import { SearchCombobox } from "@/shared/ui/search-combobox";
 
 function memberLabel(member: ChannelMember): string {
-  return member.displayName?.trim() || member.pubkey.slice(0, 12);
+  return member.displayName?.trim() || truncatePubkey(member.pubkey);
 }
 
 type AgentComboboxProps = {
