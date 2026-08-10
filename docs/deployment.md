@@ -16,6 +16,16 @@ just dev       # relay (ws://localhost:3000) + desktop app together
 Split terminals: `just relay` + `just desktop-dev`. See
 [README § Quick start](../README.md#quick-start).
 
+**Testing relay-coupled features (workflows, assign-to-agent, agent steps):
+always run against the local dev relay** (`ws://localhost:3000`, the default
+for `just dev` and the Buzz Dev debug app). `just staging` / `just production`
+and installed release builds point at remote relays that may not run your
+branch's relay-side code yet — the feature will silently no-op there. After
+pulling or merging relay changes, restart the relay (`just relay` rebuilds)
+**and** restart managed agents: `buzz-acp` caches the relay's signing pubkey
+at startup, so a relay restart with a changed key silently desyncs running
+agents.
+
 Postgres/Redis: to use your own instances (e.g. Homebrew) instead of the
 docker compose containers, set `BUZZ_EXTERNAL_POSTGRES=1` and/or
 `BUZZ_EXTERNAL_REDIS=1` in `.env` — `just` recipes then skip starting and
