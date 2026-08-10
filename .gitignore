@@ -13,6 +13,9 @@ __pycache__/
 # orchestrator vendored config pull (machine-local)
 .orchestrator/
 
+# orchestrator feature worktrees (WORKTREE_BASE_DIR)
+.worktrees/
+
 # Environment files (may contain secrets)
 .env
 .env.local
