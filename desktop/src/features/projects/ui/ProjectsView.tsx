@@ -802,6 +802,7 @@ export function ProjectsView() {
           // Land on the complete project list after creation.
           handleRepositoryScopeChange("all");
           handleFilterChange("projects");
+          return result;
         }}
         onOpenChange={setCreateProjectOpen}
         open={createProjectOpen}
