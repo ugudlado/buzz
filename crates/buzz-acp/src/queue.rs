@@ -1421,10 +1421,12 @@ pub struct FormatPromptArgs<'a> {
     /// Defaults to `false` so a caller that never sets it behaves as if this
     /// were the session's first message.
     pub standing_context_sent: bool,
+    /// Rendered `[Project]` metadata section for legacy agents.
+    pub agent_project: Option<&'a str>,
 }
 
 /// The prompt sections that do not change for the life of a session: base
-/// prompt, persona, team instructions, core memory, and channel canvas.
+/// prompt, persona, team instructions, core memory, project, and channel canvas.
 ///
 /// Protocol-v2 agents receive all of this through the system role at
 /// `session/new`, once. Legacy agents (`protocol_version < 2`) have no system
@@ -1441,13 +1443,14 @@ pub(crate) struct StandingContext<'a> {
     pub system_prompt: Option<&'a str>,
     pub team_instructions: Option<&'a str>,
     pub agent_core: Option<&'a str>,
+    pub agent_project: Option<&'a str>,
     pub agent_canvas: Option<&'a str>,
 }
 
 impl StandingContext<'_> {
     /// Render the sections in the order legacy agents have always seen them.
     pub(crate) fn sections(&self) -> Vec<String> {
-        let mut sections = Vec::with_capacity(5);
+        let mut sections = Vec::with_capacity(6);
         if let Some(bp) = self.base_prompt {
             sections.push(base_section(bp));
         }
@@ -1463,6 +1466,9 @@ impl StandingContext<'_> {
         }
         if let Some(core) = self.agent_core {
             sections.push(core.to_string());
+        }
+        if let Some(project) = self.agent_project {
+            sections.push(project.to_string());
         }
         if let Some(canvas) = self.agent_canvas {
             sections.push(canvas.to_string());
@@ -1532,6 +1538,7 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
                 system_prompt: args.system_prompt,
                 team_instructions: args.team_instructions,
                 agent_core: args.agent_core,
+                agent_project: args.agent_project,
                 agent_canvas: args.agent_canvas,
             }
             .sections(),
