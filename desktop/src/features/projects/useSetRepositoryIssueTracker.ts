@@ -1,19 +1,13 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 
-import {
-  type Project,
-  projectsQueryKey,
-  type Repository,
-} from "@/features/projects/hooks";
-import {
-  eventToRepository,
-  type RepositoryIssueTracker,
-} from "@/features/projects/projectModels";
+import type { Repository } from "@/features/projects/hooks";
+import type { RepositoryIssueTracker } from "@/features/projects/projectModels";
 import { buildRepositoryIssueTrackerTemplate } from "@/features/projects/projectRepositoryCreation";
-import { relayClient } from "@/shared/api/relayClient";
-import { signRelayEvent } from "@/shared/api/tauri";
+import {
+  replaceRepositoryInProjectsCache,
+  republishRepositoryAnnouncement,
+} from "@/features/projects/repositoryAnnouncementMutation";
 import { getIdentity } from "@/shared/api/tauriIdentity";
-import { getCachedRelayOrigin } from "@/shared/lib/mediaUrl";
 
 type SetRepositoryIssueTrackerInput = {
   issueTracker: RepositoryIssueTracker;
@@ -25,29 +19,17 @@ async function setRepositoryIssueTracker({
   repository,
 }: SetRepositoryIssueTrackerInput): Promise<Repository> {
   const identity = await getIdentity();
-  const template = buildRepositoryIssueTrackerTemplate({
-    issueTracker,
-    ownerPubkey: identity.pubkey,
+  return republishRepositoryAnnouncement({
+    template: buildRepositoryIssueTrackerTemplate({
+      issueTracker,
+      ownerPubkey: identity.pubkey,
+      repository,
+    }),
     repository,
+    timeoutMessage: "Timed out updating the issue tracker.",
+    failureMessage: "Failed to update the issue tracker.",
+    unreadableMessage: "The issue tracker was updated but could not be read.",
   });
-  const event = await signRelayEvent({
-    ...template,
-    createdAt: Math.max(
-      Math.floor(Date.now() / 1_000),
-      repository.createdAt + 1,
-    ),
-  });
-  await relayClient.publishEvent(
-    event,
-    "Timed out updating the issue tracker.",
-    "Failed to update the issue tracker.",
-  );
-
-  const updated = eventToRepository(event, getCachedRelayOrigin());
-  if (!updated) {
-    throw new Error("The issue tracker was updated but could not be read.");
-  }
-  return updated;
 }
 
 export function useSetRepositoryIssueTrackerMutation() {
@@ -55,17 +37,7 @@ export function useSetRepositoryIssueTrackerMutation() {
   return useMutation({
     mutationFn: setRepositoryIssueTracker,
     onSuccess: (repository) => {
-      queryClient.setQueryData<Project[]>(projectsQueryKey, (current = []) =>
-        current.map((project) => ({
-          ...project,
-          repositories: project.repositories.map((candidate) =>
-            candidate.repoAddress === repository.repoAddress
-              ? repository
-              : candidate,
-          ),
-        })),
-      );
-      void queryClient.invalidateQueries({ queryKey: projectsQueryKey });
+      replaceRepositoryInProjectsCache(queryClient, repository);
       void queryClient.invalidateQueries({
         queryKey: ["projects", "work-items"],
       });
