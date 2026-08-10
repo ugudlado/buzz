@@ -16,6 +16,13 @@ just dev       # relay (ws://localhost:3000) + desktop app together
 Split terminals: `just relay` + `just desktop-dev`. See
 [README § Quick start](../README.md#quick-start).
 
+Postgres/Redis: to use your own instances (e.g. Homebrew) instead of the
+docker compose containers, set `BUZZ_EXTERNAL_POSTGRES=1` and/or
+`BUZZ_EXTERNAL_REDIS=1` in `.env` — `just` recipes then skip starting and
+health-waiting that service. Point `DATABASE_URL`/`REDIS_URL` at your
+instance (the default `buzz:buzz_dev@localhost:5432/buzz` role/db must
+exist). Unset, docker compose spins them up as before.
+
 ### Desktop app — local build
 
 Full unsigned bundle (release profile, same shape CI produces):
