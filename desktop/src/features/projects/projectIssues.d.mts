@@ -18,6 +18,8 @@ export type ProjectIssueComment = {
 
 export type ProjectIssue = {
   id: string;
+  /** Human-facing short id (e.g. Backlog "ORC-12"); falls back to id prefix. */
+  displayId?: string;
   title: string;
   content: string;
   tags: string[][];

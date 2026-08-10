@@ -132,7 +132,7 @@ function IssueRow({
           ) : null}
           <ProjectFeedRowCluster>
             <ProjectFeedRowMonoCell
-              label={`#${issue.id.slice(0, 8)}`}
+              label={`#${issue.displayId ?? issue.id.slice(0, 8)}`}
               onClick={onOpen}
               title="View issue"
             />
@@ -206,7 +206,7 @@ export function ProjectIssueDetail({
             <h3 className="mt-1 line-clamp-2 text-base font-semibold text-foreground">
               {issue.title}{" "}
               <span className="font-normal text-muted-foreground">
-                #{issue.id.slice(0, 8)}
+                #{issue.displayId ?? issue.id.slice(0, 8)}
               </span>
             </h3>
           </div>

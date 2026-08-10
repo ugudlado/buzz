@@ -8,7 +8,6 @@ import {
   createBacklogIssue,
   createBacklogIssueComment,
   fetchBacklogIssuesForRepos,
-  isBacklogIssueId,
 } from "./backlogIssues.ts";
 
 const CONNECTION = { baseUrl: "http://localhost:4321/", token: "bklg_test" };
@@ -54,9 +53,9 @@ test("status mapping covers the default backlog ramp", () => {
 test("task maps to ProjectIssue with a synthetic id", () => {
   const issue = backlogTaskToProjectIssue(TASK, REPO_A);
   assert.equal(issue.id, "backlog:task-1");
-  assert.ok(isBacklogIssueId(issue.id));
   assert.equal(backlogTaskIdFromIssueId(issue.id), "task-1");
-  assert.equal(issue.title, "ORC-12 Fix the thing");
+  assert.equal(issue.displayId, "ORC-12");
+  assert.equal(issue.title, "Fix the thing");
   assert.equal(issue.content, "It is broken.");
   assert.equal(issue.status, "In Progress");
   assert.equal(issue.repoAddress, REPO_A);
@@ -114,7 +113,7 @@ test("missing connection rejects with a clear error", async () => {
   await assert.rejects(
     fetchBacklogIssuesForRepos(
       [{ repoAddress: REPO_A, backlogProject: "guid-1" }],
-      { connection: null },
+      {},
     ),
     /Backlog is not connected/,
   );
