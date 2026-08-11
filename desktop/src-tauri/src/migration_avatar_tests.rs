@@ -1,4 +1,5 @@
 use super::*;
+use crate::managed_agents::ManagedAgentRecordExt;
 
 #[test]
 fn refresh_builtin_agent_avatars_updates_seeded_values_and_preserves_customizations() {

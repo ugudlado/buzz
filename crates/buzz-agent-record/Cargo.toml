@@ -1,0 +1,11 @@
+[package]
+name = "buzz-agent-record"
+version = "0.1.0"
+edition = "2021"
+description = "Shared ManagedAgentRecord and buzz-agent-snapshot types for Buzz Desktop and buzz-cli"
+license = "Apache-2.0"
+repository = "https://github.com/block/buzz"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

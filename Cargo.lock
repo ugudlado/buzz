@@ -881,6 +881,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "buzz-agent-record"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "buzz-audit"
 version = "0.1.0"
 dependencies = [
@@ -942,6 +950,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
+ "buzz-agent-record",
  "buzz-core",
  "buzz-persona",
  "buzz-sdk",

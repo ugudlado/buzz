@@ -7,7 +7,7 @@ use std::path::Path;
 
 use crate::managed_agents::{
     persona_events::{persona_content_hash, persona_event_content},
-    ManagedAgentRecord,
+    ManagedAgentRecord, ManagedAgentRecordExt,
 };
 
 /// Manufacture definitions for standalone agents (B5 backfill).

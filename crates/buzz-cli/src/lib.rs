@@ -262,6 +262,31 @@ impl RespondToArg {
 
 #[derive(Subcommand)]
 pub enum AgentsCmd {
+    /// Import a `buzz-agent-snapshot v1` (`.agent.json`) file directly into
+    /// Buzz Desktop's local agent store, bypassing the desktop UI's Import
+    /// dialog.
+    #[command(
+        after_help = "Buzz Desktop must be fully quit before running this command — it owns \
+managed-agents.json and rewrites it on launch, which would silently discard the import. On the \
+imported agent's next start, the desktop app publishes its kind:30177 identity event and kind:0 \
+profile automatically (same boot-time reconcile as a hand-edited store); this command does no \
+relay I/O itself.\n\n\
+Only the JSON `.agent.json` format is supported — not the `.agent.png` trading-card variant, and \
+not locked/encrypted snapshot envelopes. Memory entries and avatar images in the snapshot are not \
+imported; the agent starts with no memory and no avatar.\n\n\
+Example:\n  buzz agents import ./teamlead.agent.json"
+    )]
+    Import {
+        /// Path to a `buzz-agent-snapshot v1` `.agent.json` file
+        file: std::path::PathBuf,
+        /// Override the resolved managed-agents.json directory (default:
+        /// this machine's Buzz Desktop app-data dir for --identifier)
+        #[arg(long)]
+        store_dir: Option<std::path::PathBuf>,
+        /// Tauri bundle identifier whose app-data dir to target
+        #[arg(long, default_value = "xyz.block.buzz.app")]
+        identifier: String,
+    },
     /// Open a prefilled create-agent form in the owner's Buzz Desktop
     DraftCreate {
         /// Current channel UUID; the new agent is added here after save
@@ -2169,6 +2194,7 @@ mod tests {
                 "archived",
                 "draft-create",
                 "draft-update",
+                "import",
                 "unarchive"
             ]
         );
@@ -2307,7 +2333,7 @@ mod tests {
     #[test]
     fn subcommand_counts_are_stable() {
         let expected: Vec<(&str, usize)> = vec![
-            ("agents", 5),
+            ("agents", 6),
             ("canvas", 2),
             ("channels", 16),
             ("dms", 4),

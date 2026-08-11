@@ -66,6 +66,10 @@ infer = "0.19"
 # URL parsing — extract server domain for Blossom auth tag
 url = { workspace = true }
 
+# Shared ManagedAgentRecord / buzz-agent-snapshot types with Buzz Desktop —
+# `agents import` writes a real record into managed-agents.json.
+buzz-agent-record = { path = "../buzz-agent-record" }
+
 # Persona pack parsing, validation, and resolution
 buzz-persona = { path = "../buzz-persona" }
 

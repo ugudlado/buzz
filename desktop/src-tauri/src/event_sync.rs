@@ -99,7 +99,7 @@ fn migrate_personas_in_dir_at(
     use crate::managed_agents::{
         persona_events::{build_persona_event, monotonic_created_at, persona_d_tag},
         retention::{get_retained_event, open_retention_db, retain_event, RetainedEvent},
-        AgentDefinition,
+        AgentDefinition, ManagedAgentRecordExt,
     };
     use buzz_core_pkg::kind::KIND_PERSONA;
     use nostr::JsonUtil;

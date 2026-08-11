@@ -29,7 +29,7 @@ use std::path::Path;
 
 use crate::managed_agents::{
     persona_events::{persona_content_hash, persona_event_content},
-    ManagedAgentRecord,
+    ManagedAgentRecord, ManagedAgentRecordExt,
 };
 
 /// The exact producer boundary emitted by the removed `compose_prompt()`.

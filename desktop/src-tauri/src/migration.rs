@@ -710,7 +710,7 @@ fn uploaded_media_sha256(avatar_url: &str) -> Option<String> {
 fn persona_version_from_record(record: &serde_json::Value) -> Option<String> {
     let record: crate::managed_agents::ManagedAgentRecord =
         serde_json::from_value(record.clone()).ok()?;
-    let definition = record.to_definition_view()?;
+    let definition = crate::managed_agents::ManagedAgentRecordExt::to_definition_view(&record)?;
     Some(crate::managed_agents::persona_events::persona_content_hash(
         &crate::managed_agents::persona_events::persona_event_content(&definition),
     ))
