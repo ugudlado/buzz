@@ -973,6 +973,19 @@ mod tests {
     }
 
     #[test]
+    fn manual_trigger_serde_yaml_round_trip() {
+        let trigger = TriggerDef::Manual;
+        let yaml_1 = serde_yaml::to_string(&trigger).unwrap();
+        let reparsed: TriggerDef = serde_yaml::from_str(&yaml_1).unwrap();
+        assert!(matches!(reparsed, TriggerDef::Manual));
+        let yaml_2 = serde_yaml::to_string(&reparsed).unwrap();
+        assert_eq!(
+            yaml_1, yaml_2,
+            "serialize -> deserialize -> re-serialize must produce byte-identical YAML text"
+        );
+    }
+
+    #[test]
     fn parse_assign_to_agent_action() {
         let yaml = concat!(
             "name: Assign Agent\ntrigger:\n  on: webhook\n",
