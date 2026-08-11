@@ -65,6 +65,9 @@ pub enum TriggerDef {
     },
     /// Fires when HTTP POST arrives at `/hooks/{id}`.
     Webhook,
+    /// No automatic trigger — runs only via explicit manual invocation
+    /// (e.g. `buzz workflows trigger`).
+    Manual,
 }
 
 /// A single step in a workflow definition.
@@ -378,6 +381,23 @@ mod tests {
             }
             other => panic!("unexpected trigger: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_manual_trigger_round_trips() {
+        let yaml = "name: Manual Run\ntrigger:\n  on: manual\nsteps:\n  - id: s1\n    action: send_message\n    text: hi\n";
+        let (def, json) = parse_yaml(yaml).expect("parse failed");
+        assert!(matches!(def.trigger, TriggerDef::Manual));
+
+        let reparsed: WorkflowDef = serde_json::from_str(&json).expect("json round-trip");
+        assert!(matches!(reparsed.trigger, TriggerDef::Manual));
+    }
+
+    #[test]
+    fn parse_webhook_trigger_still_deserializes_unchanged() {
+        let yaml = "name: Hook\ntrigger:\n  on: webhook\nsteps:\n  - id: s1\n    action: send_message\n    text: hi\n";
+        let (def, _) = parse_yaml(yaml).expect("parse failed");
+        assert!(matches!(def.trigger, TriggerDef::Webhook));
     }
 
     #[test]
