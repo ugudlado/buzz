@@ -1317,8 +1317,8 @@ fn trigger_matches_event(trigger: &TriggerDef, kind_u32: u32) -> bool {
         TriggerDef::MessagePosted { .. } => kind_u32 == KIND_STREAM_MESSAGE,
         TriggerDef::ReactionAdded { .. } => kind_u32 == KIND_REACTION,
         TriggerDef::DiffPosted { .. } => kind_u32 == KIND_STREAM_MESSAGE_DIFF,
-        // Schedule and Webhook triggers are not fired by channel events.
-        TriggerDef::Schedule { .. } | TriggerDef::Webhook => false,
+        // Non-event-driven triggers are not fired by channel events.
+        TriggerDef::Schedule { .. } | TriggerDef::Webhook | TriggerDef::Manual => false,
     }
 }
 
@@ -1750,6 +1750,24 @@ steps:
         assert!(!trigger_matches_event(
             &trigger,
             buzz_core::kind::KIND_STREAM_MESSAGE
+        ));
+        assert!(!trigger_matches_event(&trigger, 0));
+    }
+
+    #[test]
+    fn manual_trigger_never_matches_events() {
+        let trigger = TriggerDef::Manual;
+        assert!(!trigger_matches_event(
+            &trigger,
+            buzz_core::kind::KIND_STREAM_MESSAGE
+        ));
+        assert!(!trigger_matches_event(
+            &trigger,
+            buzz_core::kind::KIND_REACTION
+        ));
+        assert!(!trigger_matches_event(
+            &trigger,
+            buzz_core::kind::KIND_STREAM_MESSAGE_DIFF
         ));
         assert!(!trigger_matches_event(&trigger, 0));
     }
