@@ -976,6 +976,11 @@ mod tests {
     fn manual_trigger_serde_yaml_round_trip() {
         let trigger = TriggerDef::Manual;
         let yaml_1 = serde_yaml::to_string(&trigger).unwrap();
+        // Pin the concrete wire text, not just internal self-consistency —
+        // this is what actually catches the serde tag drifting to a wrong
+        // (but still self-consistent) value, unlike a bare yaml_1 == yaml_2
+        // check.
+        assert_eq!(yaml_1.trim_end(), "on: manual");
         let reparsed: TriggerDef = serde_yaml::from_str(&yaml_1).unwrap();
         assert!(matches!(reparsed, TriggerDef::Manual));
         let yaml_2 = serde_yaml::to_string(&reparsed).unwrap();
