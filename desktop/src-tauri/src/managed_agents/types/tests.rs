@@ -1,4 +1,4 @@
-use super::{AgentDefinition, CatalogSource, ManagedAgentRecord};
+use super::{AgentDefinition, CatalogSource, ManagedAgentRecord, ManagedAgentRecordExt};
 use std::path::PathBuf;
 
 #[test]

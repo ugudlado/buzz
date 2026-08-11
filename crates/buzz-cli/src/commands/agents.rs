@@ -1,6 +1,11 @@
+use buzz_agent_record::{
+    validate_respond_to_allowlist, ManagedAgentRecord, RespondTo, DEFAULT_ACP_COMMAND,
+    DEFAULT_AGENT_PARALLELISM,
+};
 use buzz_core::kind::KIND_IA_ARCHIVED_LIST;
 use buzz_sdk::builders::{build_archive_identity_request, build_unarchive_identity_request};
-use nostr::PublicKey;
+use buzz_sdk::nip_oa::compute_auth_tag;
+use nostr::{PublicKey, ToBech32};
 use serde_json::json;
 
 use crate::agent_management::{build_create, build_update, CreateAgentDraft, UpdateAgentDraft};
@@ -11,6 +16,12 @@ use crate::{AgentsCmd, RespondToArg};
 
 pub async fn dispatch(command: AgentsCmd, client: &BuzzClient) -> Result<(), CliError> {
     match command {
+        AgentsCmd::Import {
+            file,
+            store_dir,
+            identifier,
+        } => import_agent(client, &file, store_dir.as_deref(), &identifier),
+
         AgentsCmd::DraftCreate {
             channel,
             display_name,
@@ -165,6 +176,278 @@ pub async fn dispatch(command: AgentsCmd, client: &BuzzClient) -> Result<(), Cli
 
         AgentsCmd::Archived => cmd_archived(client).await,
     }
+}
+
+// ── `agents import` ──────────────────────────────────────────────────────────
+
+/// Import a `buzz-agent-snapshot v1` JSON manifest directly into Buzz
+/// Desktop's local `managed-agents.json`, mirroring what the desktop app's
+/// Import dialog does for a `.agent.json` file, minus the pieces that need a
+/// live desktop process (relay publish, avatar upload, memory restore — see
+/// the command's `after_help`).
+///
+/// The signing key configured for this CLI invocation (`BUZZ_PRIVATE_KEY`)
+/// is treated as the owner identity — the same identity Buzz Desktop runs
+/// as on this machine — and is used only to compute the new agent's NIP-OA
+/// auth tag. No event is signed or sent to any relay.
+fn import_agent(
+    client: &BuzzClient,
+    file: &std::path::Path,
+    store_dir: Option<&std::path::Path>,
+    identifier: &str,
+) -> Result<(), CliError> {
+    let bytes = std::fs::read(file)
+        .map_err(|e| CliError::Usage(format!("cannot read {}: {e}", file.display())))?;
+
+    if file
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .map(|ext| !ext.eq_ignore_ascii_case("json"))
+        .unwrap_or(true)
+    {
+        return Err(CliError::Usage(format!(
+            "{} does not look like a .agent.json file — only the JSON snapshot format is \
+             supported by `agents import` (not .agent.png)",
+            file.display()
+        )));
+    }
+
+    let snapshot: buzz_agent_record::AgentSnapshot = serde_json::from_slice(&bytes)
+        .map_err(|e| CliError::Usage(format!("not a valid agent snapshot manifest: {e}")))?;
+
+    if snapshot.format != buzz_agent_record::FORMAT_DISCRIMINATOR {
+        return Err(CliError::Usage(format!(
+            "unrecognized snapshot format '{}' (expected '{}')",
+            snapshot.format,
+            buzz_agent_record::FORMAT_DISCRIMINATOR
+        )));
+    }
+    if snapshot.version != buzz_agent_record::FORMAT_VERSION {
+        return Err(CliError::Usage(format!(
+            "unsupported snapshot version {} (this build supports v{})",
+            snapshot.version,
+            buzz_agent_record::FORMAT_VERSION
+        )));
+    }
+    if snapshot.memory.level == buzz_agent_record::MemoryLevel::None
+        && !snapshot.memory.entries.is_empty()
+    {
+        return Err(CliError::Usage(
+            "snapshot is malformed: memory.level is 'none' but entries are present".into(),
+        ));
+    }
+    if !snapshot.memory.entries.is_empty() {
+        eprintln!(
+            "buzz agents import: warning: snapshot carries {} memory entries — \
+             `agents import` does not restore memory; the agent starts with none.",
+            snapshot.memory.entries.len()
+        );
+    }
+
+    let display_name = snapshot.profile.display_name.trim().to_string();
+    if display_name.is_empty() {
+        return Err(CliError::Usage("snapshot display name is empty".into()));
+    }
+
+    let store_path = resolve_store_path(store_dir, identifier)?;
+    refuse_if_desktop_running()?;
+
+    let existing: Vec<ManagedAgentRecord> = if store_path.exists() {
+        let content = std::fs::read_to_string(&store_path).map_err(|e| {
+            CliError::Other(format!("failed to read {}: {e}", store_path.display()))
+        })?;
+        serde_json::from_str(&content).map_err(|e| {
+            CliError::Other(format!(
+                "{} is not valid JSON — refusing to write over a store this build cannot \
+                 parse (desktop's own malformed-store guard did not fire because this is the \
+                 CLI path): {e}",
+                store_path.display()
+            ))
+        })?
+    } else {
+        Vec::new()
+    };
+
+    let respond_to = match snapshot.definition.respond_to.as_deref() {
+        Some(wire) => Some(
+            RespondTo::parse_wire(wire)
+                .map_err(|e| CliError::Usage(format!("snapshot respond_to: {e}")))?,
+        ),
+        None => None,
+    };
+    let allowlist = validate_respond_to_allowlist(&snapshot.definition.respond_to_allowlist)
+        .map_err(|e| CliError::Usage(format!("snapshot respond_to_allowlist: {e}")))?;
+    if respond_to == Some(RespondTo::Allowlist) && allowlist.is_empty() {
+        return Err(CliError::Usage(
+            "snapshot respond-to mode is 'allowlist' but the allowlist is empty — cannot \
+             import: no pubkeys to grant access to"
+                .into(),
+        ));
+    }
+    if !allowlist.is_empty() {
+        eprintln!(
+            "buzz agents import: warning: snapshot's respond-to allowlist came from a \
+             different environment and is meaningless here; importing it unchanged. Edit the \
+             agent's allowlist in Buzz Desktop after import if needed."
+        );
+    }
+    let parallelism = snapshot
+        .definition
+        .parallelism
+        .filter(|count| (1..=32).contains(count))
+        .unwrap_or(DEFAULT_AGENT_PARALLELISM);
+
+    let owner_keys = client.keys();
+    let agent_keys = nostr::Keys::generate();
+    let pubkey = agent_keys.public_key().to_hex();
+    if existing.iter().any(|r| r.pubkey == pubkey) {
+        return Err(CliError::Other(format!(
+            "generated pubkey {pubkey} already exists in the store — retry"
+        )));
+    }
+    let private_key_nsec = agent_keys
+        .secret_key()
+        .to_bech32()
+        .map_err(|e| CliError::Other(format!("failed to encode agent private key: {e}")))?;
+    let auth_tag = compute_auth_tag(owner_keys, &agent_keys.public_key(), "")
+        .map_err(|e| CliError::Other(format!("failed to compute NIP-OA auth tag: {e}")))?;
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let record = ManagedAgentRecord {
+        pubkey: pubkey.clone(),
+        name: display_name.clone(),
+        persona_id: None,
+        team_id: None,
+        // Inline for now — desktop's `hydrate_keys` migrates this into the OS
+        // keyring and blanks it here on the agent's first load, exactly as it
+        // does for any record whose key arrives via the keyring-unreachable
+        // fallback path. No keyring access is required from the CLI.
+        private_key_nsec,
+        auth_tag: Some(auth_tag),
+        relay_url: String::new(),
+        avatar_url: snapshot
+            .profile
+            .avatar_url
+            .clone()
+            .or(snapshot.profile.avatar_data_url.clone()),
+        acp_command: DEFAULT_ACP_COMMAND.to_string(),
+        agent_command: String::new(),
+        agent_command_override: None,
+        agent_args: Vec::new(),
+        mcp_command: String::new(),
+        turn_timeout_seconds: 0,
+        idle_timeout_seconds: snapshot.definition.idle_timeout_seconds,
+        max_turn_duration_seconds: snapshot.definition.max_turn_duration_seconds,
+        parallelism,
+        system_prompt: snapshot.definition.system_prompt.clone(),
+        model: snapshot.definition.model.clone(),
+        provider: snapshot.definition.provider.clone(),
+        persona_source_version: None,
+        env_vars: std::collections::BTreeMap::new(),
+        start_on_app_launch: false,
+        auto_restart_on_config_change: true,
+        runtime_pid: None,
+        backend: Default::default(),
+        backend_agent_id: None,
+        provider_binary_path: None,
+        persona_team_dir: None,
+        persona_name_in_team: None,
+        created_at: now.clone(),
+        updated_at: now,
+        last_started_at: None,
+        last_stopped_at: None,
+        last_exit_code: None,
+        last_error: None,
+        last_error_code: None,
+        respond_to: respond_to.unwrap_or_default(),
+        respond_to_allowlist: allowlist,
+        display_name: None,
+        slug: None,
+        runtime: snapshot.definition.runtime.clone(),
+        name_pool: snapshot.definition.name_pool.clone(),
+        is_builtin: false,
+        is_active: true,
+        shared: false,
+        source_team: None,
+        source_team_persona_slug: None,
+        catalog_source: None,
+        definition_respond_to: snapshot.definition.respond_to.clone(),
+        definition_respond_to_allowlist: snapshot.definition.respond_to_allowlist.clone(),
+        definition_parallelism: snapshot.definition.parallelism,
+        relay_mesh: None,
+    };
+
+    let mut records = existing;
+    records.push(record);
+    if let Some(parent) = store_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| CliError::Other(format!("failed to create {}: {e}", parent.display())))?;
+    }
+    let json = serde_json::to_string_pretty(&records)
+        .map_err(|e| CliError::Other(format!("failed to serialize agent store: {e}")))?;
+    std::fs::write(&store_path, json)
+        .map_err(|e| CliError::Other(format!("failed to write {}: {e}", store_path.display())))?;
+
+    println!(
+        "{}",
+        json!({
+            "pubkey": pubkey,
+            "name": display_name,
+            "store_path": store_path.display().to_string(),
+            "message": "Imported. Start Buzz Desktop to publish this agent's identity and \
+                        profile, then add it to a channel.",
+        })
+    );
+    Ok(())
+}
+
+/// Resolve `managed-agents.json`'s directory the same way Tauri's
+/// `app_data_dir()` would for `identifier` on this platform, unless
+/// overridden by `--store-dir`.
+fn resolve_store_path(
+    store_dir: Option<&std::path::Path>,
+    identifier: &str,
+) -> Result<std::path::PathBuf, CliError> {
+    let base = match store_dir {
+        Some(dir) => dir.to_path_buf(),
+        None => {
+            let data_dir = dirs::data_dir().ok_or_else(|| {
+                CliError::Other("could not resolve this platform's app-data directory".into())
+            })?;
+            data_dir.join(identifier)
+        }
+    };
+    Ok(base.join("agents").join("managed-agents.json"))
+}
+
+/// Refuse to run while Buzz Desktop is alive: it holds `managed-agents.json`
+/// in memory and rewrites it wholesale on several code paths (including
+/// boot-time reconcile), which would silently discard this import. There is
+/// no cross-process lock to share, so "the app must be quit" is the contract.
+#[cfg(target_os = "macos")]
+fn refuse_if_desktop_running() -> Result<(), CliError> {
+    let output = std::process::Command::new("pgrep")
+        .arg("-x")
+        .arg("buzz-desktop")
+        .output()
+        .map_err(|e| CliError::Other(format!("failed to check for a running desktop app: {e}")))?;
+    if output.status.success() && !output.stdout.is_empty() {
+        return Err(CliError::Usage(
+            "Buzz Desktop is running — quit it first. It rewrites managed-agents.json on \
+             launch and on several save paths, which would discard this import."
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn refuse_if_desktop_running() -> Result<(), CliError> {
+    // TODO: pgrep-equivalent process check for Linux/Windows when the desktop
+    // ships there under `agents import`. Until then this is a soft no-op —
+    // the store-corruption risk is unchanged from before this command existed
+    // (hand-editing the file while the app runs was always unsafe).
+    Ok(())
 }
 
 /// Require `BUZZ_AUTH_TAG` and parse the owner pubkey from it. Used only by

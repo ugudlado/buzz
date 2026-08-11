@@ -1,6 +1,6 @@
 use super::backfill_standalone_agents_in_dir;
 use crate::managed_agents::spawn_snapshot::prospective_spawn_config_snapshot;
-use crate::managed_agents::{AgentDefinition, ManagedAgentRecord};
+use crate::managed_agents::{AgentDefinition, ManagedAgentRecord, ManagedAgentRecordExt};
 use crate::migration::test_support::{read_agents_json, write_agents_json};
 use std::path::Path;
 

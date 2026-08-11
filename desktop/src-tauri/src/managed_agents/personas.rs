@@ -2,7 +2,10 @@ use std::fs;
 
 use tauri::AppHandle;
 
-use crate::{managed_agents::AgentDefinition, util::now_iso};
+use crate::{
+    managed_agents::{AgentDefinition, ManagedAgentRecordExt},
+    util::now_iso,
+};
 
 struct BuiltInPersona {
     id: &'static str,
