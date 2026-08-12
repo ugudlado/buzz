@@ -20,6 +20,7 @@ import {
 import {
   availableRuntimesForStart,
   buildInstanceInputForDefinition,
+  runtimeCatalogForStart,
   type BackendIntent,
 } from "./lib/instanceInputForDefinition";
 import { useCreatedAgentChannelAttachment } from "./useCreatedAgentChannelAttachment";
@@ -186,12 +187,18 @@ export function useAgentManagement() {
     setError(null);
     try {
       assertAgentCanActFromOrigin(request.request.channelId);
-      const runtimes = await availableRuntimesForStart(runtimesQuery);
+      const runtimes = backendIntent
+        ? await runtimeCatalogForStart(runtimesQuery)
+        : await availableRuntimesForStart(runtimesQuery);
       const runtime = runtimes.find(
         (candidate) => candidate.id === input.runtime,
       );
       if (!runtime) {
-        throw new Error("Choose an available runtime for this agent.");
+        throw new Error(
+          backendIntent
+            ? "Choose a known runtime for this remote agent."
+            : "Choose an available runtime for this agent.",
+        );
       }
 
       const avatarUrl = await resolveManagedAgentAvatarUrl(

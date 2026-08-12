@@ -48,6 +48,13 @@ test("not-installed warning includes the install hint", () => {
   );
 });
 
+test("provider warning delegates availability validation to the remote", () => {
+  assert.equal(
+    runtimeAvailabilityWarning(entry({ label: "Hermes Agent" }), "provider"),
+    "Hermes Agent is not installed on this computer. The remote provider will verify it during deployment.",
+  );
+});
+
 test("empty install hint leaves no trailing space", () => {
   // Custom harnesses default installHint to "" — an unguarded template
   // would render "Amp is not installed. ".

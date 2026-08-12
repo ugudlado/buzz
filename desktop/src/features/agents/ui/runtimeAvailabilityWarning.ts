@@ -11,9 +11,13 @@ import type { AcpRuntimeCatalogEntry } from "@/shared/api/types";
  */
 export function runtimeAvailabilityWarning(
   runtime: AcpRuntimeCatalogEntry,
+  executionLocus: "local" | "provider" = "local",
 ): string | null {
   if (runtime.availability === "available") {
     return null;
+  }
+  if (executionLocus === "provider") {
+    return `${runtime.label} is not installed on this computer. The remote provider will verify it during deployment.`;
   }
   const hint = runtime.installHint.trim();
   const withHint = (base: string) => (hint ? `${base} ${hint}` : base);

@@ -112,6 +112,9 @@ run_unit_tests() {
   # the two lists must stay in step or the fallback silently covers less.
   run_test_step "buzz-backend-kubernetes tests" \
     cargo test -p buzz-backend-kubernetes -- --nocapture
+
+  run_test_step "buzz-backend-host tests" \
+    cargo test -p buzz-backend-host -- --nocapture
 }
 
 # ---- DB / integration tests (infra required) --------------------------------

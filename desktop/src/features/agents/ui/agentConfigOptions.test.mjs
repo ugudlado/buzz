@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  buildPersonaRuntimeDropdownOptions,
   getDefaultPersonaRuntime,
   getPersonaModelOptions,
   getPersonaProviderOptions,
@@ -133,6 +134,22 @@ test("getDefaultPersonaRuntime returns null when no runtime is available", () =>
     makeRuntime("goose", "cli_missing"),
   ];
   assert.equal(getDefaultPersonaRuntime(runtimes), null);
+});
+
+test("create enables remote-only runtimes only for provider execution", () => {
+  const runtimes = [makeRuntime("hermes", "not_installed")];
+  const options = (executionLocus) =>
+    buildPersonaRuntimeDropdownOptions({
+      defaultRuntimeId: "buzz-agent",
+      executionLocus,
+      isCreateMode: true,
+      runtime: "",
+      runtimes,
+      runtimesLoading: false,
+    }).runtimeDropdownOptions;
+
+  assert.equal(options("local")[0]?.disabled, true);
+  assert.notEqual(options("provider")[0]?.disabled, true);
 });
 
 // ── runtimeSupportsLlmProviderSelection — provider gating ────────────────────

@@ -119,7 +119,10 @@ with a TypeScript lookup table or an id comparison in a component.
    state includes required credentials as well as provider/model values. If no
    available harness can resolve, Create starts in Customize and lets unavailable
    catalog entries be selected only to expose their setup guidance; submission
-   remains blocked.
+   remains blocked for local execution. Provider-backed Create may select an
+   unavailable local catalog entry because the provider validates the harness
+   remotely; switching back to local restores the availability and readiness
+   gates.
    Advanced-only required credentials and incomplete remote **Run on** setup
    mark the collapsed Advanced toggle without opening it, and block incomplete
    saves.

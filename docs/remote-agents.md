@@ -1402,11 +1402,57 @@ deliberately baked out of v1 to preserve budget.
 
 ### Distribution
 
-Its own release workflow (macOS arm64/x64 + Linux musl; the sprig workflow's
-ubuntu × musl matrix cannot produce the laptop-side binary), artifacts
-attached to releases, installed to `~/.local/bin` (already on the discovery
-path). v1 ships no Windows binary [DECISION B]; desktop bundling into the
-.app (discovery already prepends the bundle dir) is deferred [DECISION D].
+The Kubernetes and Host provider binaries are bundled as Unix desktop
+sidecars and discovered beside the desktop executable. v1 ships neither
+provider on Windows; the Windows Tauri config removes both external binaries.
+The Host provider must additionally be installed on the target server from the
+same release because its `remote-deploy` mode owns the systemd binding there.
+
+## The Host Binding (`buzz-backend-host`)
+
+The Host provider runs the same `buzz-acp` launch contract on an existing
+Linux server. The desktop invokes its bundled provider locally; that provider
+uses the system `ssh` client and a fixed remote helper installed at
+`~/.local/bin/buzz-backend-host`. The provider sends the deploy payload on
+stdin. It does not put the nsec, auth tag, environment, runtime command, or
+runtime arguments in the SSH command line.
+
+`provider_config.host` is an SSH config alias, not a URL or credential. SSH
+authentication, Tailscale routing, proxies, and host-key verification remain
+in the user's normal SSH configuration. The provider enables batch mode,
+disables forwarding and TTY allocation, and does not weaken host-key checking.
+The same provider version MUST be installed on the server because its
+`remote-deploy` mode owns the remote storage and systemd contract.
+
+The remote helper derives a deterministic user-service name from the agent's
+pubkey. Each deployment generation is written beneath the remote user's state
+directory with a private directory and a mode-0600 launch file; a fixed runner
+reads that file and ends in `exec buzz-acp`. `systemd --user` uses
+`Restart=no` and `KillMode=control-group`: owner `!shutdown` and inactivity
+exit stay final, and children do not escape the unit. An active, identity-
+verified unit is a strict no-op. Full pubkey metadata and a Host-provider
+management marker are required before the provider adopts or cleans anything.
+
+The unit runs as the SSH user and retains that user's remote `HOME`. Runtime
+binaries and configuration are resolved on the server; desktop absolute paths
+and `PATH` are never forwarded. This is what lets an existing `hermes-acp`
+installation reuse its VPS configuration, credentials, memory, and tools.
+Buzz defaults `HERMES_ACP_SKIP_CONFIGURED_MCP=1` to avoid starting both the MCP
+servers Buzz supplies and every server in the Hermes profile. Set
+`HERMES_ACP_SKIP_CONFIGURED_MCP=0` in the agent or persona environment when
+the existing Hermes-configured MCP servers should also start; the normal
+`policy_env < launch.env < authoritative identity` precedence makes that
+explicit override win.
+
+Host deployment does not add a management channel. Success means systemd
+confirmed that `buzz-acp` started. Live status still comes only from the
+agent's signed relay presence in the exact community named by `relay_url`, and
+Stop remains the owner-authenticated `!shutdown` message. There is no
+`undeploy` operation in protocol v1: deleting the desktop record can orphan
+the user unit and private launch file, so the existing explicit remote-delete
+confirmation remains mandatory. Stop the agent first and use the cleanup
+procedure in [Host agent operations](host-agents.md) for an agent that will not
+be started again.
 
 ## Conformance
 
@@ -1512,6 +1558,19 @@ The realization the two lists above require, in this binding's vocabulary:
    (PID 1 or the target of the pod's termination signal — §K8s
    Entrypoint's `exec` rule), and `terminationGracePeriodSeconds` carries
    the declared grace budget (§Pod shape).
+
+### [L3] Host binding conformance
+
+1. The deterministic systemd user-unit name selects one instance per pubkey.
+   The full-pubkey header and Host-provider marker are required before adopt or
+   cleanup; an active verified unit is a strict no-op.
+2. Each attempt writes one private generation file before publishing the unit.
+   `Restart=no` realizes intentional termination as final, while
+   `KillMode=control-group` and the runner's final `exec buzz-acp` keep the
+   harness and its children inside one signal boundary.
+3. Provider success requires the systemd user unit to start. Relay liveness is
+   deliberately separate and is established only by signed presence in the
+   deployed community.
 
 Conformance is testable without mechanization: a fake-provider harness can
 exercise L2 items 1–3 and 5 over the wire contract — including the pre-secret
@@ -1703,7 +1762,8 @@ Desktop- and harness-side, discovered during this design:
 | Graceful shutdown path (budget enforcement *to be added* — Known Defect 7) | `crates/buzz-acp/src/lib.rs` (pool shutdown, then drain / reap / presence / relay close) |
 | Clean-exit exit-code contract | *to be added*: `crates/buzz-acp` distinguished exit codes + pinning test (Known Defect 6; gates `OnFailure`) |
 | Auto-stop flag | *to be added*: `crates/buzz-acp/src/config.rs` + a pool-independent timer (NOT the `pool_ready`-gated maintenance tick — Known Defect 4) + `RESERVED_ENV_KEYS` entry |
-| Kubernetes binding | *to be added*: `crates/buzz-backend-kubernetes` |
+| Kubernetes binding | `crates/buzz-backend-kubernetes` |
+| Host binding | `crates/buzz-backend-host`; operator runbook: `docs/host-agents.md` |
 | Sprig image | *to be added*: `Dockerfile.sprig` + workflow |
 
 ## Open Decisions
