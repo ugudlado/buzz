@@ -265,8 +265,8 @@ export async function provisionChannelManagedAgent(
     throw new Error("Agent name is required.");
   }
 
-  // Smart reuse: if a managed agent with the same personaId already exists
-  // and is not already in this channel, attach it instead of creating a new one.
+  // Smart reuse: standalone personas reuse an instance not yet in this channel;
+  // team deployments reuse the instance linked to the same team and persona.
   if (
     input.personaId &&
     !input.forceNewInstance &&
@@ -277,6 +277,7 @@ export async function provisionChannelManagedAgent(
       context.managedAgents,
       input.personaId,
       context.channelMemberPubkeys,
+      input.teamId,
     );
     if (reusable) {
       // Apply the caller's respondTo settings so the user's permission

@@ -50,11 +50,15 @@ export function findReusablePersonaAgent(
   agents: ManagedAgent[],
   personaId: string,
   channelMemberPubkeys: ReadonlySet<string>,
+  teamId?: string | null,
 ): ManagedAgent | undefined {
   const candidates = agents.filter(
     (agent) =>
       agent.personaId === personaId &&
-      !channelMemberPubkeys.has(normalizePubkey(agent.pubkey)),
+      (teamId
+        ? agent.teamId === teamId
+        : !agent.teamId &&
+          !channelMemberPubkeys.has(normalizePubkey(agent.pubkey))),
   );
   return pickPreferredManagedAgent(candidates);
 }
