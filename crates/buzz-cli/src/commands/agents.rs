@@ -400,7 +400,10 @@ fn import_agent(
     std::fs::write(&store_path, json)
         .map_err(|e| CliError::Other(format!("failed to write {}: {e}", store_path.display())))?;
 
-    println!("{}", import_success_json(&pubkey, &display_name, &store_path));
+    println!(
+        "{}",
+        import_success_json(&pubkey, &display_name, &store_path)
+    );
     Ok(())
 }
 
@@ -1589,7 +1592,11 @@ mod tests {
         BuzzClient::new("http://127.0.0.1:9".into(), Keys::generate(), None, None).unwrap()
     }
 
-    fn write_snapshot(dir: &std::path::Path, name: &str, body: &serde_json::Value) -> std::path::PathBuf {
+    fn write_snapshot(
+        dir: &std::path::Path,
+        name: &str,
+        body: &serde_json::Value,
+    ) -> std::path::PathBuf {
         let path = dir.join(name);
         std::fs::write(&path, serde_json::to_vec_pretty(body).unwrap()).unwrap();
         path
@@ -1612,7 +1619,11 @@ mod tests {
     #[test]
     fn import_dry_run_valid_snapshot_writes_nothing() {
         let tmp = tempfile::tempdir().unwrap();
-        let snap = write_snapshot(tmp.path(), "ok.agent.json", &valid_snapshot("Dry Run Agent"));
+        let snap = write_snapshot(
+            tmp.path(),
+            "ok.agent.json",
+            &valid_snapshot("Dry Run Agent"),
+        );
         let store_dir = tmp.path().join("store");
         std::fs::create_dir_all(&store_dir).unwrap();
 
@@ -1718,7 +1729,11 @@ mod tests {
     #[test]
     fn import_non_dry_run_writes_store_and_success_envelope() {
         let tmp = tempfile::tempdir().unwrap();
-        let snap = write_snapshot(tmp.path(), "write.agent.json", &valid_snapshot("Write Agent"));
+        let snap = write_snapshot(
+            tmp.path(),
+            "write.agent.json",
+            &valid_snapshot("Write Agent"),
+        );
         let store_dir = tmp.path().join("store");
         std::fs::create_dir_all(&store_dir).unwrap();
 
@@ -1732,16 +1747,22 @@ mod tests {
         assert!(result.is_ok(), "real import should succeed: {result:?}");
 
         let path = store_file(&store_dir);
-        assert!(path.exists(), "managed-agents.json should exist after write");
+        assert!(
+            path.exists(),
+            "managed-agents.json should exist after write"
+        );
         let records: Vec<ManagedAgentRecord> =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].name, "Write Agent");
         assert!(!records[0].pubkey.is_empty());
 
-        let envelope: serde_json::Value =
-            serde_json::from_str(&import_success_json(&records[0].pubkey, "Write Agent", &path))
-                .unwrap();
+        let envelope: serde_json::Value = serde_json::from_str(&import_success_json(
+            &records[0].pubkey,
+            "Write Agent",
+            &path,
+        ))
+        .unwrap();
         let obj = envelope.as_object().expect("envelope object");
         for key in ["pubkey", "name", "store_path", "message"] {
             assert!(obj.contains_key(key), "missing success envelope key {key}");
