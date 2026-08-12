@@ -20,7 +20,8 @@ pub async fn dispatch(command: AgentsCmd, client: &BuzzClient) -> Result<(), Cli
             file,
             store_dir,
             identifier,
-        } => import_agent(client, &file, store_dir.as_deref(), &identifier),
+            dry_run,
+        } => import_agent(client, &file, store_dir.as_deref(), &identifier, dry_run),
 
         AgentsCmd::DraftCreate {
             channel,
@@ -195,6 +196,7 @@ fn import_agent(
     file: &std::path::Path,
     store_dir: Option<&std::path::Path>,
     identifier: &str,
+    dry_run: bool,
 ) -> Result<(), CliError> {
     let bytes = std::fs::read(file)
         .map_err(|e| CliError::Usage(format!("cannot read {}: {e}", file.display())))?;
@@ -249,23 +251,27 @@ fn import_agent(
         return Err(CliError::Usage("snapshot display name is empty".into()));
     }
 
-    let store_path = resolve_store_path(store_dir, identifier)?;
-    refuse_if_desktop_running()?;
-
-    let existing: Vec<ManagedAgentRecord> = if store_path.exists() {
-        let content = std::fs::read_to_string(&store_path).map_err(|e| {
-            CliError::Other(format!("failed to read {}: {e}", store_path.display()))
-        })?;
-        serde_json::from_str(&content).map_err(|e| {
-            CliError::Other(format!(
-                "{} is not valid JSON — refusing to write over a store this build cannot \
-                 parse (desktop's own malformed-store guard did not fire because this is the \
-                 CLI path): {e}",
-                store_path.display()
-            ))
-        })?
+    let (store_path, existing) = if !dry_run {
+        let store_path = resolve_store_path(store_dir, identifier)?;
+        refuse_if_desktop_running()?;
+        let existing: Vec<ManagedAgentRecord> = if store_path.exists() {
+            let content = std::fs::read_to_string(&store_path).map_err(|e| {
+                CliError::Other(format!("failed to read {}: {e}", store_path.display()))
+            })?;
+            serde_json::from_str(&content).map_err(|e| {
+                CliError::Other(format!(
+                    "{} is not valid JSON — refusing to write over a store this build cannot \
+                     parse (desktop's own malformed-store guard did not fire because this is the \
+                     CLI path): {e}",
+                    store_path.display()
+                ))
+            })?
+        } else {
+            Vec::new()
+        };
+        (Some(store_path), existing)
     } else {
-        Vec::new()
+        (None, Vec::new())
     };
 
     let respond_to = match snapshot.definition.respond_to.as_deref() {
@@ -300,7 +306,7 @@ fn import_agent(
     let owner_keys = client.keys();
     let agent_keys = nostr::Keys::generate();
     let pubkey = agent_keys.public_key().to_hex();
-    if existing.iter().any(|r| r.pubkey == pubkey) {
+    if !dry_run && existing.iter().any(|r| r.pubkey == pubkey) {
         return Err(CliError::Other(format!(
             "generated pubkey {pubkey} already exists in the store — retry"
         )));
@@ -377,6 +383,12 @@ fn import_agent(
         relay_mesh: None,
     };
 
+    if dry_run {
+        println!("{}", dry_run_record_json(&record)?);
+        return Ok(());
+    }
+
+    let store_path = store_path.expect("store_path set on non-dry-run path");
     let mut records = existing;
     records.push(record);
     if let Some(parent) = store_path.parent() {
@@ -388,17 +400,30 @@ fn import_agent(
     std::fs::write(&store_path, json)
         .map_err(|e| CliError::Other(format!("failed to write {}: {e}", store_path.display())))?;
 
-    println!(
-        "{}",
-        json!({
-            "pubkey": pubkey,
-            "name": display_name,
-            "store_path": store_path.display().to_string(),
-            "message": "Imported. Start Buzz Desktop to publish this agent's identity and \
-                        profile, then add it to a channel.",
-        })
-    );
+    println!("{}", import_success_json(&pubkey, &display_name, &store_path));
     Ok(())
+}
+
+/// Pretty-print a managed-agent record for `--dry-run`, blanking
+/// `private_key_nsec` so serde's `skip_serializing_if = "String::is_empty"`
+/// omits the secret from stdout.
+fn dry_run_record_json(record: &ManagedAgentRecord) -> Result<String, CliError> {
+    let mut redacted = record.clone();
+    redacted.private_key_nsec = String::new();
+    serde_json::to_string_pretty(&redacted)
+        .map_err(|e| CliError::Other(format!("failed to serialize dry-run record: {e}")))
+}
+
+/// Success envelope printed after a real (non-dry-run) import write.
+fn import_success_json(pubkey: &str, name: &str, store_path: &std::path::Path) -> String {
+    json!({
+        "pubkey": pubkey,
+        "name": name,
+        "store_path": store_path.display().to_string(),
+        "message": "Imported. Start Buzz Desktop to publish this agent's identity and \
+                    profile, then add it to a channel.",
+    })
+    .to_string()
 }
 
 /// Resolve `managed-agents.json`'s directory the same way Tauri's
@@ -1558,46 +1583,168 @@ mod tests {
         assert!(result.is_empty());
     }
 
-    // --- BUZZ-1: agents import --dry-run (RED placeholders; enabled in T-2) ---
+    // --- BUZZ-1: agents import --dry-run ---
 
-    /// Intended: dry-run of a valid snapshot into a tempfile --store-dir returns
-    /// Ok and leaves no managed-agents.json.
+    fn offline_client() -> crate::client::BuzzClient {
+        BuzzClient::new("http://127.0.0.1:9".into(), Keys::generate(), None, None).unwrap()
+    }
+
+    fn write_snapshot(dir: &std::path::Path, name: &str, body: &serde_json::Value) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, serde_json::to_vec_pretty(body).unwrap()).unwrap();
+        path
+    }
+
+    fn valid_snapshot(display_name: &str) -> serde_json::Value {
+        json!({
+            "format": "buzz-agent-snapshot",
+            "version": 1,
+            "definition": { "name": display_name },
+            "profile": { "displayName": display_name },
+            "memory": { "level": "none" }
+        })
+    }
+
+    fn store_file(store_dir: &std::path::Path) -> std::path::PathBuf {
+        store_dir.join("agents").join("managed-agents.json")
+    }
+
     #[test]
-    #[ignore = "BUZZ-1 pending dry-run"]
     fn import_dry_run_valid_snapshot_writes_nothing() {
-        todo!("BUZZ-1")
+        let tmp = tempfile::tempdir().unwrap();
+        let snap = write_snapshot(tmp.path(), "ok.agent.json", &valid_snapshot("Dry Run Agent"));
+        let store_dir = tmp.path().join("store");
+        std::fs::create_dir_all(&store_dir).unwrap();
+
+        let result = import_agent(
+            &offline_client(),
+            &snap,
+            Some(&store_dir),
+            "xyz.block.buzz.app",
+            true,
+        );
+        assert!(result.is_ok(), "dry-run should succeed: {result:?}");
+        assert!(
+            !store_file(&store_dir).exists(),
+            "dry-run must not create managed-agents.json"
+        );
     }
 
-    /// Intended: dry-run of a snapshot with wrong format discriminator returns
-    /// CliError::Usage containing 'unrecognized snapshot format'.
     #[test]
-    #[ignore = "BUZZ-1 pending dry-run"]
     fn import_dry_run_bad_format_returns_usage() {
-        todo!("BUZZ-1")
+        let tmp = tempfile::tempdir().unwrap();
+        let mut body = valid_snapshot("Bad Format");
+        body["format"] = json!("not-a-snapshot");
+        let snap = write_snapshot(tmp.path(), "bad-format.agent.json", &body);
+
+        let err = import_agent(
+            &offline_client(),
+            &snap,
+            Some(tmp.path()),
+            "xyz.block.buzz.app",
+            true,
+        )
+        .expect_err("bad format must fail");
+        match err {
+            CliError::Usage(msg) => {
+                assert!(
+                    msg.contains("unrecognized snapshot format"),
+                    "unexpected message: {msg}"
+                );
+            }
+            other => panic!("expected CliError::Usage, got {other:?}"),
+        }
+        assert!(!store_file(tmp.path()).exists());
     }
 
-    /// Intended: dry-run of a snapshot with empty display name returns
-    /// CliError::Usage containing 'snapshot display name is empty'.
     #[test]
-    #[ignore = "BUZZ-1 pending dry-run"]
     fn import_dry_run_empty_display_name_returns_usage() {
-        todo!("BUZZ-1")
+        let tmp = tempfile::tempdir().unwrap();
+        let mut body = valid_snapshot("x");
+        body["profile"]["displayName"] = json!("   ");
+        let snap = write_snapshot(tmp.path(), "empty-name.agent.json", &body);
+
+        let err = import_agent(
+            &offline_client(),
+            &snap,
+            Some(tmp.path()),
+            "xyz.block.buzz.app",
+            true,
+        )
+        .expect_err("empty display name must fail");
+        match err {
+            CliError::Usage(msg) => {
+                assert!(
+                    msg.contains("snapshot display name is empty"),
+                    "unexpected message: {msg}"
+                );
+            }
+            other => panic!("expected CliError::Usage, got {other:?}"),
+        }
     }
 
-    /// Intended: dry_run_record_json output does not contain the substring
-    /// private_key_nsec.
     #[test]
-    #[ignore = "BUZZ-1 pending dry-run"]
     fn dry_run_record_json_omits_private_key_nsec() {
-        todo!("BUZZ-1")
+        let keys = Keys::generate();
+        let nsec = keys.secret_key().to_bech32().unwrap();
+        let record: ManagedAgentRecord = serde_json::from_value(json!({
+            "pubkey": keys.public_key().to_hex(),
+            "name": "Redacted",
+            "private_key_nsec": nsec,
+            "relay_url": "",
+            "acp_command": "buzz-acp",
+            "agent_command": "",
+            "agent_args": [],
+            "mcp_command": "",
+            "turn_timeout_seconds": 0,
+            "system_prompt": null,
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "last_started_at": null,
+            "last_stopped_at": null,
+            "last_exit_code": null,
+            "last_error": null,
+        }))
+        .expect("minimal ManagedAgentRecord");
+        assert!(!record.private_key_nsec.is_empty());
+
+        let out = dry_run_record_json(&record).expect("serialize");
+        assert!(
+            !out.contains("private_key_nsec"),
+            "dry-run JSON must omit private_key_nsec: {out}"
+        );
     }
 
-    /// Intended (AC-3 required): import_agent(..., dry_run=false) against a
-    /// temp --store-dir returns Ok, creates managed-agents.json, and success
-    /// envelope has keys pubkey/name/store_path/message.
     #[test]
-    #[ignore = "BUZZ-1 pending dry-run"]
     fn import_non_dry_run_writes_store_and_success_envelope() {
-        todo!("BUZZ-1")
+        let tmp = tempfile::tempdir().unwrap();
+        let snap = write_snapshot(tmp.path(), "write.agent.json", &valid_snapshot("Write Agent"));
+        let store_dir = tmp.path().join("store");
+        std::fs::create_dir_all(&store_dir).unwrap();
+
+        let result = import_agent(
+            &offline_client(),
+            &snap,
+            Some(&store_dir),
+            "xyz.block.buzz.app",
+            false,
+        );
+        assert!(result.is_ok(), "real import should succeed: {result:?}");
+
+        let path = store_file(&store_dir);
+        assert!(path.exists(), "managed-agents.json should exist after write");
+        let records: Vec<ManagedAgentRecord> =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].name, "Write Agent");
+        assert!(!records[0].pubkey.is_empty());
+
+        let envelope: serde_json::Value =
+            serde_json::from_str(&import_success_json(&records[0].pubkey, "Write Agent", &path))
+                .unwrap();
+        let obj = envelope.as_object().expect("envelope object");
+        for key in ["pubkey", "name", "store_path", "message"] {
+            assert!(obj.contains_key(key), "missing success envelope key {key}");
+        }
     }
 }
