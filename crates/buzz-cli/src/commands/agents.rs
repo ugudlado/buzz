@@ -19,7 +19,8 @@ pub async fn dispatch(command: AgentsCmd, client: &BuzzClient) -> Result<(), Cli
             file,
             store_dir,
             identifier,
-        } => import_agent(client, &file, store_dir.as_deref(), &identifier),
+            dry_run,
+        } => import_agent(client, &file, store_dir.as_deref(), &identifier, dry_run),
 
         AgentsCmd::Remove {
             pubkey,
@@ -195,11 +196,16 @@ pub async fn dispatch(command: AgentsCmd, client: &BuzzClient) -> Result<(), Cli
 /// desktop owner's key, so the record is stored without an NIP-OA auth tag
 /// and the desktop applies its owner fallback on spawn. No event is signed
 /// or sent to any relay.
+///
+/// With `dry_run`, the snapshot is validated and the resolved record is
+/// printed as pretty JSON (private key redacted) without resolving or
+/// touching the store — so dry-run works on machines with no desktop install.
 fn import_agent(
     _client: &BuzzClient,
     file: &std::path::Path,
     store_dir: Option<&std::path::Path>,
     identifier: &str,
+    dry_run: bool,
 ) -> Result<(), CliError> {
     let bytes = std::fs::read(file)
         .map_err(|e| CliError::Usage(format!("cannot read {}: {e}", file.display())))?;
@@ -254,23 +260,28 @@ fn import_agent(
         return Err(CliError::Usage("snapshot display name is empty".into()));
     }
 
-    let store_path = resolve_store_path(store_dir, identifier)?;
-    refuse_if_desktop_running()?;
-
-    let existing: Vec<ManagedAgentRecord> = if store_path.exists() {
-        let content = std::fs::read_to_string(&store_path).map_err(|e| {
-            CliError::Other(format!("failed to read {}: {e}", store_path.display()))
-        })?;
-        serde_json::from_str(&content).map_err(|e| {
-            CliError::Other(format!(
-                "{} is not valid JSON — refusing to write over a store this build cannot \
-                 parse (desktop's own malformed-store guard did not fire because this is the \
-                 CLI path): {e}",
-                store_path.display()
-            ))
-        })?
+    let (store_path, existing): (Option<std::path::PathBuf>, Vec<ManagedAgentRecord>) = if dry_run {
+        (None, Vec::new())
     } else {
-        Vec::new()
+        let store_path = resolve_store_path(store_dir, identifier)?;
+        refuse_if_desktop_running()?;
+
+        let existing = if store_path.exists() {
+            let content = std::fs::read_to_string(&store_path).map_err(|e| {
+                CliError::Other(format!("failed to read {}: {e}", store_path.display()))
+            })?;
+            serde_json::from_str(&content).map_err(|e| {
+                CliError::Other(format!(
+                    "{} is not valid JSON — refusing to write over a store this build cannot \
+                     parse (desktop's own malformed-store guard did not fire because this is the \
+                     CLI path): {e}",
+                    store_path.display()
+                ))
+            })?
+        } else {
+            Vec::new()
+        };
+        (Some(store_path), existing)
     };
 
     let respond_to = match snapshot.definition.respond_to.as_deref() {
@@ -309,7 +320,7 @@ fn import_agent(
 
     let agent_keys = nostr::Keys::generate();
     let pubkey = agent_keys.public_key().to_hex();
-    if existing.iter().any(|r| r.pubkey == pubkey) {
+    if !dry_run && existing.iter().any(|r| r.pubkey == pubkey) {
         return Err(CliError::Other(format!(
             "generated pubkey {pubkey} already exists in the store — retry"
         )));
@@ -388,6 +399,14 @@ fn import_agent(
         relay_mesh: None,
     };
 
+    if dry_run {
+        println!("{}", dry_run_record_json(&record)?);
+        return Ok(());
+    }
+    let store_path = store_path.ok_or_else(|| {
+        CliError::Other("store path unresolved outside dry-run — this is a bug".into())
+    })?;
+
     let mut records = existing;
     records.push(record);
     if let Some(parent) = store_path.parent() {
@@ -410,6 +429,17 @@ fn import_agent(
         })
     );
     Ok(())
+}
+
+/// Render `record` as the `--dry-run` output: pretty JSON with the generated
+/// agent private key blanked. The record's serde attribute
+/// (`skip_serializing_if = "String::is_empty"`) then omits the field from the
+/// output entirely, so the secret never reaches stdout or CI logs.
+fn dry_run_record_json(record: &ManagedAgentRecord) -> Result<String, CliError> {
+    let mut redacted = record.clone();
+    redacted.private_key_nsec = String::new();
+    serde_json::to_string_pretty(&redacted)
+        .map_err(|e| CliError::Other(format!("failed to serialize agent record: {e}")))
 }
 
 /// Harness + model an imported agent record gets.
@@ -894,6 +924,111 @@ mod tests {
 
     fn hex64(c: char) -> String {
         std::iter::repeat_n(c, 64).collect()
+    }
+
+    // --- `agents import --dry-run` ---
+
+    fn offline_client() -> BuzzClient {
+        BuzzClient::new("http://localhost".into(), Keys::generate(), None, None)
+            .expect("offline client construction cannot fail")
+    }
+
+    fn valid_snapshot_json() -> serde_json::Value {
+        json!({
+            "format": "buzz-agent-snapshot",
+            "version": 1,
+            "definition": { "name": "test-agent" },
+            "profile": { "displayName": "Test Agent" },
+            "memory": { "level": "none" }
+        })
+    }
+
+    fn write_snapshot(dir: &std::path::Path, snapshot: &serde_json::Value) -> std::path::PathBuf {
+        let path = dir.join("test.agent.json");
+        std::fs::write(&path, snapshot.to_string()).expect("write snapshot");
+        path
+    }
+
+    #[test]
+    fn dry_run_valid_snapshot_ok_and_no_store_write() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = write_snapshot(dir.path(), &valid_snapshot_json());
+        let store_dir = dir.path().join("store");
+
+        let result = import_agent(&offline_client(), &file, Some(&store_dir), "test.id", true);
+
+        assert!(result.is_ok(), "dry-run should succeed: {result:?}");
+        assert!(
+            !store_dir.exists(),
+            "dry-run must not create the store directory"
+        );
+        assert!(!store_dir
+            .join("agents")
+            .join("managed-agents.json")
+            .exists());
+    }
+
+    #[test]
+    fn dry_run_wrong_format_returns_existing_usage_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut snapshot = valid_snapshot_json();
+        snapshot["format"] = json!("not-a-buzz-snapshot");
+        let file = write_snapshot(dir.path(), &snapshot);
+
+        let err = import_agent(&offline_client(), &file, Some(dir.path()), "test.id", true)
+            .expect_err("wrong format must fail");
+        match err {
+            CliError::Usage(msg) => assert_eq!(
+                msg,
+                "unrecognized snapshot format 'not-a-buzz-snapshot' (expected 'buzz-agent-snapshot')"
+            ),
+            other => panic!("expected CliError::Usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dry_run_empty_display_name_returns_existing_usage_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut snapshot = valid_snapshot_json();
+        snapshot["profile"]["displayName"] = json!("   ");
+        let file = write_snapshot(dir.path(), &snapshot);
+
+        let err = import_agent(&offline_client(), &file, Some(dir.path()), "test.id", true)
+            .expect_err("empty display name must fail");
+        match err {
+            CliError::Usage(msg) => assert_eq!(msg, "snapshot display name is empty"),
+            other => panic!("expected CliError::Usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dry_run_record_json_redacts_private_key() {
+        let record: ManagedAgentRecord = serde_json::from_value(json!({
+            "pubkey": hex64('a'),
+            "name": "Test Agent",
+            "private_key_nsec": "nsec1exampleexampleexample",
+            "relay_url": "",
+            "acp_command": "buzz-acp",
+            "agent_command": "",
+            "agent_args": [],
+            "mcp_command": "",
+            "turn_timeout_seconds": 0,
+            "system_prompt": null,
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "last_started_at": null,
+            "last_stopped_at": null,
+            "last_exit_code": null,
+            "last_error": null
+        }))
+        .expect("minimal record deserializes");
+
+        let output = dry_run_record_json(&record).expect("serialization succeeds");
+        assert!(
+            !output.contains("private_key_nsec"),
+            "dry-run output must not contain the private key field: {output}"
+        );
+        assert!(output.contains("\"pubkey\""));
     }
 
     #[test]
