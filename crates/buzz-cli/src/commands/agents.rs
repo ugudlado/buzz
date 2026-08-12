@@ -4,7 +4,6 @@ use buzz_agent_record::{
 };
 use buzz_core::kind::KIND_IA_ARCHIVED_LIST;
 use buzz_sdk::builders::{build_archive_identity_request, build_unarchive_identity_request};
-use buzz_sdk::nip_oa::compute_auth_tag;
 use nostr::{PublicKey, ToBech32};
 use serde_json::json;
 
@@ -21,6 +20,12 @@ pub async fn dispatch(command: AgentsCmd, client: &BuzzClient) -> Result<(), Cli
             store_dir,
             identifier,
         } => import_agent(client, &file, store_dir.as_deref(), &identifier),
+
+        AgentsCmd::Remove {
+            pubkey,
+            store_dir,
+            identifier,
+        } => remove_agent(&pubkey, store_dir.as_deref(), &identifier),
 
         AgentsCmd::DraftCreate {
             channel,
@@ -186,12 +191,12 @@ pub async fn dispatch(command: AgentsCmd, client: &BuzzClient) -> Result<(), Cli
 /// live desktop process (relay publish, avatar upload, memory restore — see
 /// the command's `after_help`).
 ///
-/// The signing key configured for this CLI invocation (`BUZZ_PRIVATE_KEY`)
-/// is treated as the owner identity — the same identity Buzz Desktop runs
-/// as on this machine — and is used only to compute the new agent's NIP-OA
-/// auth tag. No event is signed or sent to any relay.
+/// No owner attestation is written: the CLI cannot prove it holds the
+/// desktop owner's key, so the record is stored without an NIP-OA auth tag
+/// and the desktop applies its owner fallback on spawn. No event is signed
+/// or sent to any relay.
 fn import_agent(
-    client: &BuzzClient,
+    _client: &BuzzClient,
     file: &std::path::Path,
     store_dir: Option<&std::path::Path>,
     identifier: &str,
@@ -302,7 +307,6 @@ fn import_agent(
         snapshot.definition.model.as_deref(),
     );
 
-    let owner_keys = client.keys();
     let agent_keys = nostr::Keys::generate();
     let pubkey = agent_keys.public_key().to_hex();
     if existing.iter().any(|r| r.pubkey == pubkey) {
@@ -314,8 +318,6 @@ fn import_agent(
         .secret_key()
         .to_bech32()
         .map_err(|e| CliError::Other(format!("failed to encode agent private key: {e}")))?;
-    let auth_tag = compute_auth_tag(owner_keys, &agent_keys.public_key(), "")
-        .map_err(|e| CliError::Other(format!("failed to compute NIP-OA auth tag: {e}")))?;
 
     let now = chrono::Utc::now().to_rfc3339();
     let record = ManagedAgentRecord {
@@ -328,7 +330,11 @@ fn import_agent(
         // does for any record whose key arrives via the keyring-unreachable
         // fallback path. No keyring access is required from the CLI.
         private_key_nsec,
-        auth_tag: Some(auth_tag),
+        // No auth tag: the CLI cannot prove it holds the desktop owner's key,
+        // and a tag signed by the wrong key breaks relay auth. `None` makes
+        // the desktop use its legacy owner fallback (`BUZZ_ACP_AGENT_OWNER`
+        // from the workspace owner) on spawn — see `access_policy.rs`.
+        auth_tag: None,
         relay_url: String::new(),
         avatar_url: snapshot
             .profile
@@ -422,6 +428,52 @@ fn import_runtime_and_model(
         None | Some("claude") => (Some("cursor".to_string()), None),
         Some(other) => (Some(other.to_string()), model.map(str::to_string)),
     }
+}
+
+/// Remove a managed agent record by pubkey from the local store. The inverse
+/// of `import_agent` for CLI-managed stores — keeps store maintenance in the
+/// CLI instead of hand-editing the JSON.
+fn remove_agent(
+    pubkey: &str,
+    store_dir: Option<&std::path::Path>,
+    identifier: &str,
+) -> Result<(), CliError> {
+    validate_hex64(pubkey)?;
+    let store_path = resolve_store_path(store_dir, identifier)?;
+    refuse_if_desktop_running()?;
+
+    let content = std::fs::read_to_string(&store_path)
+        .map_err(|e| CliError::Other(format!("failed to read {}: {e}", store_path.display())))?;
+    let mut records: Vec<ManagedAgentRecord> = serde_json::from_str(&content).map_err(|e| {
+        CliError::Other(format!(
+            "{} is not valid JSON — refusing to rewrite a store this build cannot parse: {e}",
+            store_path.display()
+        ))
+    })?;
+
+    let before = records.len();
+    records.retain(|r| r.pubkey != pubkey);
+    if records.len() == before {
+        return Err(CliError::Usage(format!(
+            "no record with pubkey {pubkey} in {}",
+            store_path.display()
+        )));
+    }
+
+    let json = serde_json::to_string_pretty(&records)
+        .map_err(|e| CliError::Other(format!("failed to serialize agent store: {e}")))?;
+    std::fs::write(&store_path, json)
+        .map_err(|e| CliError::Other(format!("failed to write {}: {e}", store_path.display())))?;
+
+    println!(
+        "{}",
+        json!({
+            "pubkey": pubkey,
+            "removed": before - records.len(),
+            "store_path": store_path.display().to_string(),
+        })
+    );
+    Ok(())
 }
 
 /// Resolve `managed-agents.json`'s directory the same way Tauri's
