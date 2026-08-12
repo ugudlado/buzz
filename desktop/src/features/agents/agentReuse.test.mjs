@@ -184,6 +184,46 @@ test("findReusablePersonaAgent: excludes agent with different personaId", () => 
   assert.equal(result, undefined);
 });
 
+test("findReusablePersonaAgent: reuses the same team member across channels", () => {
+  const agent = makeAgent({
+    personaId: "persona-1",
+    teamId: "team-1",
+    pubkey: PUB_A,
+  });
+  const result = findReusablePersonaAgent(
+    [agent],
+    "persona-1",
+    new Set([PUB_A]),
+    "team-1",
+  );
+  assert.equal(result, agent);
+});
+
+test("findReusablePersonaAgent: does not reuse a persona from another team", () => {
+  const agent = makeAgent({
+    personaId: "persona-1",
+    teamId: "team-2",
+    pubkey: PUB_A,
+  });
+  const result = findReusablePersonaAgent(
+    [agent],
+    "persona-1",
+    new Set(),
+    "team-1",
+  );
+  assert.equal(result, undefined);
+});
+
+test("findReusablePersonaAgent: standalone persona does not reuse a team member", () => {
+  const agent = makeAgent({
+    personaId: "persona-1",
+    teamId: "team-1",
+    pubkey: PUB_A,
+  });
+  const result = findReusablePersonaAgent([agent], "persona-1", new Set());
+  assert.equal(result, undefined);
+});
+
 test("findReusablePersonaAgent: prefers running agent", () => {
   const stopped = makeAgent({
     id: "s",
