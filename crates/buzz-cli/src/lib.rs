@@ -274,7 +274,8 @@ relay I/O itself.\n\n\
 Only the JSON `.agent.json` format is supported — not the `.agent.png` trading-card variant, and \
 not locked/encrypted snapshot envelopes. Memory entries and avatar images in the snapshot are not \
 imported; the agent starts with no memory and no avatar.\n\n\
-Example:\n  buzz agents import ./teamlead.agent.json"
+Example:\n  buzz agents import ./teamlead.agent.json\n  \
+buzz agents import --dry-run ./teamlead.agent.json"
     )]
     Import {
         /// Path to a `buzz-agent-snapshot v1` `.agent.json` file
@@ -286,6 +287,10 @@ Example:\n  buzz agents import ./teamlead.agent.json"
         /// Tauri bundle identifier whose app-data dir to target
         #[arg(long, default_value = "xyz.block.buzz.app")]
         identifier: String,
+        /// Validate and print the resolved record as JSON without writing
+        /// the agent store
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
     },
     /// Remove a managed agent record from Buzz Desktop's local store by
     /// pubkey. Local-only, desktop must be stopped; does not touch the relay.
