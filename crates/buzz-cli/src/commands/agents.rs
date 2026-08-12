@@ -1557,4 +1557,47 @@ mod tests {
         let result = verify_archived_event(&event, &self_hex).expect("should pass");
         assert!(result.is_empty());
     }
+
+    // --- BUZZ-1: agents import --dry-run (RED placeholders; enabled in T-2) ---
+
+    /// Intended: dry-run of a valid snapshot into a tempfile --store-dir returns
+    /// Ok and leaves no managed-agents.json.
+    #[test]
+    #[ignore = "BUZZ-1 pending dry-run"]
+    fn import_dry_run_valid_snapshot_writes_nothing() {
+        todo!("BUZZ-1")
+    }
+
+    /// Intended: dry-run of a snapshot with wrong format discriminator returns
+    /// CliError::Usage containing 'unrecognized snapshot format'.
+    #[test]
+    #[ignore = "BUZZ-1 pending dry-run"]
+    fn import_dry_run_bad_format_returns_usage() {
+        todo!("BUZZ-1")
+    }
+
+    /// Intended: dry-run of a snapshot with empty display name returns
+    /// CliError::Usage containing 'snapshot display name is empty'.
+    #[test]
+    #[ignore = "BUZZ-1 pending dry-run"]
+    fn import_dry_run_empty_display_name_returns_usage() {
+        todo!("BUZZ-1")
+    }
+
+    /// Intended: dry_run_record_json output does not contain the substring
+    /// private_key_nsec.
+    #[test]
+    #[ignore = "BUZZ-1 pending dry-run"]
+    fn dry_run_record_json_omits_private_key_nsec() {
+        todo!("BUZZ-1")
+    }
+
+    /// Intended (AC-3 required): import_agent(..., dry_run=false) against a
+    /// temp --store-dir returns Ok, creates managed-agents.json, and success
+    /// envelope has keys pubkey/name/store_path/message.
+    #[test]
+    #[ignore = "BUZZ-1 pending dry-run"]
+    fn import_non_dry_run_writes_store_and_success_envelope() {
+        todo!("BUZZ-1")
+    }
 }
