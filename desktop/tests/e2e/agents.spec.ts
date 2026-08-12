@@ -505,6 +505,67 @@ test("the new team card offers create and import", async ({ page }) => {
   ).toBeVisible();
 });
 
+test("deploying a team across channels reuses its agent identity", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    personas: [
+      {
+        id: "custom:cross-channel",
+        displayName: "Cross-channel agent",
+        systemPrompt: "Keep one identity across team deployments.",
+      },
+    ],
+    teams: [
+      {
+        id: "cross-channel-team",
+        name: "Cross-channel team",
+        personaIds: ["custom:cross-channel"],
+      },
+    ],
+  });
+  await gotoApp(page);
+  await page.getByTestId("open-agents-view").click();
+
+  const deployToChannel = async (channelLabel: string) => {
+    await page
+      .getByRole("button", {
+        name: "Cross-channel team team actions",
+      })
+      .click();
+    await page.getByRole("menuitem", { name: "Deploy to channel" }).click();
+    await page
+      .locator("#team-channel-id")
+      .selectOption({ label: channelLabel });
+    await page.getByRole("button", { name: "Deploy 1 agent" }).click();
+    await expect(
+      page.getByRole("heading", { name: "Deploy team to channel" }),
+    ).not.toBeVisible();
+  };
+
+  await deployToChannel("general · open");
+  await deployToChannel("random · open");
+
+  const calls = await page.evaluate(
+    () => window.__BUZZ_E2E_COMMAND_LOG__ ?? [],
+  );
+  const creates = calls.filter(
+    (call) => call.command === "create_managed_agent",
+  );
+  const memberships = calls.filter(
+    (call) => call.command === "add_channel_members",
+  );
+  expect(creates).toHaveLength(1);
+  expect(memberships).toHaveLength(2);
+  expect(
+    new Set(
+      memberships.map(
+        (call) => (call.payload as { pubkeys: string[] }).pubkeys[0],
+      ),
+    ).size,
+  ).toBe(1);
+});
+
 test("team cards follow the agents grid alignment at compact widths", async ({
   page,
 }) => {
