@@ -496,9 +496,20 @@ pub fn spawn_agent_child(
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| effective_command.clone());
 
-    // The caller supplies the explicit canonical pair relay. This is the only
-    // relay this child may connect to, regardless of the record/workspace default.
-    let effective_relay_url = runtime_key.relay_url.clone();
+    // The child must connect with the SAME host string the UI uses: the relay
+    // derives the community boundary from the request Host, so handing the
+    // child the canonical pair relay (loopback folded to 127.0.0.1 by
+    // `normalize_relay_url`) lands it in a different, empty community than the
+    // workspace it was started for. The canonical form stays confined to
+    // `runtime_key` (identity, log paths); the wire URL is re-resolved raw here.
+    let effective_relay_url = {
+        use tauri::Manager;
+        let state = app.state::<crate::app_state::AppState>();
+        crate::relay::effective_agent_relay_url(
+            &record.relay_url,
+            &crate::relay::relay_ws_url_with_override(&state),
+        )
+    };
 
     // Augment PATH for DMG launches so child processes can find:
     //   - bundled CLI via ~/.local/bin symlink
