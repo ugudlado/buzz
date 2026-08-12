@@ -297,6 +297,11 @@ fn import_agent(
         .filter(|count| (1..=32).contains(count))
         .unwrap_or(DEFAULT_AGENT_PARALLELISM);
 
+    let (runtime, model) = import_runtime_and_model(
+        snapshot.definition.runtime.as_deref(),
+        snapshot.definition.model.as_deref(),
+    );
+
     let owner_keys = client.keys();
     let agent_keys = nostr::Keys::generate();
     let pubkey = agent_keys.public_key().to_hex();
@@ -340,7 +345,7 @@ fn import_agent(
         max_turn_duration_seconds: snapshot.definition.max_turn_duration_seconds,
         parallelism,
         system_prompt: snapshot.definition.system_prompt.clone(),
-        model: snapshot.definition.model.clone(),
+        model,
         provider: snapshot.definition.provider.clone(),
         persona_source_version: None,
         env_vars: std::collections::BTreeMap::new(),
@@ -363,7 +368,7 @@ fn import_agent(
         respond_to_allowlist: allowlist,
         display_name: None,
         slug: None,
-        runtime: snapshot.definition.runtime.clone(),
+        runtime,
         name_pool: snapshot.definition.name_pool.clone(),
         is_builtin: false,
         is_active: true,
@@ -399,6 +404,24 @@ fn import_agent(
         })
     );
     Ok(())
+}
+
+/// Harness + model an imported agent record gets.
+///
+/// ponytail: temporary default — CLI-imported agents run on the Cursor
+/// harness ("cursor" preset) instead of Claude for now. A snapshot pinning
+/// any runtime other than claude keeps it (and its model); claude/unset
+/// becomes cursor with the model cleared so Cursor's own default model
+/// applies (a Claude model id is meaningless to another harness). Drop this
+/// override when Claude harness is the desired import default again.
+fn import_runtime_and_model(
+    runtime: Option<&str>,
+    model: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    match runtime {
+        None | Some("claude") => (Some("cursor".to_string()), None),
+        Some(other) => (Some(other.to_string()), model.map(str::to_string)),
+    }
 }
 
 /// Resolve `managed-agents.json`'s directory the same way Tauri's
@@ -819,6 +842,23 @@ mod tests {
 
     fn hex64(c: char) -> String {
         std::iter::repeat_n(c, 64).collect()
+    }
+
+    #[test]
+    fn import_defaults_claude_and_unset_runtimes_to_cursor() {
+        assert_eq!(
+            import_runtime_and_model(None, Some("claude-sonnet-5")),
+            (Some("cursor".into()), None)
+        );
+        assert_eq!(
+            import_runtime_and_model(Some("claude"), Some("claude-sonnet-5")),
+            (Some("cursor".into()), None)
+        );
+        // Any other pinned harness keeps both runtime and model.
+        assert_eq!(
+            import_runtime_and_model(Some("goose"), Some("gpt-5")),
+            (Some("goose".into()), Some("gpt-5".into()))
+        );
     }
 
     fn hex128(c: char) -> String {
