@@ -24,9 +24,14 @@ pub async fn dispatch(command: AgentsCmd, client: &BuzzClient) -> Result<(), Cli
 
         AgentsCmd::Remove {
             pubkey,
+            dry_run,
             store_dir,
             identifier,
-        } => remove_agent(&pubkey, store_dir.as_deref(), &identifier),
+        } => {
+            let output = remove_agent(&pubkey, dry_run, store_dir.as_deref(), &identifier)?;
+            println!("{output}");
+            Ok(())
+        }
 
         AgentsCmd::DraftCreate {
             channel,
@@ -463,47 +468,62 @@ fn import_runtime_and_model(
 /// Remove a managed agent record by pubkey from the local store. The inverse
 /// of `import_agent` for CLI-managed stores — keeps store maintenance in the
 /// CLI instead of hand-editing the JSON.
+///
+/// `--dry-run` shares the real path's pubkey/store validation (including the
+/// Desktop-running guard), returns a preview JSON value, and never writes.
 fn remove_agent(
     pubkey: &str,
+    dry_run: bool,
     store_dir: Option<&std::path::Path>,
     identifier: &str,
-) -> Result<(), CliError> {
+) -> Result<serde_json::Value, CliError> {
     validate_hex64(pubkey)?;
     let store_path = resolve_store_path(store_dir, identifier)?;
     refuse_if_desktop_running()?;
 
     let content = std::fs::read_to_string(&store_path)
         .map_err(|e| CliError::Other(format!("failed to read {}: {e}", store_path.display())))?;
-    let mut records: Vec<ManagedAgentRecord> = serde_json::from_str(&content).map_err(|e| {
+    let records: Vec<ManagedAgentRecord> = serde_json::from_str(&content).map_err(|e| {
         CliError::Other(format!(
             "{} is not valid JSON — refusing to rewrite a store this build cannot parse: {e}",
             store_path.display()
         ))
     })?;
 
-    let before = records.len();
-    records.retain(|r| r.pubkey != pubkey);
-    if records.len() == before {
-        return Err(CliError::Usage(format!(
-            "no record with pubkey {pubkey} in {}",
-            store_path.display()
-        )));
+    let name = records
+        .iter()
+        .find(|r| r.pubkey == pubkey)
+        .map(|r| r.name.clone())
+        .ok_or_else(|| {
+            CliError::Usage(format!(
+                "no record with pubkey {pubkey} in {}",
+                store_path.display()
+            ))
+        })?;
+
+    if dry_run {
+        return Ok(json!({
+            "pubkey": pubkey,
+            "name": name,
+            "store_path": store_path.display().to_string(),
+            "dry_run": true,
+            "message": "Would remove agent from store; managed-agents.json unchanged.",
+        }));
     }
 
-    let json = serde_json::to_string_pretty(&records)
+    let before = records.len();
+    let remaining: Vec<ManagedAgentRecord> =
+        records.into_iter().filter(|r| r.pubkey != pubkey).collect();
+    let json = serde_json::to_string_pretty(&remaining)
         .map_err(|e| CliError::Other(format!("failed to serialize agent store: {e}")))?;
     std::fs::write(&store_path, json)
         .map_err(|e| CliError::Other(format!("failed to write {}: {e}", store_path.display())))?;
 
-    println!(
-        "{}",
-        json!({
-            "pubkey": pubkey,
-            "removed": before - records.len(),
-            "store_path": store_path.display().to_string(),
-        })
-    );
-    Ok(())
+    Ok(json!({
+        "pubkey": pubkey,
+        "removed": before - remaining.len(),
+        "store_path": store_path.display().to_string(),
+    }))
 }
 
 /// Resolve `managed-agents.json`'s directory the same way Tauri's
@@ -531,6 +551,11 @@ fn resolve_store_path(
 /// no cross-process lock to share, so "the app must be quit" is the contract.
 #[cfg(target_os = "macos")]
 fn refuse_if_desktop_running() -> Result<(), CliError> {
+    // Unit tests exercise the store path with tempdirs; skip the live process
+    // probe so a running desktop on the developer machine doesn't fail them.
+    if cfg!(test) {
+        return Ok(());
+    }
     let output = std::process::Command::new("pgrep")
         .arg("-x")
         .arg("buzz-desktop")
@@ -1783,5 +1808,158 @@ mod tests {
             .expect("sign");
         let result = verify_archived_event(&event, &self_hex).expect("should pass");
         assert!(result.is_empty());
+    }
+
+    // --- agents remove / --dry-run ---
+
+    fn sample_managed_record(pubkey: &str, name: &str) -> ManagedAgentRecord {
+        ManagedAgentRecord {
+            pubkey: pubkey.to_string(),
+            name: name.to_string(),
+            persona_id: None,
+            team_id: None,
+            private_key_nsec: "nsec1testsecretmaterial".into(),
+            auth_tag: None,
+            relay_url: String::new(),
+            avatar_url: None,
+            acp_command: DEFAULT_ACP_COMMAND.to_string(),
+            agent_command: String::new(),
+            agent_command_override: None,
+            agent_args: Vec::new(),
+            mcp_command: String::new(),
+            turn_timeout_seconds: 0,
+            idle_timeout_seconds: None,
+            max_turn_duration_seconds: None,
+            parallelism: DEFAULT_AGENT_PARALLELISM,
+            system_prompt: Some("prompt".into()),
+            model: None,
+            provider: None,
+            persona_source_version: None,
+            env_vars: std::collections::BTreeMap::new(),
+            start_on_app_launch: false,
+            auto_restart_on_config_change: true,
+            runtime_pid: None,
+            backend: Default::default(),
+            backend_agent_id: None,
+            provider_binary_path: None,
+            persona_team_dir: None,
+            persona_name_in_team: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            last_started_at: None,
+            last_stopped_at: None,
+            last_exit_code: None,
+            last_error: None,
+            last_error_code: None,
+            respond_to: Default::default(),
+            respond_to_allowlist: Vec::new(),
+            display_name: None,
+            slug: None,
+            runtime: None,
+            name_pool: Vec::new(),
+            is_builtin: false,
+            is_active: true,
+            shared: false,
+            source_team: None,
+            source_team_persona_slug: None,
+            catalog_source: None,
+            definition_respond_to: None,
+            definition_respond_to_allowlist: Vec::new(),
+            definition_parallelism: None,
+            relay_mesh: None,
+        }
+    }
+
+    fn write_temp_store(
+        dir: &std::path::Path,
+        records: &[ManagedAgentRecord],
+    ) -> std::path::PathBuf {
+        let agents_dir = dir.join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        let path = agents_dir.join("managed-agents.json");
+        let json = serde_json::to_string_pretty(records).unwrap();
+        std::fs::write(&path, json).unwrap();
+        path
+    }
+
+    #[test]
+    fn remove_dry_run_leaves_store_bytes_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let pubkey = hex64('a');
+        let path = write_temp_store(
+            dir.path(),
+            &[sample_managed_record(&pubkey, "PreviewAgent")],
+        );
+        let before = std::fs::read(&path).unwrap();
+
+        let out = remove_agent(&pubkey, true, Some(dir.path()), "xyz.block.buzz.app")
+            .expect("dry-run should succeed");
+
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(before, after, "dry-run must not mutate managed-agents.json");
+        assert_eq!(out["pubkey"], pubkey);
+        assert_eq!(out["name"], "PreviewAgent");
+        assert_eq!(out["dry_run"], true);
+        assert!(
+            out.get("store_path").and_then(|v| v.as_str()).is_some(),
+            "stdout JSON must include store_path: {out}"
+        );
+        assert!(
+            out.get("private_key_nsec").is_none(),
+            "must omit private_key_nsec: {out}"
+        );
+        assert!(
+            !serde_json::to_string(&out)
+                .unwrap()
+                .contains("nsec1testsecretmaterial"),
+            "must not leak nsec material: {out}"
+        );
+    }
+
+    #[test]
+    fn remove_without_dry_run_drops_matched_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let keep = hex64('b');
+        let drop = hex64('c');
+        let path = write_temp_store(
+            dir.path(),
+            &[
+                sample_managed_record(&keep, "KeepMe"),
+                sample_managed_record(&drop, "DropMe"),
+            ],
+        );
+
+        let out = remove_agent(&drop, false, Some(dir.path()), "xyz.block.buzz.app")
+            .expect("real remove should succeed");
+
+        // Non-dry-run keeps the pre-existing JSON shape (pubkey/removed/store_path).
+        assert_eq!(out["pubkey"], drop);
+        assert_eq!(out["removed"], 1);
+        assert!(out.get("dry_run").is_none());
+        assert!(out.get("private_key_nsec").is_none());
+
+        let remaining: Vec<ManagedAgentRecord> =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].pubkey, keep);
+        assert_eq!(remaining[0].name, "KeepMe");
+    }
+
+    #[test]
+    fn remove_unknown_pubkey_fails_without_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let present = hex64('d');
+        let missing = hex64('e');
+        let path = write_temp_store(dir.path(), &[sample_managed_record(&present, "StillHere")]);
+        let before = std::fs::read(&path).unwrap();
+
+        let err = remove_agent(&missing, true, Some(dir.path()), "xyz.block.buzz.app")
+            .expect_err("unknown pubkey must fail");
+        assert!(
+            err.to_string().contains(&missing),
+            "error should name the missing pubkey: {err}"
+        );
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(before, after, "failed remove must not mutate the store");
     }
 }

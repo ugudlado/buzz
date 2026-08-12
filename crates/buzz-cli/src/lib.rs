@@ -294,9 +294,23 @@ buzz agents import --dry-run ./teamlead.agent.json"
     },
     /// Remove a managed agent record from Buzz Desktop's local store by
     /// pubkey. Local-only, desktop must be stopped; does not touch the relay.
+    #[command(
+        after_help = "Buzz Desktop must be fully quit before running this command — it owns \
+managed-agents.json and rewrites it on launch.\n\n\
+This is a store-record-only inverse of `agents import`: it does not stop runtimes, delete \
+OS keyring material, publish tombstones, or regenerate nest files.\n\n\
+`--dry-run` runs the same pubkey/store validation (including the Desktop-running guard), \
+prints a preview JSON object, and never writes.\n\n\
+Examples:\n  \
+buzz agents remove <PUBKEY> --dry-run\n  \
+buzz agents remove <PUBKEY>"
+    )]
     Remove {
         /// Full 64-hex pubkey of the record to remove
         pubkey: String,
+        /// Validate and preview without writing managed-agents.json
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
         /// Override the resolved managed-agents.json directory (default:
         /// this machine's Buzz Desktop app-data dir for --identifier)
         #[arg(long)]
