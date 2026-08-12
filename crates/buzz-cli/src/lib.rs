@@ -287,6 +287,19 @@ Example:\n  buzz agents import ./teamlead.agent.json"
         #[arg(long, default_value = "xyz.block.buzz.app")]
         identifier: String,
     },
+    /// Remove a managed agent record from Buzz Desktop's local store by
+    /// pubkey. Local-only, desktop must be stopped; does not touch the relay.
+    Remove {
+        /// Full 64-hex pubkey of the record to remove
+        pubkey: String,
+        /// Override the resolved managed-agents.json directory (default:
+        /// this machine's Buzz Desktop app-data dir for --identifier)
+        #[arg(long)]
+        store_dir: Option<std::path::PathBuf>,
+        /// Tauri bundle identifier whose app-data dir to target
+        #[arg(long, default_value = "xyz.block.buzz.app")]
+        identifier: String,
+    },
     /// Open a prefilled create-agent form in the owner's Buzz Desktop
     DraftCreate {
         /// Current channel UUID; the new agent is added here after save
@@ -2201,6 +2214,7 @@ mod tests {
                 "draft-create",
                 "draft-update",
                 "import",
+                "remove",
                 "unarchive"
             ]
         );
@@ -2339,7 +2353,7 @@ mod tests {
     #[test]
     fn subcommand_counts_are_stable() {
         let expected: Vec<(&str, usize)> = vec![
-            ("agents", 6),
+            ("agents", 7),
             ("canvas", 2),
             ("channels", 16),
             ("dms", 4),
