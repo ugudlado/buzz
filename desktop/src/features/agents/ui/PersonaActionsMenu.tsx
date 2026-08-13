@@ -2,6 +2,7 @@ import {
   CopyPlus,
   EllipsisVertical,
   Pencil,
+  Settings2,
   Share2,
   Trash2,
 } from "lucide-react";
@@ -22,6 +23,7 @@ export function PersonaActionsMenu({
   linkedAgent,
   onDuplicate,
   onEdit,
+  onEditInstance,
   onShare,
   onDeactivate,
   onDelete,
@@ -33,6 +35,7 @@ export function PersonaActionsMenu({
   linkedAgent: ManagedAgent | undefined;
   onDuplicate: (persona: AgentPersona) => void;
   onEdit: (persona: AgentPersona) => void;
+  onEditInstance: (agent: ManagedAgent) => void;
   onShare: (
     persona: AgentPersona,
     linkedAgent: ManagedAgent | undefined,
@@ -62,6 +65,15 @@ export function PersonaActionsMenu({
           <DropdownMenuItem disabled={disabled} onClick={() => onEdit(persona)}>
             <Pencil className="h-4 w-4" />
             Edit
+          </DropdownMenuItem>
+        ) : null}
+        {linkedAgent ? (
+          <DropdownMenuItem
+            disabled={disabled}
+            onClick={() => onEditInstance(linkedAgent)}
+          >
+            <Settings2 className="h-4 w-4" />
+            Agent settings
           </DropdownMenuItem>
         ) : null}
         <DropdownMenuItem

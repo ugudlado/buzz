@@ -36,6 +36,7 @@ type UnifiedAgentsSectionProps = {
     options?: ProfilePanelOpenOptions,
   ) => void;
   onOpenPersonaProfile: (persona: AgentPersona) => void;
+  onEditAgentInstance: (agent: ManagedAgent) => void;
   onRestartAgent: (pubkey: string) => void;
   onStartAgent: (pubkey: string) => void;
   onStartPersona: (persona: AgentPersona) => void;
@@ -76,6 +77,7 @@ export function UnifiedAgentsSection(props: UnifiedAgentsSectionProps) {
     startingPersonaIds,
     onOpenAgentProfile,
     onOpenPersonaProfile,
+    onEditAgentInstance,
     onRestartAgent,
     onStartAgent,
     onStartPersona,
@@ -143,6 +145,7 @@ export function UnifiedAgentsSection(props: UnifiedAgentsSectionProps) {
                       onDelete={onDeletePersona}
                       onDuplicate={onDuplicatePersona}
                       onEdit={onEditPersona}
+                      onEditInstance={onEditAgentInstance}
                       onShare={(persona, linkedAgent) =>
                         onSharePersona(persona, linkedAgent, effectiveAvatarUrl)
                       }
