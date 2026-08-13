@@ -3,9 +3,10 @@ import { expect, test } from "@playwright/test";
 import { installMockBridge, TEST_IDENTITIES } from "../helpers/bridge";
 
 const MARKETPLACE_AGENT_PUBKEY = TEST_IDENTITIES.alice.pubkey;
+const MARKETPLACE_OWNER_PUBKEY = "deadbeef".repeat(8);
 const MARKETPLACE_AGENT_EVENT = {
   id: "a".repeat(64),
-  pubkey: TEST_IDENTITIES.tyler.pubkey,
+  pubkey: MARKETPLACE_OWNER_PUBKEY,
   created_at: 1_800_000_000,
   kind: 30177,
   tags: [["d", MARKETPLACE_AGENT_PUBKEY]],
@@ -27,6 +28,19 @@ test.beforeEach(async ({ page }) => {
   await installMockBridge(page, {
     personaCatalogEvents: [MARKETPLACE_AGENT_EVENT],
     managedAgents: [
+      {
+        pubkey: MARKETPLACE_AGENT_PUBKEY,
+        name: "Rust Reviewer",
+        status: "running",
+        respondTo: "anyone",
+        marketplace: {
+          listed: true,
+          description: "Reviews Rust changes and reports correctness risks",
+          capabilities: ["rust", "review"],
+          deployment: "remote",
+          pricing: { currency: "USD", microunits_per_hour: 12_000_000 },
+        },
+      },
       {
         pubkey: TEST_IDENTITIES.bob.pubkey,
         name: "Private Local Agent",
@@ -151,6 +165,56 @@ test("discovers a listed agent with presence and sanitized pricing", async ({
   await search.fill("Rust Reviewer");
   await expect(listing).toBeVisible();
   await expect(unpublished).toHaveCount(0);
+
+  await listing.getByRole("button", { name: "Unpublish" }).click();
+  await expect(listing).toHaveCount(0);
+  const unpublishedListing = marketplace.getByTestId(
+    `unpublished-agent-${MARKETPLACE_AGENT_PUBKEY}`,
+  );
+  await expect(unpublishedListing).toBeVisible();
+  await unpublishedListing.getByRole("button", { name: "Publish" }).click();
+  await page
+    .getByRole("dialog")
+    .getByRole("button", { name: "Publish" })
+    .click();
+  await expect(listing).toBeVisible();
+});
+
+test("searches published workflows by marketplace summary", async ({
+  page,
+}) => {
+  await navigateToWorkflows(page);
+  await page.getByRole("button", { name: "Create Workflow" }).click();
+  const dialog = page.getByRole("dialog");
+  await dialog.getByRole("button", { name: "Edit as YAML" }).click();
+  await dialog.locator("textarea").fill(`
+name: Release reviewer
+trigger:
+  on: message_posted
+marketplace:
+  listed: true
+  summary: Reviews release candidates
+steps:
+  - id: review
+    action: assign_to_agent
+    agent: Rust Reviewer
+    agent_pubkey: ${MARKETPLACE_AGENT_PUBKEY}
+    instruction: review it
+`);
+  await dialog.getByRole("button", { name: "Create" }).click();
+
+  await page.getByTestId("open-marketplace-view").click();
+  const search = page.getByRole("searchbox", {
+    name: "Search published workflows",
+  });
+  await search.fill("release candidates");
+  await expect(
+    page.getByText("Release reviewer", { exact: true }),
+  ).toBeVisible();
+  await search.fill("no matching workflow");
+  await expect(
+    page.getByText("No published workflows match your search"),
+  ).toBeVisible();
 });
 
 test("shows completed and failed assignment receipt evidence", async ({

@@ -202,6 +202,7 @@ export function WorkflowsView({
   const [deleteTarget, setDeleteTarget] = React.useState<Workflow | null>(null);
   const [catalogTab, setCatalogTab] = React.useState<CatalogTab>("workflows");
   const [agentSearch, setAgentSearch] = React.useState("");
+  const [workflowSearch, setWorkflowSearch] = React.useState("");
   const isMarketplace = surface === "marketplace";
   const [listingAgent, setListingAgent] = React.useState<ManagedAgent | null>(
     null,
@@ -218,7 +219,7 @@ export function WorkflowsView({
     staleTime: 30_000,
     refetchOnWindowFocus: true,
   });
-  const marketplaceAgents = marketplaceAgentsQuery.data ?? [];
+  const relayMarketplaceAgents = marketplaceAgentsQuery.data ?? [];
   const managedAgents = managedAgentsQuery.data ?? [];
   const managedAgentByPubkey = React.useMemo(
     () =>
@@ -227,22 +228,70 @@ export function WorkflowsView({
       ),
     [managedAgents],
   );
-  const searchTerm = agentSearch.trim().toLowerCase();
+  const marketplaceAgents = React.useMemo(() => {
+    const localMarketplaceAgents: MarketplaceAgent[] = identityPubkey
+      ? managedAgents.flatMap((agent) => {
+          const marketplace = agent.marketplace;
+          if (!marketplace?.listed) return [];
+          return [
+            {
+              pubkey: agent.pubkey.toLowerCase(),
+              name: agent.name,
+              ownerPubkey: identityPubkey,
+              description: marketplace.description,
+              capabilities: marketplace.capabilities,
+              deployment: marketplace.deployment,
+              pricing: marketplace.pricing
+                ? {
+                    currency: marketplace.pricing.currency,
+                    microunitsPerHour: marketplace.pricing.microunits_per_hour,
+                  }
+                : null,
+              directUse:
+                agent.respondTo === "anyone"
+                  ? "community"
+                  : agent.respondTo === "allowlist"
+                    ? "restricted"
+                    : "owner",
+            },
+          ];
+        })
+      : [];
+    return [
+      ...relayMarketplaceAgents.filter((agent) => {
+        if (agent.ownerPubkey !== identityPubkey) return true;
+        return !managedAgentByPubkey.get(agent.pubkey)?.marketplace;
+      }),
+      ...localMarketplaceAgents,
+    ];
+  }, [
+    identityPubkey,
+    managedAgentByPubkey,
+    managedAgents,
+    relayMarketplaceAgents,
+  ]);
+  const agentSearchTerm = agentSearch.trim().toLowerCase();
   const filteredMarketplaceAgents = marketplaceAgents.filter(
     (agent) =>
-      !searchTerm ||
-      [agent.name, agent.pubkey, agent.description, ...agent.capabilities].some(
-        (value) => value.toLowerCase().includes(searchTerm),
-      ),
+      !agentSearchTerm ||
+      [
+        agent.name,
+        agent.pubkey,
+        agent.ownerPubkey,
+        agent.description,
+        ...agent.capabilities,
+      ].some((value) => value.toLowerCase().includes(agentSearchTerm)),
   );
   const filteredUnpublishedAgents = managedAgents.filter(
     (agent) =>
       !marketplaceAgents.some(
-        (listing) => listing.pubkey === agent.pubkey.toLowerCase(),
+        (listing) =>
+          listing.ownerPubkey === identityPubkey &&
+          listing.pubkey === agent.pubkey.toLowerCase(),
       ) &&
-      (!searchTerm ||
+      (!agentSearchTerm ||
         [agent.name, agent.pubkey].some((value) =>
-          value.toLowerCase().includes(searchTerm),
+          value.toLowerCase().includes(agentSearchTerm),
         )),
   );
   const marketplaceAgentPubkeys = React.useMemo(
@@ -285,6 +334,17 @@ export function WorkflowsView({
         getWorkflowMarketplace(workflow.definition),
       )
     : allWorkflows;
+  const workflowSearchTerm = workflowSearch.trim().toLowerCase();
+  const filteredVisibleWorkflows = visibleWorkflows.filter(
+    ({ workflow, channelName }) =>
+      !workflowSearchTerm ||
+      [
+        workflow.name,
+        workflow.ownerPubkey,
+        channelName,
+        getWorkflowMarketplace(workflow.definition)?.summary ?? "",
+      ].some((value) => value.toLowerCase().includes(workflowSearchTerm)),
+  );
 
   const triggerMutation = useMutation({
     mutationFn: (workflowId: string) => triggerWorkflow(workflowId),
@@ -445,6 +505,20 @@ export function WorkflowsView({
           </div>
         </div>
 
+        {isMarketplace && catalogTab === "workflows" ? (
+          <div className="relative mb-4">
+            <Search className="absolute left-3 top-2.5 h-4 w-4 text-muted-foreground" />
+            <Input
+              aria-label="Search published workflows"
+              className="pl-9"
+              onChange={(event) => setWorkflowSearch(event.target.value)}
+              placeholder="Search published workflows"
+              type="search"
+              value={workflowSearch}
+            />
+          </div>
+        ) : null}
+
         {isMarketplace && catalogTab === "agents" ? (
           marketplaceAgentsQuery.isLoading ? (
             <WorkflowsListSkeleton />
@@ -477,7 +551,7 @@ export function WorkflowsView({
                 <div className="flex flex-col items-center justify-center gap-3 py-10 text-muted-foreground">
                   <Bot className="h-10 w-10 opacity-30" />
                   <p className="text-sm">
-                    {searchTerm
+                    {agentSearchTerm
                       ? "No agents match your search"
                       : "No agents available"}
                   </p>
@@ -488,7 +562,11 @@ export function WorkflowsView({
                     <AgentCatalogCard
                       agent={agent}
                       key={agent.pubkey}
-                      localAgent={managedAgentByPubkey.get(agent.pubkey)}
+                      localAgent={
+                        agent.ownerPubkey === identityPubkey
+                          ? managedAgentByPubkey.get(agent.pubkey)
+                          : undefined
+                      }
                       onEdit={setListingAgent}
                       onUnpublish={unpublishAgent}
                       presenceStatus={
@@ -542,11 +620,15 @@ export function WorkflowsView({
               Retry
             </Button>
           </div>
-        ) : visibleWorkflows.length === 0 ? (
+        ) : filteredVisibleWorkflows.length === 0 ? (
           <div className="flex flex-1 flex-col items-center justify-center gap-3 text-muted-foreground">
             <Zap className="h-10 w-10 opacity-30" />
             <p className="text-sm">
-              {isMarketplace ? "No listed workflows" : "No workflows yet"}
+              {isMarketplace && workflowSearchTerm
+                ? "No published workflows match your search"
+                : isMarketplace
+                  ? "No listed workflows"
+                  : "No workflows yet"}
             </p>
             {!isMarketplace ? (
               <Button
@@ -561,7 +643,7 @@ export function WorkflowsView({
           </div>
         ) : (
           <div className="space-y-2">
-            {visibleWorkflows.map(({ workflow, channelName }) => (
+            {filteredVisibleWorkflows.map(({ workflow, channelName }) => (
               <WorkflowCard
                 canManage={
                   identityPubkey === workflow.ownerPubkey.toLowerCase()
