@@ -449,7 +449,7 @@ relay-release: _ensure-migrations
 dev *ARGS: bootstrap _ensure-sidecar-stubs _ensure-migrations
     #!/usr/bin/env bash
     set -euo pipefail
-    export PATH="{{justfile_directory()}}/bin:$PATH"
+    export PATH="{{justfile_directory()}}/target/debug:{{justfile_directory()}}/bin:$PATH"
     bind_addr="${BUZZ_BIND_ADDR:-0.0.0.0:3000}"
     relay_port="${bind_addr##*:}"; [[ -n "$relay_port" ]] || relay_port=3000
     health_port="${BUZZ_HEALTH_PORT:-8080}"
