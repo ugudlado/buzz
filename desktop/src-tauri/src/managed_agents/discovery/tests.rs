@@ -55,7 +55,7 @@ fn default_agent_command_resolves_bundled_buzz_agent() {
 }
 
 #[test]
-fn normalizes_claude_and_codex_args_to_empty() {
+fn normalizes_zero_arg_acp_wrappers_to_empty() {
     assert_eq!(
         normalize_agent_args("claude-agent-acp", vec!["acp".into()]),
         Vec::<String>::new()
@@ -66,6 +66,10 @@ fn normalizes_claude_and_codex_args_to_empty() {
     );
     assert_eq!(
         normalize_agent_args("codex-acp", vec!["acp".into()]),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        normalize_agent_args("hermes-acp", vec!["acp".into()]),
         Vec::<String>::new()
     );
 }
