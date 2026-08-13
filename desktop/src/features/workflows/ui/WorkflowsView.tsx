@@ -1,4 +1,4 @@
-import { Plus, RefreshCw, Zap } from "lucide-react";
+import { Bot, Plus, RefreshCw, Zap } from "lucide-react";
 import * as React from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
@@ -6,18 +6,43 @@ import {
   allWorkflowsQueryKey,
   workflowListFocusRefetchPolicy,
 } from "@/features/workflows/hooks";
+import {
+  useManagedAgentsQuery,
+  useUpdateManagedAgentMutation,
+} from "@/features/agents/hooks";
+import { AgentMarketplaceDialog } from "@/features/workflows/ui/AgentMarketplaceDialog";
 import { WorkflowCard } from "@/features/workflows/ui/WorkflowCard";
 import { WorkflowDeleteDialog } from "@/features/workflows/ui/WorkflowDeleteDialog";
 import { WorkflowDetailPanel } from "@/features/workflows/ui/WorkflowDetailPanel";
 import { WorkflowDialog } from "@/features/workflows/ui/WorkflowDialog";
-import type { Channel, Workflow } from "@/shared/api/types";
+import {
+  formatMicrounits,
+  getWorkflowMarketplace,
+} from "@/features/workflows/marketplace";
+import { usePresenceQuery } from "@/features/presence/hooks";
+import { useIdentityQuery } from "@/shared/api/hooks";
+import { getPresenceLabel } from "@/features/presence/lib/presence";
+import { PresenceBadge } from "@/features/presence/ui/PresenceBadge";
+import {
+  getMarketplaceAgents,
+  type MarketplaceAgent,
+} from "@/shared/api/marketplace";
+import type {
+  Channel,
+  ManagedAgent,
+  PresenceStatus,
+  Workflow,
+} from "@/shared/api/types";
+import type { ManagedAgentMarketplace } from "@/shared/api/marketplace";
 import {
   deleteWorkflow,
   getChannelsWorkflows,
   triggerWorkflow,
 } from "@/shared/api/tauriWorkflows";
 import { Button } from "@/shared/ui/button";
+import { Badge } from "@/shared/ui/badge";
 import { Card } from "@/shared/ui/card";
+import { PubKey } from "@/shared/ui/PubKey";
 import { Skeleton } from "@/shared/ui/skeleton";
 
 type WorkflowsViewProps = {
@@ -25,6 +50,7 @@ type WorkflowsViewProps = {
   onCloseWorkflow: () => void;
   onSelectWorkflow: (workflowId: string) => void;
   selectedWorkflowId: string | null;
+  surface: "manage" | "marketplace";
 };
 
 type WorkflowWithChannel = {
@@ -37,6 +63,8 @@ type DialogState =
   | { mode: "create" }
   | { mode: "edit"; workflow: Workflow }
   | { mode: "duplicate"; workflow: Workflow };
+
+type CatalogTab = "agents" | "workflows";
 
 function WorkflowsListSkeleton() {
   return (
@@ -67,17 +95,147 @@ function WorkflowsListSkeleton() {
   );
 }
 
+function AgentCatalogCard({
+  agent,
+  presenceStatus,
+  localAgent,
+  onEdit,
+  onUnpublish,
+}: {
+  agent: MarketplaceAgent;
+  presenceStatus: PresenceStatus | null;
+  localAgent?: ManagedAgent;
+  onEdit: (agent: ManagedAgent) => void;
+  onUnpublish: (agent: ManagedAgent) => void;
+}) {
+  return (
+    <Card className="p-4" data-testid={`marketplace-agent-${agent.pubkey}`}>
+      <div className="flex items-start gap-3">
+        <div className="mt-0.5 rounded-md bg-primary/10 p-2 text-primary">
+          <Bot className="h-4 w-4" />
+        </div>
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <h3 className="text-sm font-semibold">{agent.name}</h3>
+            {presenceStatus ? (
+              <PresenceBadge
+                className="px-2 py-0.5 text-2xs"
+                label={getPresenceLabel(presenceStatus)}
+                status={presenceStatus}
+              />
+            ) : (
+              <Badge variant="secondary">Presence unavailable</Badge>
+            )}
+            <Badge variant="secondary">{agent.deployment}</Badge>
+          </div>
+          {agent.description ? (
+            <p className="mt-2 text-xs text-muted-foreground">
+              {agent.description}
+            </p>
+          ) : null}
+          <div className="mt-3 flex flex-wrap gap-1.5">
+            {agent.capabilities.map((capability) => (
+              <Badge key={capability} variant="outline">
+                {capability}
+              </Badge>
+            ))}
+          </div>
+          <div className="mt-3 grid gap-2 border-t pt-3 text-xs sm:grid-cols-2">
+            <div>
+              <p className="text-2xs text-muted-foreground">Hourly rate</p>
+              <p>
+                {agent.pricing
+                  ? `${formatMicrounits(
+                      agent.pricing.currency,
+                      agent.pricing.microunitsPerHour,
+                    )}/hour`
+                  : "Unpriced"}
+              </p>
+            </div>
+            <div>
+              <p className="text-2xs text-muted-foreground">Availability</p>
+              <p>
+                Workflows · Direct use{" "}
+                {agent.directUse.replace("owner", "owner only")}
+              </p>
+            </div>
+            <div className="sm:col-span-2">
+              <p className="text-2xs text-muted-foreground">Publisher</p>
+              <PubKey pubkey={agent.ownerPubkey} />
+            </div>
+          </div>
+          {localAgent ? (
+            <div className="mt-3 flex gap-2">
+              <Button
+                onClick={() => onEdit(localAgent)}
+                size="sm"
+                variant="outline"
+              >
+                Edit listing
+              </Button>
+              <Button
+                onClick={() => onUnpublish(localAgent)}
+                size="sm"
+                variant="ghost"
+              >
+                Unpublish
+              </Button>
+            </div>
+          ) : null}
+        </div>
+      </div>
+    </Card>
+  );
+}
+
 export function WorkflowsView({
   channels,
   onCloseWorkflow,
   onSelectWorkflow,
   selectedWorkflowId,
+  surface,
 }: WorkflowsViewProps) {
   const [dialogState, setDialogState] = React.useState<DialogState>({
     mode: "closed",
   });
   const [deleteTarget, setDeleteTarget] = React.useState<Workflow | null>(null);
+  const [catalogTab, setCatalogTab] = React.useState<CatalogTab>("workflows");
+  const isMarketplace = surface === "marketplace";
+  const [listingAgent, setListingAgent] = React.useState<ManagedAgent | null>(
+    null,
+  );
   const queryClient = useQueryClient();
+  const identityPubkey = useIdentityQuery().data?.pubkey.toLowerCase() ?? null;
+  const managedAgentsQuery = useManagedAgentsQuery();
+  const updateManagedAgent = useUpdateManagedAgentMutation();
+  const updateManagedAgentMutate = updateManagedAgent.mutate;
+
+  const marketplaceAgentsQuery = useQuery({
+    queryKey: ["marketplace-agents"],
+    queryFn: getMarketplaceAgents,
+    staleTime: 30_000,
+    refetchOnWindowFocus: true,
+  });
+  const marketplaceAgents = marketplaceAgentsQuery.data ?? [];
+  const managedAgents = managedAgentsQuery.data ?? [];
+  const managedAgentByPubkey = React.useMemo(
+    () =>
+      new Map(
+        managedAgents.map((agent) => [agent.pubkey.toLowerCase(), agent]),
+      ),
+    [managedAgents],
+  );
+  const unlistedManagedAgents = managedAgents.filter(
+    (agent) =>
+      !marketplaceAgents.some(
+        (listing) => listing.pubkey === agent.pubkey.toLowerCase(),
+      ),
+  );
+  const marketplaceAgentPubkeys = React.useMemo(
+    () => marketplaceAgents.map((agent) => agent.pubkey),
+    [marketplaceAgents],
+  );
+  const presenceQuery = usePresenceQuery(marketplaceAgentPubkeys);
 
   const memberChannels = channels.filter((c) => c.isMember);
   const channelIds = memberChannels.map((c) => c.id).sort();
@@ -108,6 +266,11 @@ export function WorkflowsView({
   });
 
   const allWorkflows = allWorkflowsQuery.data ?? [];
+  const visibleWorkflows = isMarketplace
+    ? allWorkflows.filter(({ workflow }) =>
+        getWorkflowMarketplace(workflow.definition),
+      )
+    : allWorkflows;
 
   const triggerMutation = useMutation({
     mutationFn: (workflowId: string) => triggerWorkflow(workflowId),
@@ -168,6 +331,34 @@ export function WorkflowsView({
     }
   }, []);
 
+  const saveAgentListing = React.useCallback(
+    (marketplace: ManagedAgentMarketplace) => {
+      if (!listingAgent) return;
+      updateManagedAgentMutate(
+        { pubkey: listingAgent.pubkey, marketplace },
+        {
+          onSuccess: () => {
+            setListingAgent(null);
+            void marketplaceAgentsQuery.refetch();
+          },
+        },
+      );
+    },
+    [listingAgent, marketplaceAgentsQuery.refetch, updateManagedAgentMutate],
+  );
+
+  const unpublishAgent = React.useCallback(
+    (agent: ManagedAgent) => {
+      const current = agent.marketplace;
+      if (!current) return;
+      updateManagedAgentMutate(
+        { pubkey: agent.pubkey, marketplace: { ...current, listed: false } },
+        { onSuccess: () => void marketplaceAgentsQuery.refetch() },
+      );
+    },
+    [marketplaceAgentsQuery.refetch, updateManagedAgentMutate],
+  );
+
   return (
     <div
       className="relative flex min-h-0 flex-1 overflow-hidden"
@@ -179,31 +370,132 @@ export function WorkflowsView({
       >
         <div className="mb-4 flex items-center justify-between gap-2">
           <div className="flex items-center gap-2">
-            <h2 className="text-lg font-semibold">Workflows</h2>
+            <h2 className="text-lg font-semibold">
+              {isMarketplace ? "Marketplace" : "Workflows"}
+            </h2>
             <Button
-              aria-label="Refresh workflows"
-              disabled={allWorkflowsQuery.isFetching}
-              onClick={() => void allWorkflowsQuery.refetch()}
+              aria-label={`Refresh ${catalogTab}`}
+              disabled={
+                isMarketplace && catalogTab === "agents"
+                  ? marketplaceAgentsQuery.isFetching
+                  : allWorkflowsQuery.isFetching
+              }
+              onClick={() =>
+                void (isMarketplace && catalogTab === "agents"
+                  ? marketplaceAgentsQuery.refetch()
+                  : allWorkflowsQuery.refetch())
+              }
               size="icon"
               variant="ghost"
             >
               <RefreshCw
-                className={`h-4 w-4 ${allWorkflowsQuery.isFetching ? "animate-spin" : ""}`}
+                className={`h-4 w-4 ${
+                  (
+                    isMarketplace && catalogTab === "agents"
+                      ? marketplaceAgentsQuery.isFetching
+                      : allWorkflowsQuery.isFetching
+                  )
+                    ? "animate-spin"
+                    : ""
+                }`}
               />
             </Button>
           </div>
           <div className="flex shrink-0 items-center gap-2">
-            <Button
-              onClick={() => setDialogState({ mode: "create" })}
-              size="sm"
-            >
-              <Plus className="mr-1 h-4 w-4" />
-              Create Workflow
-            </Button>
+            {isMarketplace ? (
+              <div className="flex rounded-lg border bg-muted/30 p-0.5">
+                <Button
+                  onClick={() => setCatalogTab("agents")}
+                  size="sm"
+                  variant={catalogTab === "agents" ? "secondary" : "ghost"}
+                >
+                  Agents
+                </Button>
+                <Button
+                  onClick={() => setCatalogTab("workflows")}
+                  size="sm"
+                  variant={catalogTab === "workflows" ? "secondary" : "ghost"}
+                >
+                  Workflows
+                </Button>
+              </div>
+            ) : (
+              <Button
+                onClick={() => setDialogState({ mode: "create" })}
+                size="sm"
+              >
+                <Plus className="mr-1 h-4 w-4" />
+                Create Workflow
+              </Button>
+            )}
           </div>
         </div>
 
-        {allWorkflowsQuery.isLoading ? (
+        {isMarketplace && catalogTab === "agents" ? (
+          marketplaceAgentsQuery.isLoading ? (
+            <WorkflowsListSkeleton />
+          ) : marketplaceAgentsQuery.isError ? (
+            <div className="flex flex-1 flex-col items-center justify-center gap-2 text-muted-foreground">
+              <p className="text-sm text-red-400">Failed to load agents</p>
+              <Button
+                onClick={() => void marketplaceAgentsQuery.refetch()}
+                size="sm"
+                variant="outline"
+              >
+                Retry
+              </Button>
+            </div>
+          ) : marketplaceAgents.length === 0 &&
+            unlistedManagedAgents.length === 0 ? (
+            <div className="flex flex-1 flex-col items-center justify-center gap-3 text-muted-foreground">
+              <Bot className="h-10 w-10 opacity-30" />
+              <p className="text-sm">No listed agents</p>
+              <p className="max-w-sm text-center text-xs">
+                Published agent listings for this community appear here.
+              </p>
+            </div>
+          ) : (
+            <div className="space-y-4">
+              {marketplaceAgents.map((agent) => (
+                <AgentCatalogCard
+                  agent={agent}
+                  key={agent.pubkey}
+                  localAgent={managedAgentByPubkey.get(agent.pubkey)}
+                  onEdit={setListingAgent}
+                  onUnpublish={unpublishAgent}
+                  presenceStatus={
+                    presenceQuery.isSuccess
+                      ? (presenceQuery.data?.[agent.pubkey] ?? "offline")
+                      : null
+                  }
+                />
+              ))}
+              {unlistedManagedAgents.length > 0 ? (
+                <div className="space-y-2 border-t pt-4">
+                  <p className="text-xs font-medium text-muted-foreground">
+                    Your unlisted agents
+                  </p>
+                  {unlistedManagedAgents.map((agent) => (
+                    <Card
+                      className="flex items-center justify-between gap-3 p-4"
+                      key={agent.pubkey}
+                    >
+                      <div className="min-w-0">
+                        <p className="truncate text-sm font-medium">
+                          {agent.name}
+                        </p>
+                        <PubKey pubkey={agent.pubkey} />
+                      </div>
+                      <Button onClick={() => setListingAgent(agent)} size="sm">
+                        Publish
+                      </Button>
+                    </Card>
+                  ))}
+                </div>
+              ) : null}
+            </div>
+          )
+        ) : allWorkflowsQuery.isLoading ? (
           <WorkflowsListSkeleton />
         ) : allWorkflowsQuery.isError ? (
           <div className="flex flex-1 flex-col items-center justify-center gap-2 text-muted-foreground">
@@ -216,23 +508,30 @@ export function WorkflowsView({
               Retry
             </Button>
           </div>
-        ) : allWorkflows.length === 0 ? (
+        ) : visibleWorkflows.length === 0 ? (
           <div className="flex flex-1 flex-col items-center justify-center gap-3 text-muted-foreground">
             <Zap className="h-10 w-10 opacity-30" />
-            <p className="text-sm">No workflows yet</p>
-            <Button
-              onClick={() => setDialogState({ mode: "create" })}
-              size="sm"
-              variant="outline"
-            >
-              <Plus className="mr-1 h-4 w-4" />
-              Create your first workflow
-            </Button>
+            <p className="text-sm">
+              {isMarketplace ? "No listed workflows" : "No workflows yet"}
+            </p>
+            {!isMarketplace ? (
+              <Button
+                onClick={() => setDialogState({ mode: "create" })}
+                size="sm"
+                variant="outline"
+              >
+                <Plus className="mr-1 h-4 w-4" />
+                Create your first workflow
+              </Button>
+            ) : null}
           </div>
         ) : (
           <div className="space-y-2">
-            {allWorkflows.map(({ workflow, channelName }) => (
+            {visibleWorkflows.map(({ workflow, channelName }) => (
               <WorkflowCard
+                canManage={
+                  identityPubkey === workflow.ownerPubkey.toLowerCase()
+                }
                 channelName={channelName}
                 isActive={selectedWorkflowId === workflow.id}
                 key={workflow.id}
@@ -241,6 +540,9 @@ export function WorkflowsView({
                 onEdit={handleEdit}
                 onSelect={onSelectWorkflow}
                 onTrigger={handleTrigger}
+                marketplaceAgents={marketplaceAgents}
+                presence={presenceQuery.data}
+                presenceLoaded={presenceQuery.isSuccess}
                 workflow={workflow}
               />
             ))}
@@ -251,7 +553,13 @@ export function WorkflowsView({
       {selectedWorkflowId ? (
         <div className="w-[400px] shrink-0">
           <WorkflowDetailPanel
+            canManage={
+              allWorkflows
+                .find(({ workflow }) => workflow.id === selectedWorkflowId)
+                ?.workflow.ownerPubkey.toLowerCase() === identityPubkey
+            }
             key={selectedWorkflowId}
+            marketplaceAgents={marketplaceAgents}
             onClose={onCloseWorkflow}
             onEdit={handleEdit}
             workflowId={selectedWorkflowId}
@@ -278,6 +586,15 @@ export function WorkflowsView({
         }}
         open={deleteTarget !== null}
         workflow={deleteTarget}
+      />
+      <AgentMarketplaceDialog
+        agent={listingAgent}
+        onOpenChange={(open) => {
+          if (!open) setListingAgent(null);
+        }}
+        onSave={saveAgentListing}
+        open={listingAgent !== null}
+        pending={updateManagedAgent.isPending}
       />
     </div>
   );

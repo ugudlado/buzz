@@ -8,6 +8,7 @@ import type {
   WorkflowSaveResult,
   TraceEntry,
 } from "@/shared/api/types";
+import type { AssignmentReceipt } from "@/shared/api/workflowTypes";
 
 // ── Raw types (snake_case from backend) ───────────────────────────────────
 
@@ -33,6 +34,22 @@ type RawTraceEntry = {
   started_at?: number | null;
   completed_at?: number | null;
   error?: string | null;
+  assignment_receipt?: RawAssignmentReceipt | null;
+};
+
+type RawAssignmentReceipt = {
+  agent_pubkey: string;
+  agent_owner_pubkey: string | null;
+  prompt_event_id: string;
+  completion_event_id: string | null;
+  prompt_published_at_ms: number | null;
+  terminal_at_ms: number | null;
+  duration_ms: number | null;
+  rate_currency: string | null;
+  rate_microunits_per_hour: number | null;
+  estimated_microunits: number | null;
+  outcome: AssignmentReceipt["outcome"];
+  review_state: AssignmentReceipt["reviewState"];
 };
 
 type RawWorkflowRun = {
@@ -44,6 +61,9 @@ type RawWorkflowRun = {
   started_at: number | null;
   completed_at: number | null;
   error_message: string | null;
+  workflow_author_pubkey?: string | null;
+  fixed_price_currency?: string | null;
+  fixed_price_microunits?: number | null;
   created_at: number;
 };
 
@@ -96,7 +116,26 @@ function fromRawWorkflowSave(raw: RawWorkflowSaveResponse): WorkflowSaveResult {
   };
 }
 
-function fromRawTraceEntry(raw: RawTraceEntry): TraceEntry {
+function fromRawAssignmentReceipt(
+  raw: RawAssignmentReceipt,
+): AssignmentReceipt {
+  return {
+    agentPubkey: raw.agent_pubkey,
+    agentOwnerPubkey: raw.agent_owner_pubkey,
+    promptEventId: raw.prompt_event_id,
+    completionEventId: raw.completion_event_id,
+    promptPublishedAtMs: raw.prompt_published_at_ms,
+    terminalAtMs: raw.terminal_at_ms,
+    durationMs: raw.duration_ms,
+    rateCurrency: raw.rate_currency,
+    rateMicrounitsPerHour: raw.rate_microunits_per_hour,
+    estimatedMicrounits: raw.estimated_microunits,
+    outcome: raw.outcome,
+    reviewState: raw.review_state,
+  };
+}
+
+export function fromRawTraceEntry(raw: RawTraceEntry): TraceEntry {
   return {
     stepId: raw.step_id,
     status: raw.status,
@@ -104,6 +143,9 @@ function fromRawTraceEntry(raw: RawTraceEntry): TraceEntry {
     startedAt: raw.started_at ?? null,
     completedAt: raw.completed_at ?? null,
     error: raw.error ?? null,
+    assignmentReceipt: raw.assignment_receipt
+      ? fromRawAssignmentReceipt(raw.assignment_receipt)
+      : null,
   };
 }
 
@@ -117,6 +159,9 @@ function fromRawWorkflowRun(raw: RawWorkflowRun): WorkflowRun {
     startedAt: raw.started_at,
     completedAt: raw.completed_at,
     errorMessage: raw.error_message,
+    workflowAuthorPubkey: raw.workflow_author_pubkey ?? null,
+    fixedPriceCurrency: raw.fixed_price_currency ?? null,
+    fixedPriceMicrounits: raw.fixed_price_microunits ?? null,
     createdAt: raw.created_at,
   };
 }

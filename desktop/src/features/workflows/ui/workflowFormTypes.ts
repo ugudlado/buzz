@@ -6,6 +6,7 @@ export const TRIGGER_TYPES = [
   "diff_posted",
   "webhook",
   "schedule",
+  "manual",
 ] as const;
 export type TriggerType = (typeof TRIGGER_TYPES)[number];
 
@@ -76,6 +77,7 @@ export const DEFAULT_FORM_STATE: WorkflowFormState = {
 };
 
 export const TRIGGER_LABELS: Record<TriggerType, string> = {
+  manual: "Manual",
   message_posted: "Message Posted",
   reaction_added: "Reaction Added",
   diff_posted: "Diff Posted",
@@ -241,6 +243,12 @@ export function yamlToFormState(
     const parsed = yamlParse(yaml);
     if (!parsed || typeof parsed !== "object") {
       return { ok: false, error: "YAML must be an object" };
+    }
+    if (parsed.marketplace !== undefined) {
+      return {
+        ok: false,
+        error: "Marketplace metadata is edited in the YAML editor",
+      };
     }
 
     const triggerOn = parsed.trigger?.on;

@@ -43,6 +43,7 @@ import {
   KIND_HUDDLE_STARTED,
   KIND_MEMBER_ADDED_NOTIFICATION,
   KIND_MEMBER_REMOVED_NOTIFICATION,
+  KIND_MANAGED_AGENT,
   KIND_PERSONA,
   KIND_PROJECT_ANNOUNCEMENT,
   KIND_REPO_ANNOUNCEMENT,
@@ -3344,6 +3345,20 @@ type RawWorkflowTraceEntry = {
   started_at?: number | null;
   completed_at?: number | null;
   error?: string | null;
+  assignment_receipt?: {
+    agent_pubkey: string;
+    agent_owner_pubkey: string | null;
+    prompt_event_id: string;
+    completion_event_id: string | null;
+    prompt_published_at_ms: number | null;
+    terminal_at_ms: number | null;
+    duration_ms: number | null;
+    rate_currency: string | null;
+    rate_microunits_per_hour: number | null;
+    estimated_microunits: number | null;
+    outcome: "completed" | "failed" | "timed_out" | "cancelled";
+    review_state: "not_required" | "human_review_required";
+  } | null;
 };
 
 type RawWorkflowRun = {
@@ -3362,6 +3377,9 @@ type RawWorkflowRun = {
   started_at: number | null;
   completed_at: number | null;
   error_message: string | null;
+  workflow_author_pubkey: string | null;
+  fixed_price_currency: string | null;
+  fixed_price_microunits: number | null;
   created_at: number;
 };
 
@@ -3470,37 +3488,62 @@ function buildMockWorkflowRun(workflow: MockWorkflow): RawWorkflowRun {
   const rawSteps = Array.isArray(workflow.definition.steps)
     ? workflow.definition.steps
     : [];
-  const executionTrace = rawSteps.map((candidate, index) => {
-    const step =
-      candidate && typeof candidate === "object"
-        ? (candidate as Record<string, unknown>)
-        : {};
-    const startedAt = createdAt + index;
-    const completedAt = startedAt + 1;
-    const output: Record<string, unknown> = {};
+  const executionTrace: RawWorkflowTraceEntry[] = rawSteps.map(
+    (candidate, index) => {
+      const step =
+        candidate && typeof candidate === "object"
+          ? (candidate as Record<string, unknown>)
+          : {};
+      const startedAt = createdAt + index;
+      const completedAt = startedAt + 1;
+      const output: Record<string, unknown> = {};
+      const isAgentAssignment = step.action === "assign_to_agent";
+      const failed = step.instruction === "fail in e2e";
+      const agentPubkey =
+        typeof step.agent_pubkey === "string" ? step.agent_pubkey : "";
 
-    if (typeof step.action === "string") {
-      output.action = step.action;
-    }
-    if (typeof step.name === "string" && step.name.trim().length > 0) {
-      output.name = step.name;
-    }
-    if (typeof step.text === "string" && step.text.trim().length > 0) {
-      output.preview = step.text;
-    }
+      if (typeof step.action === "string") {
+        output.action = step.action;
+      }
+      if (typeof step.name === "string" && step.name.trim().length > 0) {
+        output.name = step.name;
+      }
+      if (typeof step.text === "string" && step.text.trim().length > 0) {
+        output.preview = step.text;
+      }
 
-    return {
-      step_id:
-        typeof step.id === "string" && step.id.trim().length > 0
-          ? step.id
-          : `step_${index + 1}`,
-      status: "completed",
-      output,
-      started_at: startedAt,
-      completed_at: completedAt,
-      error: null,
-    };
-  });
+      return {
+        step_id:
+          typeof step.id === "string" && step.id.trim().length > 0
+            ? step.id
+            : `step_${index + 1}`,
+        status: failed ? "failed" : "completed",
+        output,
+        started_at: startedAt,
+        completed_at: completedAt,
+        error: failed ? "Agent returned partial work before failing" : null,
+        assignment_receipt:
+          isAgentAssignment && agentPubkey
+            ? {
+                agent_pubkey: agentPubkey,
+                agent_owner_pubkey: MOCK_IDENTITY_PUBKEY,
+                prompt_event_id: `${index + 3}`.repeat(64).slice(0, 64),
+                completion_event_id: failed
+                  ? null
+                  : `${index + 5}`.repeat(64).slice(0, 64),
+                prompt_published_at_ms: startedAt * 1_000,
+                terminal_at_ms: completedAt * 1_000,
+                duration_ms: 1_000,
+                rate_currency: "USD",
+                rate_microunits_per_hour: 12_000_000,
+                estimated_microunits: 3_333,
+                outcome: failed ? "failed" : "completed",
+                review_state: failed ? "human_review_required" : "not_required",
+              }
+            : null,
+      };
+    },
+  );
 
   const startedAt =
     executionTrace.length > 0
@@ -3512,15 +3555,34 @@ function buildMockWorkflowRun(workflow: MockWorkflow): RawWorkflowRun {
       ? (lastTraceEntry?.completed_at ?? createdAt)
       : createdAt;
 
+  const marketplace =
+    workflow.definition.marketplace &&
+    typeof workflow.definition.marketplace === "object" &&
+    !Array.isArray(workflow.definition.marketplace)
+      ? (workflow.definition.marketplace as Record<string, unknown>)
+      : null;
+  const fixedPrice =
+    marketplace?.fixed_price &&
+    typeof marketplace.fixed_price === "object" &&
+    !Array.isArray(marketplace.fixed_price)
+      ? (marketplace.fixed_price as Record<string, unknown>)
+      : null;
+  const failed = executionTrace.some((entry) => entry.status === "failed");
+
   return {
     id: `mock-run-${Date.now()}`,
     workflow_id: workflow.id,
-    status: "completed",
+    status: failed ? "failed" : "completed",
     current_step: null,
     execution_trace: executionTrace,
     started_at: startedAt,
     completed_at: completedAt,
-    error_message: null,
+    error_message: failed ? "Workflow stopped after agent failure" : null,
+    workflow_author_pubkey: workflow.owner_pubkey,
+    fixed_price_currency:
+      typeof fixedPrice?.currency === "string" ? fixedPrice.currency : null,
+    fixed_price_microunits:
+      typeof fixedPrice?.microunits === "number" ? fixedPrice.microunits : null,
     created_at: createdAt,
   };
 }
@@ -9838,12 +9900,17 @@ function sendToMockSocket(args: {
       return;
     }
 
-    if (filter.kinds?.includes(KIND_PERSONA)) {
+    if (
+      filter.kinds?.includes(KIND_PERSONA) ||
+      filter.kinds?.includes(KIND_MANAGED_AGENT)
+    ) {
       const authors = filter.authors?.map((author) => author.toLowerCase());
       const sourceIds = filter["#d"];
       for (const event of mockPersonaEvents) {
+        if (!filter.kinds?.includes(event.kind)) continue;
         if (authors && !authors.includes(event.pubkey.toLowerCase())) continue;
         if (
+          event.kind === KIND_PERSONA &&
           event.pubkey.toLowerCase() !== MOCK_IDENTITY_PUBKEY.toLowerCase() &&
           !personaHasExactSharedTag(event)
         ) {

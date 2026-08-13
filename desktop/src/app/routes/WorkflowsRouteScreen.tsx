@@ -22,6 +22,7 @@ export function WorkflowsRouteScreen({
         void goWorkflow(workflowId);
       }}
       selectedWorkflowId={selectedWorkflowId}
+      surface="manage"
     />
   );
 }

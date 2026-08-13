@@ -1,9 +1,39 @@
 import { expect, test } from "@playwright/test";
 
-import { installMockBridge } from "../helpers/bridge";
+import { installMockBridge, TEST_IDENTITIES } from "../helpers/bridge";
+
+const MARKETPLACE_AGENT_PUBKEY = TEST_IDENTITIES.alice.pubkey;
+const MARKETPLACE_AGENT_EVENT = {
+  id: "a".repeat(64),
+  pubkey: TEST_IDENTITIES.tyler.pubkey,
+  created_at: 1_800_000_000,
+  kind: 30177,
+  tags: [["d", MARKETPLACE_AGENT_PUBKEY]],
+  content: JSON.stringify({
+    name: "Rust Reviewer",
+    respond_to: "anyone",
+    marketplace: {
+      listed: true,
+      description: "Reviews Rust changes and reports correctness risks",
+      capabilities: ["rust", "review"],
+      deployment: "remote",
+      pricing: { currency: "USD", microunits_per_hour: 12_000_000 },
+    },
+  }),
+  sig: "",
+};
 
 test.beforeEach(async ({ page }) => {
-  await installMockBridge(page);
+  await installMockBridge(page, {
+    personaCatalogEvents: [MARKETPLACE_AGENT_EVENT],
+    relayAgents: [
+      {
+        pubkey: MARKETPLACE_AGENT_PUBKEY,
+        name: "Rust Reviewer",
+        status: "online",
+      },
+    ],
+  });
 });
 
 async function navigateToWorkflows(page: import("@playwright/test").Page) {
@@ -11,6 +41,15 @@ async function navigateToWorkflows(page: import("@playwright/test").Page) {
   await page.getByTestId("open-workflows-view").click();
   await expect(page).toHaveURL(/#\/workflows$/);
   await expect(page.getByTestId("workflows-view")).toBeVisible();
+}
+
+async function navigateToMarketplace(page: import("@playwright/test").Page) {
+  await page.goto("/");
+  await page.getByTestId("open-marketplace-view").click();
+  await expect(page).toHaveURL(/#\/marketplace$/);
+  await expect(
+    page.getByRole("heading", { name: "Marketplace", exact: true }),
+  ).toBeVisible();
 }
 
 async function createWorkflow(
@@ -69,6 +108,85 @@ test("navigates to workflows view and shows empty state", async ({ page }) => {
   await expect(
     page.getByRole("button", { name: "Create your first workflow" }),
   ).toBeVisible();
+});
+
+test("discovers a listed agent with presence and sanitized pricing", async ({
+  page,
+}) => {
+  await navigateToMarketplace(page);
+  await page
+    .getByTestId("workflows-view")
+    .getByRole("button", { name: "Agents", exact: true })
+    .click();
+
+  const listing = page.getByTestId(
+    `marketplace-agent-${MARKETPLACE_AGENT_PUBKEY}`,
+  );
+  await expect(listing).toContainText("Rust Reviewer");
+  await expect(listing).toContainText("Online");
+  await expect(listing).toContainText("USD 12/hour");
+  await expect(listing).toContainText("remote");
+  await expect(listing).toContainText("Direct use community");
+  await expect(listing).not.toContainText("system_prompt");
+});
+
+test("shows completed and failed assignment receipt evidence", async ({
+  page,
+}) => {
+  await navigateToWorkflows(page);
+  await page.getByRole("button", { name: "Create Workflow" }).click();
+  const dialog = page.getByRole("dialog");
+  await dialog.getByRole("button", { name: "Edit as YAML" }).click();
+  await dialog.locator("textarea").fill(`
+name: Marketplace review
+trigger:
+  on: message_posted
+marketplace:
+  listed: true
+  summary: Review a release candidate
+  fixed_price:
+    currency: USD
+    microunits: 5000000
+steps:
+  - id: completed_review
+    action: assign_to_agent
+    agent: Rust Reviewer
+    agent_pubkey: ${MARKETPLACE_AGENT_PUBKEY}
+    instruction: review it
+  - id: failed_review
+    action: assign_to_agent
+    agent: Rust Reviewer
+    agent_pubkey: ${MARKETPLACE_AGENT_PUBKEY}
+    instruction: fail in e2e
+`);
+  await dialog.getByRole("button", { name: "Create" }).click();
+
+  const card = page
+    .locator('[data-testid^="workflow-card-"]')
+    .filter({ hasText: "Marketplace review" });
+  await expect(card).toContainText("Listed");
+  await expect(card).toContainText("USD 5 fixed display price");
+  await card.getByRole("button", { name: "View Marketplace review" }).click();
+
+  const panel = page.getByTestId("workflow-detail-panel");
+  await panel.getByRole("button", { name: "Trigger" }).click();
+  const receipt = panel.getByTestId("workflow-run-receipt");
+  await expect(receipt).toContainText("Accounting preview");
+  await expect(receipt).toContainText("Fixed display price");
+  await expect(receipt).toContainText("USD 5");
+  await expect(receipt).toContainText("USD 0.006666");
+
+  const assignments = panel.getByTestId("assignment-receipt");
+  await expect(assignments).toHaveCount(2);
+  await expect(assignments.nth(0)).toContainText("completed");
+  await expect(assignments.nth(0)).toContainText("not required");
+  await expect(assignments.nth(1)).toContainText("failed");
+  await expect(assignments.nth(1)).toContainText("human review required");
+  await expect(assignments.nth(1)).toContainText("Completion ID unavailable");
+  await expect(assignments.nth(1)).toContainText("Live telemetry: unavailable");
+  await expect(assignments.nth(1)).toContainText(
+    "Usage diagnostics: unavailable",
+  );
 });
 
 test("creates a workflow via the form builder", async ({ page }) => {

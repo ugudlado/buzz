@@ -1,4 +1,5 @@
 import {
+  AlertTriangle,
   Clock,
   Copy,
   MoreHorizontal,
@@ -9,8 +10,16 @@ import {
 } from "lucide-react";
 
 import type { Workflow } from "@/shared/api/types";
+import type { MarketplaceAgent } from "@/shared/api/marketplace";
+import type { PresenceLookup } from "@/shared/api/types";
+import { PubKey } from "@/shared/ui/PubKey";
 import { Badge } from "@/shared/ui/badge";
 import { Button } from "@/shared/ui/button";
+import {
+  formatMicrounits,
+  getWorkflowAgentDependencies,
+  getWorkflowMarketplace,
+} from "../marketplace";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -32,6 +41,10 @@ type WorkflowCardProps = {
   onEdit: (workflow: Workflow) => void;
   onDuplicate: (workflow: Workflow) => void;
   onDelete: (workflow: Workflow) => void;
+  marketplaceAgents?: readonly MarketplaceAgent[];
+  presence?: PresenceLookup;
+  presenceLoaded?: boolean;
+  canManage?: boolean;
 };
 
 function StatusBadge({ status }: { status: Workflow["status"] }) {
@@ -56,10 +69,25 @@ export function WorkflowCard({
   onEdit,
   onDuplicate,
   onDelete,
+  marketplaceAgents = [],
+  presence,
+  presenceLoaded = false,
+  canManage = false,
 }: WorkflowCardProps) {
   const displayStatus = getWorkflowDisplayStatus(workflow);
   const description = getWorkflowDescription(workflow.definition);
   const triggerSummary = getWorkflowTriggerSummary(workflow.definition);
+  const marketplace = getWorkflowMarketplace(workflow.definition);
+  const dependencies = getWorkflowAgentDependencies(
+    workflow.definition,
+    marketplaceAgents,
+    presence,
+    presenceLoaded,
+  );
+  const unavailableDependencies = dependencies.filter(
+    (dependency) =>
+      dependency.state === "missing" || dependency.state === "offline",
+  );
 
   return (
     <div
@@ -84,6 +112,7 @@ export function WorkflowCard({
               {workflow.name}
             </span>
             <StatusBadge status={displayStatus} />
+            {marketplace ? <Badge variant="info">Listed</Badge> : null}
           </div>
           <div className="mt-1.5 flex items-center gap-3 pl-6 text-2xs text-muted-foreground">
             {channelName ? <span>{channelName}</span> : null}
@@ -93,9 +122,51 @@ export function WorkflowCard({
               {new Date(workflow.updatedAt * 1000).toLocaleDateString()}
             </span>
           </div>
-          {description ? (
+          {marketplace?.summary || description ? (
             <p className="mt-2 pl-6 text-xs text-muted-foreground">
-              {description}
+              {marketplace?.summary || description}
+            </p>
+          ) : null}
+          {marketplace ? (
+            <div className="mt-2 flex flex-wrap items-center gap-2 pl-6 text-2xs text-muted-foreground">
+              <span>
+                {marketplace.fixedPrice
+                  ? `${formatMicrounits(
+                      marketplace.fixedPrice.currency,
+                      marketplace.fixedPrice.microunits,
+                    )} fixed display price`
+                  : "Usage-based"}
+              </span>
+              <span className="flex items-center gap-1">
+                by <PubKey pubkey={workflow.ownerPubkey} />
+              </span>
+            </div>
+          ) : null}
+          {dependencies.length > 0 ? (
+            <div className="mt-2 flex flex-wrap gap-1.5 pl-6">
+              {dependencies.map((dependency) => (
+                <Badge
+                  key={dependency.pubkey ?? dependency.name}
+                  variant={
+                    dependency.state === "missing" ||
+                    dependency.state === "offline"
+                      ? "warning"
+                      : dependency.state === "online"
+                        ? "success"
+                        : "secondary"
+                  }
+                >
+                  {dependency.name} · {dependency.state}
+                </Badge>
+              ))}
+            </div>
+          ) : null}
+          {unavailableDependencies.length > 0 ? (
+            <p className="mt-2 flex items-center gap-1.5 pl-6 text-xs text-amber-600 dark:text-amber-400">
+              <AlertTriangle className="h-4 w-4 shrink-0" />
+              {unavailableDependencies.length === 1
+                ? "1 agent dependency is unavailable"
+                : `${unavailableDependencies.length} agent dependencies are unavailable`}
             </p>
           ) : null}
         </div>
@@ -112,25 +183,31 @@ export function WorkflowCard({
             </Button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end">
-            <DropdownMenuItem onClick={() => onTrigger(workflow.id)}>
-              <Play className="mr-2 h-4 w-4" />
-              Trigger
-            </DropdownMenuItem>
-            <DropdownMenuItem onClick={() => onEdit(workflow)}>
-              <Pencil className="mr-2 h-4 w-4" />
-              Edit
-            </DropdownMenuItem>
+            {canManage ? (
+              <DropdownMenuItem onClick={() => onTrigger(workflow.id)}>
+                <Play className="mr-2 h-4 w-4" />
+                Trigger
+              </DropdownMenuItem>
+            ) : null}
+            {canManage ? (
+              <DropdownMenuItem onClick={() => onEdit(workflow)}>
+                <Pencil className="mr-2 h-4 w-4" />
+                Edit
+              </DropdownMenuItem>
+            ) : null}
             <DropdownMenuItem onClick={() => onDuplicate(workflow)}>
               <Copy className="mr-2 h-4 w-4" />
               Duplicate
             </DropdownMenuItem>
-            <DropdownMenuItem
-              className="text-destructive"
-              onClick={() => onDelete(workflow)}
-            >
-              <Trash2 className="mr-2 h-4 w-4" />
-              Delete
-            </DropdownMenuItem>
+            {canManage ? (
+              <DropdownMenuItem
+                className="text-destructive"
+                onClick={() => onDelete(workflow)}
+              >
+                <Trash2 className="mr-2 h-4 w-4" />
+                Delete
+              </DropdownMenuItem>
+            ) : null}
           </DropdownMenuContent>
         </DropdownMenu>
       </div>
