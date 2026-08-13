@@ -1148,26 +1148,6 @@ async fn main() -> anyhow::Result<()> {
 
                 match sweep_state.db.sweep_expired_agent_steps(100).await {
                     Ok(expired) => {
-                        for agent_step in &expired {
-                            // Conditional UPDATE: only fails runs still
-                            // `waiting_agent`, so a run that resumed between
-                            // the row expiring and this tick is left alone.
-                            if let Err(e) = sweep_state
-                                .db
-                                .fail_run_if_waiting_agent(
-                                    agent_step.community_id,
-                                    agent_step.run_id,
-                                    agent_step.step_index,
-                                    "agent assignment expired",
-                                )
-                                .await
-                            {
-                                tracing::error!(
-                                    run_id = %agent_step.run_id,
-                                    "Agent-step sweep: failed to fail expired run: {e}"
-                                );
-                            }
-                        }
                         if !expired.is_empty() {
                             tracing::info!(
                                 count = expired.len(),

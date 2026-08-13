@@ -130,7 +130,16 @@ pub async fn list_workflow_runs(
         .await
         .map_err(|e| internal_error(&format!("list workflow runs: {e}")))?;
 
-    Ok(Json(Value::Array(runs.iter().map(run_json).collect())))
+    let mut values = Vec::with_capacity(runs.len());
+    for run in &runs {
+        let agent_steps = state
+            .db
+            .list_agent_steps_for_run(tenant.community(), run.id)
+            .await
+            .map_err(|e| internal_error(&format!("list workflow agent steps: {e}")))?;
+        values.push(run_json_with_receipts(run, &agent_steps));
+    }
+    Ok(Json(Value::Array(values)))
 }
 
 /// `GET /api/workflows/{workflow_id}/runs/{run_id}/approvals` — list approval
@@ -176,7 +185,62 @@ fn run_json(run: &WorkflowRunRecord) -> Value {
         "completed_at": run.completed_at.map(|t| t.timestamp()),
         "error_message": run.error_message,
         "created_at": run.created_at.timestamp(),
+        "workflow_author_pubkey": run.workflow_author_pubkey.as_ref().map(hex::encode),
+        "fixed_price_currency": run.fixed_price_currency,
+        "fixed_price_microunits": run.fixed_price_microunits,
     })
+}
+
+fn run_json_with_receipts(
+    run: &WorkflowRunRecord,
+    agent_steps: &[buzz_db::workflow::AgentStepRecord],
+) -> Value {
+    let mut value = run_json(run);
+    let Some(trace) = value
+        .get_mut("execution_trace")
+        .and_then(Value::as_array_mut)
+    else {
+        return value;
+    };
+    for step in agent_steps {
+        let outcome = step.outcome.as_deref().unwrap_or("pending");
+        let Some(entry) = trace.iter_mut().find(|entry| {
+            entry.get("step_id").and_then(Value::as_str) == Some(step.step_id.as_str())
+        }) else {
+            continue;
+        };
+        let estimated = step
+            .rate_microunits_per_hour
+            .zip(step.duration_ms)
+            .and_then(|(rate, duration)| {
+                buzz_core::marketplace::estimated_microunits(rate as u64, duration as u64).ok()
+            });
+        if step.outcome.is_some() {
+            entry["status"] = Value::String(outcome.to_string());
+        }
+        if let Some(terminal_at) = step.terminal_at {
+            entry["completed_at"] = Value::from(terminal_at.timestamp());
+        }
+        entry["assignment_receipt"] = serde_json::json!({
+            "agent_pubkey": hex::encode(&step.agent_pubkey),
+            "agent_owner_pubkey": step.agent_owner_pubkey.as_ref().map(hex::encode),
+            "prompt_event_id": step.prompt_event_id,
+            "completion_event_id": step.completion_event_id,
+            "prompt_published_at_ms": step.prompt_published_at.map(|time| time.timestamp_millis()),
+            "terminal_at_ms": step.terminal_at.map(|time| time.timestamp_millis()),
+            "duration_ms": step.duration_ms,
+            "rate_currency": step.rate_currency,
+            "rate_microunits_per_hour": step.rate_microunits_per_hour,
+            "estimated_microunits": estimated,
+            "outcome": outcome,
+            "review_state": if matches!(outcome, "completed" | "pending") {
+                "not_required"
+            } else {
+                "human_review_required"
+            },
+        });
+    }
+    value
 }
 
 /// Serialize an [`ApprovalRecord`] into the desktop's `RawWorkflowApproval`
@@ -219,6 +283,9 @@ mod tests {
             completed_at: None,
             error_message: None,
             created_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+            workflow_author_pubkey: None,
+            fixed_price_currency: None,
+            fixed_price_microunits: None,
         }
     }
 
@@ -236,6 +303,79 @@ mod tests {
             expires_at: Utc.timestamp_opt(1_700_003_600, 0).unwrap(),
             created_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
         }
+    }
+
+    #[test]
+    fn terminal_agent_step_adds_reproducible_receipt() {
+        let mut run = sample_run();
+        run.execution_trace = serde_json::json!([{
+            "step_id": "review",
+            "status": "waiting",
+            "output": {"summary": "partial review"}
+        }]);
+        let prompt_at = Utc.timestamp_millis_opt(1_700_000_000_000).unwrap();
+        let step = buzz_db::workflow::AgentStepRecord {
+            prompt_event_id: "prompt-id".into(),
+            workflow_id: Uuid::nil(),
+            run_id: Uuid::nil(),
+            step_id: "review".into(),
+            step_index: 0,
+            agent_pubkey: vec![0x11; 32],
+            status: buzz_db::workflow::AgentStepStatus::Done,
+            output: None,
+            expires_at: prompt_at + chrono::Duration::minutes(5),
+            created_at: prompt_at,
+            resolved_at: Some(prompt_at + chrono::Duration::seconds(90)),
+            agent_owner_pubkey: Some(vec![0x22; 32]),
+            rate_currency: Some("USD".into()),
+            rate_microunits_per_hour: Some(12_000_000),
+            prompt_published_at: Some(prompt_at),
+            completion_event_id: Some("completion-id".into()),
+            terminal_at: Some(prompt_at + chrono::Duration::seconds(90)),
+            duration_ms: Some(90_000),
+            outcome: Some("failed".into()),
+        };
+
+        let value = run_json_with_receipts(&run, &[step]);
+        let receipt = &value["execution_trace"][0]["assignment_receipt"];
+        assert_eq!(receipt["estimated_microunits"], 300_000);
+        assert_eq!(receipt["review_state"], "human_review_required");
+        assert_eq!(receipt["completion_event_id"], "completion-id");
+        assert_eq!(value["execution_trace"][0]["status"], "failed");
+    }
+
+    #[test]
+    fn pending_agent_step_exposes_snapshotted_rate() {
+        let mut run = sample_run();
+        run.execution_trace = serde_json::json!([{"step_id": "review", "status": "waiting"}]);
+        let prompt_at = Utc.timestamp_millis_opt(1_700_000_000_000).unwrap();
+        let step = buzz_db::workflow::AgentStepRecord {
+            prompt_event_id: "prompt-id".into(),
+            workflow_id: Uuid::nil(),
+            run_id: Uuid::nil(),
+            step_id: "review".into(),
+            step_index: 0,
+            agent_pubkey: vec![0x11; 32],
+            status: buzz_db::workflow::AgentStepStatus::Pending,
+            output: None,
+            expires_at: prompt_at + chrono::Duration::minutes(5),
+            created_at: prompt_at,
+            resolved_at: None,
+            agent_owner_pubkey: Some(vec![0x22; 32]),
+            rate_currency: Some("USD".into()),
+            rate_microunits_per_hour: Some(12_000_000),
+            prompt_published_at: Some(prompt_at),
+            completion_event_id: None,
+            terminal_at: None,
+            duration_ms: None,
+            outcome: None,
+        };
+
+        let value = run_json_with_receipts(&run, &[step]);
+        let receipt = &value["execution_trace"][0]["assignment_receipt"];
+        assert_eq!(receipt["outcome"], "pending");
+        assert_eq!(receipt["rate_microunits_per_hour"], 12_000_000);
+        assert_eq!(receipt["estimated_microunits"], Value::Null);
     }
 
     /// `run_json` must produce every field `RawWorkflowRun`

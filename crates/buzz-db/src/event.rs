@@ -1302,6 +1302,28 @@ pub async fn insert_event_with_thread_metadata(
     Ok(result)
 }
 
+/// Atomically persist a workflow assignment prompt and arm its receipt row.
+pub async fn insert_workflow_assignment_event(
+    pool: &PgPool,
+    community_id: CommunityId,
+    event: &Event,
+    channel_id: Option<Uuid>,
+    thread_meta: Option<ThreadMetadataParams<'_>>,
+    assignment: crate::workflow::CreateAgentStepParams<'_>,
+) -> Result<(StoredEvent, bool)> {
+    let mut tx = pool.begin().await?;
+    let result =
+        insert_event_with_thread_metadata_tx(&mut tx, community_id, event, channel_id, thread_meta)
+            .await?;
+    if !result.1 || !crate::workflow::create_agent_step_tx(&mut tx, assignment).await? {
+        return Err(crate::DbError::InvalidData(
+            "workflow assignment prompt is already associated".into(),
+        ));
+    }
+    tx.commit().await?;
+    Ok(result)
+}
+
 /// Atomically insert a kind:7 reaction event and its reaction row.
 ///
 /// Ordering is load-bearing: resolve target, upsert/reactivate the reaction row,

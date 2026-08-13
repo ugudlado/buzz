@@ -2243,6 +2243,36 @@ impl Db {
         Ok(result)
     }
 
+    /// Atomically persist a workflow assignment prompt and arm its receipt.
+    pub async fn insert_workflow_assignment_event(
+        &self,
+        community_id: CommunityId,
+        event: &nostr::Event,
+        channel_id: Option<Uuid>,
+        thread_meta: Option<event::ThreadMetadataParams<'_>>,
+        assignment: workflow::CreateAgentStepParams<'_>,
+    ) -> Result<(StoredEvent, bool)> {
+        let result = event::insert_workflow_assignment_event(
+            &self.pool,
+            community_id,
+            event,
+            channel_id,
+            thread_meta,
+            assignment,
+        )
+        .await?;
+        if result.1 {
+            let pool = self.pool.clone();
+            let event = event.clone();
+            tokio::spawn(async move {
+                if let Err(e) = insert_mentions(&pool, community_id, &event, channel_id).await {
+                    tracing::warn!(event_id = %event.id, "Failed to insert mentions: {e}");
+                }
+            });
+        }
+        Ok(result)
+    }
+
     /// Atomically insert a kind:7 reaction event and its reaction row.
     #[allow(clippy::too_many_arguments)]
     #[datastore_span(
@@ -4074,10 +4104,35 @@ impl Db {
         .await
     }
 
+    /// Fail a workflow run only if it is still actively executing.
+    pub async fn fail_workflow_run_if_running(
+        &self,
+        community_id: CommunityId,
+        id: uuid::Uuid,
+        current_step: i32,
+        trace: &serde_json::Value,
+        error: &str,
+    ) -> Result<bool> {
+        workflow::fail_workflow_run_if_running(
+            &self.pool,
+            community_id,
+            id,
+            current_step,
+            trace,
+            error,
+        )
+        .await
+    }
+
     /// CAS a run's status `waiting_approval|waiting_agent -> running` before resuming it.
     /// See [`workflow::try_mark_run_resuming`].
-    pub async fn try_mark_run_resuming(&self, community_id: CommunityId, id: Uuid) -> Result<bool> {
-        workflow::try_mark_run_resuming(&self.pool, community_id, id).await
+    pub async fn try_mark_run_resuming(
+        &self,
+        community_id: CommunityId,
+        id: Uuid,
+        expected_step: i32,
+    ) -> Result<bool> {
+        workflow::try_mark_run_resuming(&self.pool, community_id, id, expected_step).await
     }
 
     /// Fail a run still `waiting_agent` in one conditional UPDATE.
@@ -4187,8 +4242,20 @@ impl Db {
     pub async fn create_agent_step(
         &self,
         params: workflow::CreateAgentStepParams<'_>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         workflow::create_agent_step(&self.pool, params).await
+    }
+
+    /// Attach a waiting trace unless the run has already resumed.
+    pub async fn update_waiting_agent_trace(
+        &self,
+        community_id: CommunityId,
+        run_id: uuid::Uuid,
+        step_index: i32,
+        trace: &serde_json::Value,
+    ) -> Result<bool> {
+        workflow::update_waiting_agent_trace(&self.pool, community_id, run_id, step_index, trace)
+            .await
     }
 
     /// Fetch an agent-assignment step by its prompt event id.
@@ -4198,6 +4265,15 @@ impl Db {
         prompt_event_id: &str,
     ) -> Result<workflow::AgentStepRecord> {
         workflow::get_agent_step(&self.pool, community_id, prompt_event_id).await
+    }
+
+    /// List durable agent-assignment receipts for a run.
+    pub async fn list_agent_steps_for_run(
+        &self,
+        community_id: CommunityId,
+        run_id: Uuid,
+    ) -> Result<Vec<workflow::AgentStepRecord>> {
+        workflow::list_agent_steps_for_run(&self.pool, community_id, run_id).await
     }
 
     /// Update an agent step's status and optional output.
@@ -4218,11 +4294,18 @@ impl Db {
         .await
     }
 
+    /// Complete an agent step and atomically persist its marketplace receipt.
+    pub async fn complete_agent_step_by_prompt_event_id(
+        &self,
+        params: workflow::CompleteAgentStepParams<'_>,
+    ) -> Result<bool> {
+        workflow::complete_agent_step_by_prompt_event_id(&self.pool, params).await
+    }
+
     /// Sweep overdue `workflow_agent_steps` rows to `status = 'expired'`.
     ///
-    /// Returns one entry per swept row; callers are responsible for
-    /// finalizing the associated `workflow_runs` row (this call only touches
-    /// `workflow_agent_steps`). `limit` bounds one sweep tick.
+    /// Atomically finalizes each swept row and its still-waiting run. `limit`
+    /// bounds one sweep tick.
     pub async fn sweep_expired_agent_steps(
         &self,
         limit: i64,

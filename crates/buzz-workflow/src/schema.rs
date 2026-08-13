@@ -5,6 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use buzz_core::marketplace::WorkflowMarketplace;
 use serde::{Deserialize, Serialize};
 
 use crate::error::WorkflowError;
@@ -24,6 +25,9 @@ pub struct WorkflowDef {
     /// Whether this workflow is active. Defaults to `true`.
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Optional community marketplace listing metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub marketplace: Option<WorkflowMarketplace>,
 }
 
 fn default_true() -> bool {
@@ -203,6 +207,13 @@ impl WorkflowDef {
             ));
         }
 
+        if let Some(marketplace) = &self.marketplace {
+            marketplace
+                .clone()
+                .normalized()
+                .map_err(WorkflowError::InvalidDefinition)?;
+        }
+
         // Validate step IDs are safe for use in evalexpr variable names.
         // Step IDs become variable names like `steps_{id}_output_{field}`,
         // so they must only contain alphanumeric chars and underscores.
@@ -334,8 +345,13 @@ pub(crate) fn normalize_cron(expr: &str) -> String {
 ///
 /// Returns `(WorkflowDef, canonical_json)` on success.
 pub fn parse_yaml(yaml: &str) -> Result<(WorkflowDef, String), WorkflowError> {
-    let def: WorkflowDef = serde_yaml::from_str(yaml)?;
+    let mut def: WorkflowDef = serde_yaml::from_str(yaml)?;
     def.validate()?;
+    def.marketplace = def
+        .marketplace
+        .map(WorkflowMarketplace::normalized)
+        .transpose()
+        .map_err(WorkflowError::InvalidDefinition)?;
     let json =
         serde_json::to_string(&def).map_err(|e| WorkflowError::InvalidDefinition(e.to_string()))?;
     Ok((def, json))
@@ -344,6 +360,22 @@ pub fn parse_yaml(yaml: &str) -> Result<(WorkflowDef, String), WorkflowError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn marketplace_metadata_is_validated_and_normalized() {
+        let (def, _) = parse_yaml(
+            "name: Listed\ntrigger:\n  on: manual\nmarketplace:\n  listed: true\n  summary: '  Review release notes  '\n  fixed_price:\n    currency: USD\n    microunits: 5000000\nsteps:\n  - id: send\n    action: send_message\n    text: done\n",
+        )
+        .unwrap();
+        let listing = def.marketplace.unwrap();
+        assert_eq!(listing.summary, "Review release notes");
+        assert_eq!(listing.fixed_price.unwrap().microunits, 5_000_000);
+
+        assert!(parse_yaml(
+            "name: Bad\ntrigger:\n  on: manual\nmarketplace:\n  listed: true\n  summary: bad\n  fixed_price:\n    currency: usd\n    microunits: 1\nsteps:\n  - id: send\n    action: send_message\n    text: done\n",
+        )
+        .is_err());
+    }
 
     #[test]
     fn parse_simple_message_posted_workflow() {

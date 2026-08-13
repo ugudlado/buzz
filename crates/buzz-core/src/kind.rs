@@ -820,6 +820,7 @@ pub const fn is_command_kind(kind: u32) -> bool {
             | KIND_DM_ADD_MEMBER
             | KIND_DM_HIDE
             | KIND_WORKFLOW_TRIGGER
+            | KIND_WORKFLOW_CANCELLED
             | KIND_APPROVAL_GRANT
             | KIND_APPROVAL_DENY
     )
@@ -921,6 +922,12 @@ mod tests {
         assert!(is_parameterized_replaceable(39000)); // NIP-29 group metadata
         assert!(is_parameterized_replaceable(39999));
         assert!(!is_parameterized_replaceable(40000));
+    }
+
+    #[test]
+    fn workflow_cancelled_is_an_ingested_command_and_execution_event() {
+        assert!(is_command_kind(KIND_WORKFLOW_CANCELLED));
+        assert!(is_workflow_execution_kind(KIND_WORKFLOW_CANCELLED));
     }
 
     #[test]

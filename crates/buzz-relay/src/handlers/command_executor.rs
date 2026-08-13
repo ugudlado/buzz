@@ -1,6 +1,6 @@
 //! Command executor — transactional event processing for command kinds.
 //!
-//! Command kinds (41010–41012, 30620, 46020, 46030–46031) are processed
+//! Command kinds (41010–41012, 30620, 46007, 46020, 46030–46031) are processed
 //! transactionally: validate → begin tx → insert event → execute mutations → commit.
 //!
 //! SECURITY: This module is only reachable AFTER the ingest pipeline has verified:
@@ -68,6 +68,7 @@ pub async fn handle_command(
         KIND_DM_HIDE => handle_dm_hide(tenant, state, &event, &auth).await,
         KIND_WORKFLOW_DEF => handle_workflow_def(tenant, state, &event, &auth).await,
         KIND_WORKFLOW_TRIGGER => handle_workflow_trigger(tenant, state, &event, &auth).await,
+        KIND_WORKFLOW_CANCELLED => handle_workflow_cancel(tenant, state, &event, &auth).await,
         KIND_APPROVAL_GRANT => handle_approval_grant(tenant, state, &event, &auth).await,
         KIND_APPROVAL_DENY => handle_approval_deny(tenant, state, &event, &auth).await,
         _ => Err(IngestError::Rejected(format!(
@@ -982,6 +983,7 @@ async fn handle_workflow_trigger(
             &trigger_ctx_clone,
             0,
             None,
+            None,
         )
         .await;
         engine
@@ -998,6 +1000,110 @@ async fn handle_workflow_trigger(
             serde_json::json!({
                 "run_id": run_id.to_string(),
             })
+        ),
+    })
+}
+
+/// Cancel an in-flight agent assignment using the reserved workflow-cancelled kind.
+async fn handle_workflow_cancel(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    event: &Event,
+    auth: &IngestAuth,
+) -> Result<IngestResult, IngestError> {
+    let run_id = extract_d_tag(event)
+        .ok_or_else(|| IngestError::Rejected("invalid: missing d tag (run_id)".into()))?
+        .parse::<Uuid>()
+        .map_err(|_| IngestError::Rejected("invalid: bad run_id format".into()))?;
+    let community_id = tenant.community();
+    let run = state
+        .db
+        .get_workflow_run(community_id, run_id)
+        .await
+        .map_err(|_| IngestError::Rejected("invalid: workflow run not found".into()))?;
+    if run.status != RunStatus::WaitingAgent {
+        return Err(IngestError::Rejected(
+            "invalid: only a run waiting on an agent can be cancelled".into(),
+        ));
+    }
+    if run.workflow_author_pubkey.as_deref() != Some(auth.pubkey().to_bytes().as_slice()) {
+        return Err(IngestError::Rejected(
+            "forbidden: only the workflow author can cancel this run".into(),
+        ));
+    }
+    let workflow = state
+        .db
+        .get_workflow(community_id, run.workflow_id)
+        .await
+        .map_err(|_| IngestError::Rejected("invalid: workflow not found".into()))?;
+
+    let mut tx = match persist_command_event(state, tenant, event, workflow.channel_id).await? {
+        PersistResult::Duplicate => {
+            return Ok(IngestResult {
+                event_id: event.id.to_hex(),
+                accepted: true,
+                message: "duplicate: already processed".into(),
+            });
+        }
+        PersistResult::Inserted(tx) => tx,
+    };
+
+    let cancelled_at = Utc::now();
+    let assignment_updated = sqlx::query(
+        r#"
+        UPDATE workflow_agent_steps
+        SET status = 'failed', resolved_at = $1,
+            terminal_at = GREATEST(prompt_published_at, LEAST($1, expires_at)),
+            duration_ms = GREATEST(0, FLOOR(EXTRACT(EPOCH FROM
+                (GREATEST(prompt_published_at, LEAST($1, expires_at)) - prompt_published_at)
+            ) * 1000)::BIGINT),
+            outcome = 'cancelled'
+        WHERE community_id = $2 AND run_id = $3 AND status = 'pending'
+        "#,
+    )
+    .bind(cancelled_at)
+    .bind(community_id.as_uuid())
+    .bind(run_id)
+    .execute(tx.as_mut())
+    .await
+    .map_err(|e| IngestError::Internal(format!("error: cancel assignment: {e}")))?
+    .rows_affected();
+    if assignment_updated != 1 {
+        return Err(IngestError::Rejected(
+            "invalid: agent assignment is no longer pending".into(),
+        ));
+    }
+
+    let run_updated = sqlx::query(
+        r#"
+        UPDATE workflow_runs
+        SET status = 'cancelled', completed_at = $1,
+            error_message = 'workflow cancelled by author'
+        WHERE community_id = $2 AND id = $3 AND status = 'waiting_agent'
+        "#,
+    )
+    .bind(cancelled_at)
+    .bind(community_id.as_uuid())
+    .bind(run_id)
+    .execute(tx.as_mut())
+    .await
+    .map_err(|e| IngestError::Internal(format!("error: cancel workflow run: {e}")))?
+    .rows_affected();
+    if run_updated != 1 {
+        return Err(IngestError::Rejected(
+            "invalid: workflow run is no longer waiting on an agent".into(),
+        ));
+    }
+
+    tx.commit()
+        .await
+        .map_err(|e| IngestError::Internal(format!("error: commit cancellation: {e}")))?;
+    Ok(IngestResult {
+        event_id: event.id.to_hex(),
+        accepted: true,
+        message: format!(
+            "response:{}",
+            serde_json::json!({ "run_id": run_id, "status": "cancelled" })
         ),
     })
 }
@@ -1370,16 +1476,11 @@ async fn resume_workflow_after_approval(
         &trigger_ctx,
         resume_index,
         Some(initial_outputs),
+        existing_trace,
     )
     .await;
     engine
-        .finalize_run(
-            community_id,
-            run.workflow_id,
-            run_id,
-            result,
-            existing_trace,
-        )
+        .finalize_run(community_id, run.workflow_id, run_id, result, None)
         .await;
 }
 
@@ -1404,7 +1505,12 @@ async fn resume_workflow_after_approval(
 /// On a match, the row is CAS'd `pending -> done` *before* any further work
 /// (guards against a duplicate reply or a concurrent expiry-sweep resume).
 /// Only the CAS winner parses the completion block and resumes the run.
-pub async fn try_resume_agent_step(tenant: &TenantContext, state: &Arc<AppState>, event: &Event) {
+pub async fn try_resume_agent_step(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    event: &Event,
+    received_at: chrono::DateTime<chrono::Utc>,
+) {
     // buzz-acp posts completions as direct replies to the run's thread root
     // (so the run reads as one flat thread) and names the completed prompt
     // in a `buzz:completion-of` tag. Prefer that; fall back to the NIP-10
@@ -1504,15 +1610,22 @@ pub async fn try_resume_agent_step(tenant: &TenantContext, state: &Arc<AppState>
         event.created_at.as_secs() as i64,
         root_thread.as_ref(),
     );
+    let outcome = match completion.status {
+        buzz_workflow::CompletionStatus::Success => "completed",
+        buzz_workflow::CompletionStatus::Failed => "failed",
+    };
 
     let updated = match state
         .db
-        .update_agent_step_by_prompt_event_id(
+        .complete_agent_step_by_prompt_event_id(buzz_db::workflow::CompleteAgentStepParams {
             community_id,
-            &prompt_event_id,
-            buzz_db::workflow::AgentStepStatus::Done,
-            Some(&output),
-        )
+            prompt_event_id: &prompt_event_id,
+            status: buzz_db::workflow::AgentStepStatus::Done,
+            output: Some(&output),
+            completion_event_id: Some(&event.id.to_hex()),
+            terminal_at: received_at,
+            outcome,
+        })
         .await
     {
         Ok(updated) => updated,
@@ -1580,11 +1693,6 @@ fn agent_completion_to_output_json(
         },
         "outputs": outputs,
         "reason": completion.reason,
-        "usage": completion.usage.as_ref().map(|u| serde_json::json!({
-            "input_tokens": u.input_tokens,
-            "output_tokens": u.output_tokens,
-            "cost": u.cost,
-        })),
     })
 }
 
@@ -1620,36 +1728,6 @@ async fn resume_from_done_agent_step(
             }
         },
     };
-
-    // CAS the run waiting_agent -> running before doing any resume work —
-    // this, not the earlier status check alone, is what prevents two
-    // concurrent resume attempts for the same run (e.g. the crash-recovery
-    // sweeper racing a still-in-flight live resume once both are past the
-    // grace period) from both calling `execute_from_step`. Only the CAS
-    // winner proceeds; the loser's run has already been (or is being)
-    // resumed by the other caller.
-    match state
-        .db
-        .try_mark_run_resuming(community_id, step.run_id)
-        .await
-    {
-        Ok(true) => {}
-        Ok(false) => {
-            tracing::warn!(
-                run_id = %step.run_id,
-                "Agent-step resume: run has status '{}', expected 'waiting_agent' (lost resume race or already resumed)",
-                run.status
-            );
-            return;
-        }
-        Err(e) => {
-            tracing::error!(
-                run_id = %step.run_id,
-                "Agent-step resume: failed to CAS run to running: {e}"
-            );
-            return;
-        }
-    }
 
     let workflow = match state.db.get_workflow(community_id, step.workflow_id).await {
         Ok(w) => w,
@@ -1747,14 +1825,49 @@ async fn resume_from_done_agent_step(
         None => trace.push(completed_entry),
     }
 
+    if completion_failed {
+        if let Err(e) = state
+            .db
+            .update_workflow_run(
+                community_id,
+                step.run_id,
+                RunStatus::Failed,
+                step.step_index,
+                &serde_json::Value::Array(trace),
+                output.get("reason").and_then(|value| value.as_str()),
+            )
+            .await
+        {
+            tracing::error!(run_id = %step.run_id, "Agent-step resume: failed to persist failed completion: {e}");
+        }
+        return;
+    }
+
     let trigger_ctx: TriggerContext = run
         .trigger_context
         .as_ref()
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default();
 
+    // Claim only after every fallible preparation step. If a workflow read or
+    // decode fails, the run remains waiting and the existing sweeper can retry.
+    match state
+        .db
+        .try_mark_run_resuming(community_id, step.run_id, step.step_index)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(e) => {
+            tracing::error!(
+                run_id = %step.run_id,
+                "Agent-step resume: failed to CAS run to running: {e}"
+            );
+            return;
+        }
+    }
+
     let resume_index = step.step_index as usize + 1;
-    let existing_trace = Some(trace);
     let result = buzz_workflow::executor::execute_from_step(
         &state.workflow_engine,
         community_id,
@@ -1763,17 +1876,12 @@ async fn resume_from_done_agent_step(
         &trigger_ctx,
         resume_index,
         Some(initial_outputs),
+        Some(trace),
     )
     .await;
     state
         .workflow_engine
-        .finalize_run(
-            community_id,
-            step.workflow_id,
-            step.run_id,
-            result,
-            existing_trace,
-        )
+        .finalize_run(community_id, step.workflow_id, step.run_id, result, None)
         .await;
 }
 
