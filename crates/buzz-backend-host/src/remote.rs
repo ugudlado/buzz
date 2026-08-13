@@ -315,7 +315,7 @@ fn unit_file(
         systemd_arg(path_text(generation)?)?,
         systemd_arg(path_text(acp)?)?,
         systemd_arg(path_text(workspace)?)?,
-        systemd_arg(path_text(workspace)?)?,
+        systemd_path(path_text(workspace)?)?,
     ))
 }
 
@@ -330,6 +330,18 @@ fn systemd_arg(value: &str) -> Result<String, String> {
             .replace('\\', "\\\\")
             .replace('"', "\\\"")
     ))
+}
+
+fn systemd_path(value: &str) -> Result<String, String> {
+    if value.contains(['\n', '\r', '\0']) {
+        return Err("systemd path contains a control character".into());
+    }
+    Ok(value
+        .replace('%', "%%")
+        .replace('\\', "\\x5c")
+        .replace(' ', "\\x20")
+        .replace('\t', "\\x09")
+        .replace('"', "\\x22"))
 }
 
 fn path_text(path: &Path) -> Result<&str, String> {
@@ -434,7 +446,7 @@ mod tests {
         assert!(unit.contains("Restart=no"));
         assert!(unit.contains("Type=exec"));
         assert!(unit.contains("KillMode=control-group"));
-        assert!(unit.contains("WorkingDirectory=\"/srv/buzz workspace\""));
+        assert!(unit.contains("WorkingDirectory=/srv/buzz\\x20workspace"));
         assert!(!unit.contains("BUZZ_PRIVATE_KEY"));
         assert!(!unit.contains("nsec1"));
     }
@@ -442,7 +454,9 @@ mod tests {
     #[test]
     fn systemd_paths_are_quoted_and_specifiers_escaped() {
         assert_eq!(systemd_arg("/tmp/a b%/c").unwrap(), "\"/tmp/a b%%/c\"");
+        assert_eq!(systemd_path("/tmp/a b%/c").unwrap(), "/tmp/a\\x20b%%/c");
         assert!(systemd_arg("/tmp/a\nb").is_err());
+        assert!(systemd_path("/tmp/a\nb").is_err());
     }
 
     #[test]

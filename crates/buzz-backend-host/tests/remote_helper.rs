@@ -238,7 +238,7 @@ fn remote_helper_writes_private_state_and_active_deploy_is_a_noop() {
     .unwrap();
     assert!(unit.contains("Restart=no"));
     assert!(unit.contains(&format!(
-        "WorkingDirectory=\"{}\"",
+        "WorkingDirectory={}",
         root.canonicalize().unwrap().display()
     )));
     assert!(!unit.contains(&nsec));
