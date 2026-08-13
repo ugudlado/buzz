@@ -270,6 +270,11 @@ impl RespondToArg {
 
 #[derive(Subcommand)]
 pub enum AgentsCmd {
+    /// Discover and publish community agent listings
+    Marketplace {
+        #[command(subcommand)]
+        command: AgentsMarketplaceCmd,
+    },
     /// Import a `buzz-agent-snapshot v1` (`.agent.json`) file directly into
     /// Buzz Desktop's local agent store, bypassing the desktop UI's Import
     /// dialog.
@@ -454,6 +459,44 @@ Examples:\n  \
 buzz agents archived"
     )]
     Archived,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub enum MarketplaceDeployment {
+    Local,
+    Remote,
+    Kubernetes,
+}
+
+#[derive(Subcommand)]
+pub enum AgentsMarketplaceCmd {
+    /// List agents published in this community's marketplace
+    List,
+    /// Publish or update an existing owner-authored managed agent listing
+    Publish {
+        /// Managed agent pubkey (the kind:30177 d-tag)
+        agent_pubkey: String,
+        /// Public listing description
+        #[arg(long)]
+        description: Option<String>,
+        /// Public capability labels (comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        capabilities: Vec<String>,
+        /// Descriptive deployment location
+        #[arg(long, value_enum)]
+        deployment: Option<MarketplaceDeployment>,
+        /// Hourly rate in integer micro-units
+        #[arg(long, requires = "currency")]
+        rate: Option<u64>,
+        /// Three-letter uppercase currency code
+        #[arg(long, requires = "rate")]
+        currency: Option<String>,
+    },
+    /// Hide an existing owner-authored managed agent listing
+    Unpublish {
+        /// Managed agent pubkey (the kind:30177 d-tag)
+        agent_pubkey: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -979,6 +1022,11 @@ pub enum UsersCmd {
 
 #[derive(Subcommand)]
 pub enum WorkflowsCmd {
+    /// Discover and publish community workflow listings
+    Marketplace {
+        #[command(subcommand)]
+        command: WorkflowsMarketplaceCmd,
+    },
     /// List workflows in a channel
     List {
         /// Channel UUID
@@ -1035,9 +1083,18 @@ pub enum WorkflowsCmd {
         /// Workflow UUID
         #[arg(long)]
         workflow: String,
+        /// Return only this run UUID
+        #[arg(long)]
+        run: Option<String>,
         /// Maximum number of results to return
         #[arg(long)]
         limit: Option<u32>,
+    },
+    /// Cancel a run currently waiting on an agent assignment
+    Cancel {
+        /// Workflow run UUID
+        #[arg(long)]
+        run: String,
     },
     /// Approve or deny a workflow step
     #[command(
@@ -1053,6 +1110,31 @@ pub enum WorkflowsCmd {
         /// Optional note to include with the approval/denial
         #[arg(long)]
         note: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum WorkflowsMarketplaceCmd {
+    /// List workflows published in this community's marketplace
+    List,
+    /// Publish or update an existing owner-authored workflow listing
+    Publish {
+        /// Workflow UUID (the kind:30620 d-tag)
+        workflow_id: String,
+        /// Public listing summary
+        #[arg(long)]
+        summary: Option<String>,
+        /// Optional fixed display price in integer micro-units
+        #[arg(long, requires = "currency")]
+        fixed_price: Option<u64>,
+        /// Three-letter uppercase currency code
+        #[arg(long, requires = "fixed_price")]
+        currency: Option<String>,
+    },
+    /// Hide an existing owner-authored workflow listing
+    Unpublish {
+        /// Workflow UUID (the kind:30620 d-tag)
+        workflow_id: String,
     },
 }
 
@@ -2161,6 +2243,79 @@ mod tests {
         }
     }
 
+    #[test]
+    fn parses_agent_marketplace_publish_price_as_microunits_per_hour() {
+        let agent = "a".repeat(64);
+        let cli = Cli::try_parse_from([
+            "buzz",
+            "agents",
+            "marketplace",
+            "publish",
+            &agent,
+            "--rate",
+            "12000000",
+            "--currency",
+            "USD",
+        ])
+        .unwrap();
+        let Cmd::Agents(AgentsCmd::Marketplace {
+            command:
+                AgentsMarketplaceCmd::Publish {
+                    agent_pubkey,
+                    rate,
+                    currency,
+                    ..
+                },
+        }) = cli.command
+        else {
+            panic!("expected agent marketplace publish");
+        };
+        assert_eq!(agent_pubkey, agent);
+        assert_eq!(rate, Some(12_000_000));
+        assert_eq!(currency.as_deref(), Some("USD"));
+    }
+
+    #[test]
+    fn parses_workflow_marketplace_and_run_show_forms() {
+        let workflow = "11111111-1111-1111-1111-111111111111";
+        let run = "22222222-2222-2222-2222-222222222222";
+        assert!(Cli::try_parse_from([
+            "buzz",
+            "workflows",
+            "marketplace",
+            "publish",
+            workflow,
+            "--fixed-price",
+            "5000000",
+            "--currency",
+            "USD",
+        ])
+        .is_ok());
+
+        let cli = Cli::try_parse_from([
+            "buzz",
+            "workflows",
+            "runs",
+            "--workflow",
+            workflow,
+            "--run",
+            run,
+        ])
+        .unwrap();
+        let Cmd::Workflows(WorkflowsCmd::Runs {
+            workflow: parsed_workflow,
+            run: parsed_run,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected workflow run show");
+        };
+        assert_eq!(parsed_workflow, workflow);
+        assert_eq!(parsed_run.as_deref(), Some(run));
+
+        assert!(Cli::try_parse_from(["buzz", "workflows", "cancel", "--run", run,]).is_ok());
+    }
+
     /// Smoke test: CLI definition is valid and parseable.
     #[test]
     fn cli_definition_is_valid() {
@@ -2265,6 +2420,7 @@ mod tests {
                 "draft-create",
                 "draft-update",
                 "import",
+                "marketplace",
                 "remove",
                 "set-access",
                 "unarchive"
@@ -2326,7 +2482,18 @@ mod tests {
         );
         assert_eq!(
             names(&cmd, "workflows"),
-            vec!["approve", "create", "delete", "get", "list", "runs", "trigger", "update"]
+            vec![
+                "approve",
+                "cancel",
+                "create",
+                "delete",
+                "get",
+                "list",
+                "marketplace",
+                "runs",
+                "trigger",
+                "update"
+            ]
         );
         assert_eq!(names(&cmd, "feed"), vec!["get"]);
         assert_eq!(
@@ -2405,7 +2572,7 @@ mod tests {
     #[test]
     fn subcommand_counts_are_stable() {
         let expected: Vec<(&str, usize)> = vec![
-            ("agents", 7),
+            ("agents", 9),
             ("canvas", 2),
             ("channels", 16),
             ("dms", 4),
@@ -2423,7 +2590,7 @@ mod tests {
             ("social", 7),
             ("upload", 1),
             ("users", 5),
-            ("workflows", 8),
+            ("workflows", 10),
         ];
 
         let cmd = Cli::command();
