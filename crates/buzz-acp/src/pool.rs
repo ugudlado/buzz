@@ -562,65 +562,49 @@ impl ChannelInfoResolver {
     }
 }
 
-/// Per-channel resolved repo working directory, cached after the first
-/// lookup for each channel — same shape as [`ChannelInfoResolver`]. `None`
-/// is cached too (channel has no linked repo, or no matching local clone),
-/// so repeat misses don't re-query on every new session creation.
+/// Resolves and prepares a channel repository when a new ACP session is
+/// created. Persistent sessions avoid per-turn work; a replacement session
+/// deliberately re-queries the binding and fetches before starting.
 #[derive(Debug, Clone)]
 pub struct RepoCwdResolver {
-    cache: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<Uuid, Option<String>>>>,
     rest_client: RestClient,
-    /// The nest's `REPOS` directory (`{static cwd}/REPOS`) — buzz-acp's own
-    /// process cwd is already the nest root (set by the desktop app at
-    /// spawn time via `default_agent_workdir()`), so no separate discovery
-    /// is needed here.
     repos_root: std::path::PathBuf,
 }
 
 impl RepoCwdResolver {
-    pub fn new(rest_client: RestClient, harness_cwd: &str) -> Self {
+    pub fn new(rest_client: RestClient, repos_root: impl Into<std::path::PathBuf>) -> Self {
         Self {
-            cache: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             rest_client,
-            repos_root: std::path::PathBuf::from(harness_cwd).join("REPOS"),
+            repos_root: repos_root.into(),
         }
     }
 
-    /// Resolve the local repo directory bound to `channel_id`, if any,
-    /// falling back to `None` (caller uses the harness's default cwd) when
-    /// the channel has no linked repo, the repo has no matching local
-    /// clone, or the owner pubkey is unknown.
+    /// Prepare and resolve the repo bound to `channel_id`. `Ok(None)` means
+    /// the channel has no owner/binding and should use the harness default cwd.
     pub async fn resolve(
         &self,
         channel_id: Uuid,
         owner_pubkey: Option<&nostr::PublicKey>,
-    ) -> Option<String> {
-        if let Some(cached) = self
-            .cache
-            .read()
-            .ok()
-            .and_then(|cache| cache.get(&channel_id).cloned())
-        {
-            return cached;
-        }
+    ) -> Result<Option<String>, String> {
+        let Some(owner_pubkey) = owner_pubkey else {
+            return Ok(None);
+        };
+        let Some((repo_dtag, clone_url)) =
+            find_repo_for_channel(channel_id, owner_pubkey, &self.rest_client).await?
+        else {
+            return Ok(None);
+        };
+        let resolved = crate::repo_paths::prepare_repo_dir(
+            &self.repos_root,
+            &repo_dtag,
+            clone_url.as_deref(),
+            &self.rest_client.base_url,
+        )
+        .await?
+        .display()
+        .to_string();
 
-        let resolved = async {
-            let owner_pubkey = owner_pubkey?;
-            let (repo_dtag, clone_url) =
-                find_repo_for_channel(channel_id, owner_pubkey, &self.rest_client).await?;
-            crate::repo_paths::find_local_repo_dir(
-                &self.repos_root,
-                &repo_dtag,
-                clone_url.as_deref(),
-            )
-            .map(|p| p.display().to_string())
-        }
-        .await;
-
-        if let Ok(mut cache) = self.cache.write() {
-            cache.insert(channel_id, resolved.clone());
-        }
-        resolved
+        Ok(Some(resolved))
     }
 }
 
@@ -1800,14 +1784,30 @@ pub async fn run_prompt_task(
             } else {
                 // Resolve the channel's linked repo (if any) to its local
                 // clone directory, so the session starts there instead of
-                // the harness's default cwd — one relay round trip on this
-                // channel's first session, cached thereafter (same
-                // amortization as the core/canvas fetches above).
-                let resolved_cwd = ctx
+                // the harness's default cwd. This runs once per replacement
+                // ACP session (not per turn), refreshing the binding and
+                // fetching the existing origin before new work begins.
+                let resolved_cwd = match ctx
                     .repo_cwd
                     .resolve(*cid, ctx.agent_owner_pubkey.as_ref())
                     .await
-                    .unwrap_or_else(|| ctx.cwd.clone());
+                {
+                    Ok(Some(cwd)) => cwd,
+                    Ok(None) => ctx.cwd.clone(),
+                    Err(error) => {
+                        send_prompt_result(
+                            &result_tx,
+                            &turn_id,
+                            agent,
+                            source,
+                            PromptOutcome::Error(AcpError::Setup(format!(
+                                "repository preparation failed: {error}"
+                            ))),
+                            requeue_batch_if_queue(&ctx, batch),
+                        );
+                        return;
+                    }
+                };
 
                 // The title is channel-qualified (`Agent · #channel`) so one
                 // agent in several channels doesn't produce identical session
@@ -2816,17 +2816,15 @@ pub(crate) async fn fetch_channel_info(
 /// returned tags client-side, the same pattern [`fetch_channel_info`] already
 /// uses for its own tag extraction.
 ///
-/// Returns `(repo_d_tag, clone_url)` for the first matching repo event, or
-/// `None` if the owner has no repo bound to this channel, or on any
-/// query/parse failure (best-effort — the caller falls back to the harness's
-/// default cwd). `clone_url` is `None` if the repo event has no `clone` tag
-/// (still usable — see [`crate::repo_paths::find_local_repo_dir`]'s
-/// d-tag-only fallback).
+/// Returns `(repo_d_tag, clone_url)` for the first valid matching event, or
+/// `None` if the owner has no repo bound to this channel. Query/response
+/// failures return `Err` so the caller reports a visible setup failure rather
+/// than silently starting bound work in the harness default directory.
 pub(crate) async fn find_repo_for_channel(
     channel_id: Uuid,
     owner_pubkey: &nostr::PublicKey,
     rest: &RestClient,
-) -> Option<(String, Option<String>)> {
+) -> Result<Option<(String, Option<String>)>, String> {
     let filter = nostr::Filter::new()
         .kind(nostr::Kind::Custom(
             buzz_core::kind::KIND_GIT_REPO_ANNOUNCEMENT as u16,
@@ -2837,27 +2835,58 @@ pub(crate) async fn find_repo_for_channel(
         Ok(Ok(json)) => json,
         Ok(Err(e)) => {
             tracing::debug!(channel_id = %channel_id, "repo-for-channel query failed: {e}");
-            return None;
+            return Err(format!("could not query linked repository: {e}"));
         }
         Err(_) => {
             tracing::debug!(channel_id = %channel_id, "repo-for-channel query timed out");
-            return None;
+            return Err("linked repository query timed out".into());
         }
     };
-    let arr = events.as_array()?;
+    let arr = events
+        .as_array()
+        .ok_or_else(|| "linked repository query returned an invalid response".to_string())?;
 
-    let channel_str = channel_id.to_string();
-    for ev in arr {
-        let tags = ev.get("tags")?.as_array()?;
+    Ok(repo_binding_from_query_response(
+        arr,
+        &channel_id.to_string(),
+        owner_pubkey,
+    ))
+}
+
+fn repo_binding_from_query_response(
+    events: &[serde_json::Value],
+    channel_uuid: &str,
+    owner_pubkey: &nostr::PublicKey,
+) -> Option<(String, Option<String>)> {
+    let expected_kind = nostr::Kind::Custom(buzz_core::kind::KIND_GIT_REPO_ANNOUNCEMENT as u16);
+    for raw in events {
+        let event = match serde_json::from_value::<nostr::Event>(raw.clone()) {
+            Ok(event) => event,
+            Err(error) => {
+                tracing::warn!(target: "repo::fetch", %error, "repo query returned a malformed event — skipping");
+                continue;
+            }
+        };
+        if let Err(error) = event.verify() {
+            tracing::warn!(target: "repo::fetch", %error, "repo event failed signature verification — skipping");
+            continue;
+        }
+        if event.kind != expected_kind || event.pubkey != *owner_pubkey {
+            tracing::warn!(
+                target: "repo::fetch",
+                kind = %event.kind.as_u16(),
+                author = %event.pubkey,
+                "repo event has unexpected kind or author — skipping"
+            );
+            continue;
+        }
         let mut d_tag: Option<String> = None;
         let mut clone_url: Option<String> = None;
         let mut buzz_channel: Option<String> = None;
-        for tag in tags {
-            let Some(parts) = tag.as_array() else {
-                continue;
-            };
-            let name = parts.first().and_then(|v| v.as_str());
-            let value = parts.get(1).and_then(|v| v.as_str());
+        for tag in event.tags.iter() {
+            let parts = tag.as_slice();
+            let name = parts.first().map(String::as_str);
+            let value = parts.get(1).map(String::as_str);
             match (name, value) {
                 (Some("d"), Some(v)) => d_tag = Some(v.to_string()),
                 (Some("clone"), Some(v)) if clone_url.is_none() => clone_url = Some(v.to_string()),
@@ -2867,7 +2896,7 @@ pub(crate) async fn find_repo_for_channel(
                 _ => {}
             }
         }
-        if buzz_channel.as_deref() == Some(channel_str.as_str()) {
+        if buzz_channel.as_deref() == Some(channel_uuid) {
             if let Some(d_tag) = d_tag {
                 return Some((d_tag, clone_url));
             }
@@ -8068,7 +8097,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
                     keys: agent_keys.clone(),
                     auth_tag_json: None,
                 },
-                ".",
+                "./REPOS",
             ),
         }
     }
@@ -8614,6 +8643,183 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             requests,
             server,
         )
+    }
+
+    async fn counting_repo_resolver(
+        responses: Vec<serde_json::Value>,
+        repos_root: std::path::PathBuf,
+    ) -> (
+        RepoCwdResolver,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test HTTP server");
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let requests = std::sync::Arc::new(AtomicUsize::new(0));
+        let server_requests = requests.clone();
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = vec![0; 8192];
+                let _ = socket.read(&mut buf).await;
+                let index = server_requests.fetch_add(1, Ordering::SeqCst);
+                let body = responses
+                    .get(index)
+                    .or_else(|| responses.last())
+                    .cloned()
+                    .unwrap_or_else(|| json!([]))
+                    .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        let rest = crate::relay::RestClient {
+            http: reqwest::Client::new(),
+            base_url,
+            keys: nostr::Keys::generate(),
+            auth_tag_json: None,
+        };
+        (RepoCwdResolver::new(rest, repos_root), requests, server)
+    }
+
+    fn signed_repo_event(
+        keys: &Keys,
+        channel_id: Uuid,
+        clone_url: Option<&str>,
+    ) -> serde_json::Value {
+        let mut tags = vec![
+            Tag::parse(["d", "repo"]).unwrap(),
+            Tag::parse(["buzz-channel", &channel_id.to_string()]).unwrap(),
+        ];
+        if let Some(clone_url) = clone_url {
+            tags.push(Tag::parse(["clone", clone_url]).unwrap());
+        }
+        serde_json::to_value(
+            EventBuilder::new(
+                Kind::Custom(buzz_core::kind::KIND_GIT_REPO_ANNOUNCEMENT as u16),
+                "",
+            )
+            .tags(tags)
+            .sign_with_keys(keys)
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn repo_binding_requires_valid_signature_kind_and_owner() {
+        let channel_id = Uuid::new_v4();
+        let owner = Keys::generate();
+        let valid = signed_repo_event(&owner, channel_id, Some("https://github.com/block/buzz"));
+        assert_eq!(
+            repo_binding_from_query_response(
+                std::slice::from_ref(&valid),
+                &channel_id.to_string(),
+                &owner.public_key()
+            ),
+            Some(("repo".into(), Some("https://github.com/block/buzz".into())))
+        );
+
+        let mut tampered = valid.clone();
+        tampered["tags"][0][1] = json!("attacker-controlled");
+        assert!(repo_binding_from_query_response(
+            &[tampered],
+            &channel_id.to_string(),
+            &owner.public_key()
+        )
+        .is_none());
+
+        let stranger = Keys::generate();
+        assert!(repo_binding_from_query_response(
+            &[signed_repo_event(&stranger, channel_id, None)],
+            &channel_id.to_string(),
+            &owner.public_key()
+        )
+        .is_none());
+
+        let wrong_kind = serde_json::to_value(
+            EventBuilder::new(Kind::Custom(9), "")
+                .tags([Tag::parse(["buzz-channel", &channel_id.to_string()]).unwrap()])
+                .sign_with_keys(&owner)
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(repo_binding_from_query_response(
+            &[wrong_kind],
+            &channel_id.to_string(),
+            &owner.public_key()
+        )
+        .is_none());
+    }
+
+    #[tokio::test]
+    async fn repo_cwd_requeries_for_each_new_session() {
+        use std::sync::atomic::Ordering;
+
+        let root = std::env::temp_dir().join(format!("buzz-acp-repo-resolver-{}", Uuid::new_v4()));
+        let repos = root.join("REPOS");
+        std::fs::create_dir_all(repos.join("repo/.git")).unwrap();
+        let channel_id = Uuid::new_v4();
+        let owner = nostr::Keys::generate();
+        let response = json!([signed_repo_event(&owner, channel_id, None)]);
+        let (resolver, requests, server) = counting_repo_resolver(vec![response], repos).await;
+
+        let first = resolver
+            .resolve(channel_id, Some(&owner.public_key()))
+            .await
+            .unwrap();
+        let second = resolver
+            .resolve(channel_id, Some(&owner.public_key()))
+            .await
+            .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            2,
+            "each replacement ACP session must refresh its repository binding"
+        );
+        server.abort();
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn repo_cwd_query_failures_are_not_cached() {
+        use std::sync::atomic::Ordering;
+
+        let root = std::env::temp_dir().join(format!("buzz-acp-repo-resolver-{}", Uuid::new_v4()));
+        let repos = root.join("REPOS");
+        std::fs::create_dir_all(repos.join("repo/.git")).unwrap();
+        let channel_id = Uuid::new_v4();
+        let owner = nostr::Keys::generate();
+        let (resolver, requests, server) = counting_repo_resolver(
+            vec![
+                json!({"invalid": true}),
+                json!([signed_repo_event(&owner, channel_id, None)]),
+            ],
+            repos,
+        )
+        .await;
+
+        assert!(resolver
+            .resolve(channel_id, Some(&owner.public_key()))
+            .await
+            .is_err());
+        assert!(resolver
+            .resolve(channel_id, Some(&owner.public_key()))
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        server.abort();
+        std::fs::remove_dir_all(root).ok();
     }
 
     fn channel_metadata_response(id: Uuid, tags: &[[&str; 2]]) -> serde_json::Value {

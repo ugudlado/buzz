@@ -30,10 +30,18 @@ type RuntimesQueryLike = {
 export async function availableRuntimesForStart(
   query: RuntimesQueryLike,
 ): Promise<AcpRuntime[]> {
-  const entries = query.isFetched ? query.data : (await query.refetch()).data;
-  return (entries ?? []).filter(
+  return (await runtimeCatalogForStart(query)).filter(
     (runtime): runtime is AcpRuntime => runtime.availability === "available",
   );
+}
+
+/** Acquire the full catalog when execution happens outside this computer. */
+export async function runtimeCatalogForStart(
+  query: RuntimesQueryLike,
+): Promise<readonly AcpRuntimeCatalogEntry[]> {
+  return query.isFetched
+    ? (query.data ?? [])
+    : ((await query.refetch()).data ?? []);
 }
 
 /**
@@ -109,7 +117,7 @@ export type BackendIntent = {
  */
 export async function buildInstanceInputForDefinition(
   persona: AgentPersona,
-  runtime: AcpRuntime,
+  runtime: AcpRuntimeCatalogEntry,
   upload?: UploadMediaBytes,
   backendIntent?: BackendIntent,
 ): Promise<CreateManagedAgentInput> {
@@ -137,6 +145,16 @@ export async function buildInstanceInputForDefinition(
         config: backendIntent.config,
       },
     };
+  }
+
+  if (
+    runtime.availability !== "available" ||
+    !runtime.command ||
+    !runtime.binaryPath
+  ) {
+    throw new Error(
+      `${runtime.label} is not available on this computer. Install it before starting locally.`,
+    );
   }
 
   return {

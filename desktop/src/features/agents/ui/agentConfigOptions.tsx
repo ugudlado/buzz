@@ -481,12 +481,14 @@ export function formatRuntimeOptionLabel(runtime: AcpRuntimeCatalogEntry) {
 
 export function buildPersonaRuntimeDropdownOptions({
   defaultRuntimeId,
+  executionLocus,
   isCreateMode,
   runtime,
   runtimes,
   runtimesLoading,
 }: {
   defaultRuntimeId?: string;
+  executionLocus: "local" | "provider";
   isCreateMode: boolean;
   runtime: string;
   runtimes: AcpRuntimeCatalogEntry[];
@@ -512,6 +514,7 @@ export function buildPersonaRuntimeDropdownOptions({
     ...sortPersonaRuntimes(runtimes).map((candidate) => ({
       disabled:
         isCreateMode &&
+        executionLocus === "local" &&
         defaultRuntimeId !== undefined &&
         candidate.availability !== "available",
       label: `${formatRuntimeOptionLabel(candidate)}${

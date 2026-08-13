@@ -42,7 +42,6 @@ import type {
   SnapshotMemoryLevel,
 } from "@/shared/api/tauriPersonas";
 import type {
-  AcpRuntime,
   AgentPersona,
   Channel,
   CreatePersonaInput,
@@ -60,7 +59,9 @@ import {
 } from "./agentCreateIntent";
 import { resolveManagedAgentAvatarUrl } from "./managedAgentAvatar";
 import {
+  availableRuntimesForStart,
   buildInstanceInputForDefinition,
+  runtimeCatalogForStart,
   type BackendIntent,
 } from "../lib/instanceInputForDefinition";
 
@@ -138,14 +139,6 @@ export function usePersonaActions() {
         .map((publication) => publication.sourcePersonaId),
     );
   }, [identityQuery.data?.pubkey, publications]);
-  const availableRuntimes = React.useMemo(
-    () =>
-      (acpRuntimesQuery.data ?? []).filter(
-        (runtime): runtime is AcpRuntime =>
-          runtime.availability === "available",
-      ),
-    [acpRuntimesQuery.data],
-  );
   const catalogPersonas = React.useMemo(
     () =>
       catalogPersonasFromPublications(
@@ -206,22 +199,27 @@ export function usePersonaActions() {
           setPersonaNoticeMessage(personaSaveNotice(input.displayName, null));
         }
       } else {
-        const runtime = availableRuntimes.find(
-          (candidate) => candidate.id === input.runtime,
-        );
-        if (!runtime) {
-          setPersonaErrorMessage(
-            "Choose an available provider for this agent.",
-          );
-          return false;
-        }
-
         // Stale-intent guard: a definition-only create never carries one.
         const startIntent =
           resolveCreateIntent(intent) === "definition_start"
             ? (backendIntent ?? null)
             : null;
-
+        // A remote provider validates the runtime where it will execute; local
+        // creation remains restricted to commands available on this computer.
+        const runtimeCatalog = startIntent
+          ? await runtimeCatalogForStart(acpRuntimesQuery)
+          : await availableRuntimesForStart(acpRuntimesQuery);
+        const runtime = runtimeCatalog.find(
+          (candidate) => candidate.id === input.runtime,
+        );
+        if (!runtime) {
+          setPersonaErrorMessage(
+            startIntent
+              ? "Choose a known runtime for this remote agent."
+              : "Choose an available runtime for this agent.",
+          );
+          return false;
+        }
         const avatarUrl = await resolveManagedAgentAvatarUrl(
           input.avatarUrl,
           undefined,

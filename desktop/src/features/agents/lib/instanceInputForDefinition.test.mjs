@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   availableRuntimesForStart,
   buildInstanceInputForDefinition,
+  runtimeCatalogForStart,
   resolveStartRuntimeForDefinition,
 } from "./instanceInputForDefinition.ts";
 
@@ -230,6 +231,40 @@ test("provider intent forces startOnAppLaunch off and omits local commands", asy
   assert.equal(input.systemPrompt, "prompt");
 });
 
+test("provider intent accepts a runtime installed only remotely", async () => {
+  const hermes = {
+    ...gooseRuntime,
+    id: "hermes",
+    label: "Hermes Agent",
+    availability: "not_installed",
+    command: null,
+    binaryPath: null,
+  };
+  const input = await buildInstanceInputForDefinition(
+    persona({ runtime: "hermes" }),
+    hermes,
+    undefined,
+    { type: "provider", id: "host", config: { host: "agent-vps" } },
+  );
+  assert.deepEqual(input.backend, {
+    type: "provider",
+    id: "host",
+    config: { host: "agent-vps" },
+  });
+});
+
+test("local intent refuses a runtime unavailable on this computer", async () => {
+  await assert.rejects(
+    buildInstanceInputForDefinition(persona(), {
+      ...gooseRuntime,
+      availability: "not_installed",
+      command: null,
+      binaryPath: null,
+    }),
+    /not available on this computer/i,
+  );
+});
+
 test("row 1: refuses when the configured runtime is not available", () => {
   assert.throws(
     () =>
@@ -295,6 +330,25 @@ test("row 6: unfetched query refetches instead of resolving empty", async () => 
     runtimes.map((r) => r.id),
     ["claude"],
     "an unfetched query must fetch, not spuriously report no runtimes",
+  );
+});
+
+test("provider catalog acquisition preserves unavailable runtimes", async () => {
+  const hermes = {
+    ...gooseRuntime,
+    id: "hermes",
+    availability: "not_installed",
+    command: null,
+    binaryPath: null,
+  };
+  const runtimes = await runtimeCatalogForStart({
+    isFetched: true,
+    data: [gooseRuntime, hermes],
+    refetch: async () => ({ data: [] }),
+  });
+  assert.deepEqual(
+    runtimes.map((runtime) => runtime.id),
+    ["goose", "hermes"],
   );
 });
 

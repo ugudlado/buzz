@@ -11,11 +11,12 @@ import { cn } from "@/shared/lib/cn";
 import { Input } from "@/shared/ui/input";
 import { Textarea } from "@/shared/ui/textarea";
 import { AgentCreationPreview } from "./AgentCreationPreview";
+import { RunWarning } from "./AgentRuntimeAvailabilityWarning";
+import { useAgentRunLocation } from "./AgentRunLocationContext";
 import { PersonaDropdownField } from "./PersonaDropdownField";
 import type { EnvVarsValue } from "./EnvVarsEditor";
 import { PersonaAdvancedFields } from "./PersonaAdvancedFields";
 import { PersonaModelField } from "./PersonaModelField";
-import { runtimeAvailabilityWarning } from "./runtimeAvailabilityWarning";
 import { PersonaProviderApiKeyField } from "./PersonaProviderApiKeyField";
 import {
   canSubmitPersonaDialog,
@@ -137,6 +138,7 @@ export function AgentDefinitionDialog({
   createRunSection,
   createSubmitBlocked = false,
 }: AgentDefinitionDialogProps) {
+  const locus = useAgentRunLocation() === "remote" ? "provider" : "local";
   const runtimesLoading = runtimeCatalogStatus === "loading";
   const [displayName, setDisplayName] = React.useState("");
   const [aiDefaultsOpen, setAiDefaultsOpen] = React.useState(false);
@@ -434,7 +436,7 @@ export function AgentDefinitionDialog({
         globalEnvVars: globalConfig.env_vars,
         globalProvider: inheritedProviderDefault.value,
         globalModel: inheritedModelDefault.value,
-        isProviderMode: false,
+        isProviderMode: locus === "provider",
         model,
         provider: trimmedProvider,
         runtimeId: runtime,
@@ -442,6 +444,7 @@ export function AgentDefinitionDialog({
       }),
     [
       bakedEnvKeys,
+      locus,
       envVars,
       globalConfig.env_vars,
       inheritedModelDefault.value,
@@ -497,6 +500,7 @@ export function AgentDefinitionDialog({
   );
   const selectedRuntimeIsAvailable =
     runtime.trim().length === 0 ||
+    locus === "provider" ||
     selectedRuntime?.availability === "available";
   // Gate model/provider validity through missingNormalizedFields — single
   // source of truth with the readiness gate so display and Save can't drift.
@@ -582,6 +586,7 @@ export function AgentDefinitionDialog({
   const { blankRuntimeOptionLabel, runtimeDropdownOptions } =
     buildPersonaRuntimeDropdownOptions({
       defaultRuntimeId: defaultRuntime?.id,
+      executionLocus: locus,
       isCreateMode,
       runtime,
       runtimes,
@@ -618,14 +623,7 @@ export function AgentDefinitionDialog({
       );
   const previewLabel = displayName.trim() || "Agent name";
   const previewAvatarUrl = avatarUrl.trim() || null;
-  const runtimeWarningText = selectedRuntime
-    ? runtimeAvailabilityWarning(selectedRuntime)
-    : null;
-  const runtimeWarning = runtimeWarningText ? (
-    <p className="text-xs text-warning">
-      {runtimeWarningText} Visit Settings &gt; Agents to set it up.
-    </p>
-  ) : null;
+  const runtimeWarning = <RunWarning locus={locus} runtime={selectedRuntime} />;
   const advancedFieldsTransition = shouldReduceMotion
     ? { duration: 0 }
     : ADVANCED_FIELDS_MOTION_TRANSITION;
