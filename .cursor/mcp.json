@@ -1,0 +1,12 @@
+{
+	"mcpServers": {
+		"backlog": {
+			"url": "${env:BACKLOG_URL}/mcp",
+			"headers": {
+				"Authorization": "Bearer ${env:BACKLOG_TOKEN}",
+				"X-Backlog-Project": "${env:BACKLOG_PROJECT_ID}"
+			},
+			"envFile": "${workspaceFolder}/.env"
+		}
+	}
+}

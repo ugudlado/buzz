@@ -1,0 +1,4 @@
+[mcp_servers.backlog]
+url = "https://vmi3254961.tail4397c5.ts.net/mcp"
+bearer_token_env_var = "BACKLOG_TOKEN"
+env_http_headers = { "X-Backlog-Project" = "BACKLOG_PROJECT_ID" }
