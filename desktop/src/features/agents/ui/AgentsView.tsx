@@ -26,7 +26,6 @@ import { useTeamActions } from "./useTeamActions";
 import { useProfilePanel } from "@/shared/context/ProfilePanelContext";
 import { useBakedBuildEnvQuery } from "@/features/agents/hooks";
 import { isManagedAgentActive } from "@/features/agents/lib/managedAgentControlActions";
-import { requestOpenEditAgent } from "@/features/agents/openEditAgentEvent";
 import { useGlobalAgentConfig } from "@/features/agents/useGlobalAgentConfig";
 import { Button } from "@/shared/ui/button";
 import {
@@ -229,10 +228,6 @@ export function AgentsView() {
               }}
               onOpenPersonaProfile={(persona) => {
                 openPersonaProfilePanel?.(persona);
-              }}
-              onEditAgentInstance={(agent) => {
-                openProfilePanel?.(agent.pubkey);
-                requestOpenEditAgent(agent.pubkey);
               }}
               onStartAgent={(pubkey) => {
                 void agents.handleStart(pubkey);
