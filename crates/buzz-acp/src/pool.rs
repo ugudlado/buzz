@@ -1952,6 +1952,7 @@ pub async fn run_prompt_task(
         system_prompt: ctx.system_prompt.as_deref(),
         team_instructions: ctx.team_instructions.as_deref(),
         agent_core: agent_core.as_deref(),
+        agent_project: agent_project.as_deref(),
         agent_canvas: agent_canvas.as_deref(),
     };
     // Delivery state is committed only after ACP confirms success. Existing
@@ -5016,6 +5017,7 @@ mod tests {
             system_prompt: Some("you are Eva"),
             team_instructions: Some("ship small"),
             agent_core: Some("[Agent Memory — core]\nremember this"),
+            agent_project: Some("[Project]\nproject content"),
             agent_canvas: Some("[Channel Canvas]\ncanvas content"),
         }
     }
