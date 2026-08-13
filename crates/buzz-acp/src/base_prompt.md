@@ -10,6 +10,8 @@ When a human references work "you" are doing in another channel, that work belon
 
 The `buzz` CLI is your primary interface. Auth env vars: `BUZZ_RELAY_URL`, `BUZZ_PRIVATE_KEY`, `BUZZ_AUTH_TAG`. Exit codes: 0 ok, 1 user error, 2 network, 3 auth, 4 other. Output is structured JSON.
 
+When running `buzz` from Cursor's shell tool, always preserve your managed-agent identity by prefixing the command with `BUZZ_PRIVATE_KEY="$BUZZ_AGENT_PRIVATE_KEY" BUZZ_AUTH_TAG="${BUZZ_AGENT_AUTH_TAG:-}"`. Cursor may otherwise restore the owner's login-shell credentials and misattribute your message. Never print either signing variable.
+
 | Group | Key commands |
 |-------|-------------|
 | `buzz agents` | `draft-create`, `draft-update` |

@@ -532,7 +532,10 @@ impl AcpClient {
             // this var directly, so an inherited wrong value causes the
             // agent's own messages to be signed and published under someone
             // else's identity with no error at any layer.
-            if key == "BUZZ_PRIVATE_KEY" {
+            if matches!(
+                key.as_str(),
+                "BUZZ_PRIVATE_KEY" | "BUZZ_AGENT_PRIVATE_KEY" | "BUZZ_AGENT_AUTH_TAG"
+            ) {
                 cmd.env(key, value);
                 continue;
             }

@@ -1065,12 +1065,20 @@ impl Config {
         // (the `buzz` CLI, in particular) reads `BUZZ_PRIVATE_KEY` directly
         // to sign its own events, so an inherited/ambient value here would
         // silently misattribute the agent's messages to another identity.
-        persona_env_vars.push((
-            "BUZZ_PRIVATE_KEY".to_string(),
-            keys.secret_key()
-                .to_bech32()
-                .expect("secret key bech32 encoding should never fail"),
-        ));
+        let agent_private_key = keys
+            .secret_key()
+            .to_bech32()
+            .expect("secret key bech32 encoding should never fail");
+        persona_env_vars.push(("BUZZ_PRIVATE_KEY".to_string(), agent_private_key.clone()));
+        // Cursor's shell tool may restore the user's login-shell value for
+        // BUZZ_PRIVATE_KEY. Keep an agent-scoped alias that commands can copy
+        // back immediately before invoking `buzz`.
+        persona_env_vars.push(("BUZZ_AGENT_PRIVATE_KEY".to_string(), agent_private_key));
+        if let Ok(auth_tag) = std::env::var("BUZZ_AUTH_TAG") {
+            if !auth_tag.is_empty() {
+                persona_env_vars.push(("BUZZ_AGENT_AUTH_TAG".to_string(), auth_tag));
+            }
+        }
 
         // Inject CODEX_CONFIG so the @agentclientprotocol/codex-acp adapter (1.x)
         // opens the Seatbelt network sandbox for buzz-cli (an MCP subprocess). No-op
@@ -2841,6 +2849,22 @@ channels = "ALL"
         assert!(
             result.is_ok(),
             "from_args should accept any mode when allowed list is unset: {result:?}"
+        );
+    }
+
+    #[test]
+    fn managed_agent_key_has_cursor_safe_alias() {
+        let args = CliArgs::try_parse_from(["buzz-acp", "--private-key", TEST_PRIVATE_KEY])
+            .expect("clap should parse args");
+        let config = Config::from_args(args).expect("config should be valid");
+        let env = config
+            .persona_env_vars
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+
+        assert_eq!(
+            env.get("BUZZ_PRIVATE_KEY"),
+            env.get("BUZZ_AGENT_PRIVATE_KEY")
         );
     }
 
