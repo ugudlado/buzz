@@ -225,12 +225,6 @@ export function WorkflowsView({
       ),
     [managedAgents],
   );
-  const unlistedManagedAgents = managedAgents.filter(
-    (agent) =>
-      !marketplaceAgents.some(
-        (listing) => listing.pubkey === agent.pubkey.toLowerCase(),
-      ),
-  );
   const marketplaceAgentPubkeys = React.useMemo(
     () => marketplaceAgents.map((agent) => agent.pubkey),
     [marketplaceAgents],
@@ -445,8 +439,7 @@ export function WorkflowsView({
                 Retry
               </Button>
             </div>
-          ) : marketplaceAgents.length === 0 &&
-            unlistedManagedAgents.length === 0 ? (
+          ) : marketplaceAgents.length === 0 ? (
             <div className="flex flex-1 flex-col items-center justify-center gap-3 text-muted-foreground">
               <Bot className="h-10 w-10 opacity-30" />
               <p className="text-sm">No listed agents</p>
@@ -470,29 +463,6 @@ export function WorkflowsView({
                   }
                 />
               ))}
-              {unlistedManagedAgents.length > 0 ? (
-                <div className="space-y-2 border-t pt-4">
-                  <p className="text-xs font-medium text-muted-foreground">
-                    Your unlisted agents
-                  </p>
-                  {unlistedManagedAgents.map((agent) => (
-                    <Card
-                      className="flex items-center justify-between gap-3 p-4"
-                      key={agent.pubkey}
-                    >
-                      <div className="min-w-0">
-                        <p className="truncate text-sm font-medium">
-                          {agent.name}
-                        </p>
-                        <PubKey pubkey={agent.pubkey} />
-                      </div>
-                      <Button onClick={() => setListingAgent(agent)} size="sm">
-                        Publish
-                      </Button>
-                    </Card>
-                  ))}
-                </div>
-              ) : null}
             </div>
           )
         ) : allWorkflowsQuery.isLoading ? (

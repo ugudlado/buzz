@@ -26,6 +26,12 @@ const MARKETPLACE_AGENT_EVENT = {
 test.beforeEach(async ({ page }) => {
   await installMockBridge(page, {
     personaCatalogEvents: [MARKETPLACE_AGENT_EVENT],
+    managedAgents: [
+      {
+        pubkey: TEST_IDENTITIES.bob.pubkey,
+        name: "Private Local Agent",
+      },
+    ],
     relayAgents: [
       {
         pubkey: MARKETPLACE_AGENT_PUBKEY,
@@ -128,6 +134,9 @@ test("discovers a listed agent with presence and sanitized pricing", async ({
   await expect(listing).toContainText("remote");
   await expect(listing).toContainText("Direct use community");
   await expect(listing).not.toContainText("system_prompt");
+  const marketplace = page.getByTestId("workflows-view");
+  await expect(marketplace.getByText("Private Local Agent")).toHaveCount(0);
+  await expect(marketplace.getByText("Your unlisted agents")).toHaveCount(0);
 });
 
 test("shows completed and failed assignment receipt evidence", async ({
