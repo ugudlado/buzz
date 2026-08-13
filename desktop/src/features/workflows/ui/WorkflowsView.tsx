@@ -1,4 +1,4 @@
-import { Bot, Plus, RefreshCw, Zap } from "lucide-react";
+import { Bot, Plus, RefreshCw, Search, Zap } from "lucide-react";
 import * as React from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
@@ -42,6 +42,7 @@ import {
 import { Button } from "@/shared/ui/button";
 import { Badge } from "@/shared/ui/badge";
 import { Card } from "@/shared/ui/card";
+import { Input } from "@/shared/ui/input";
 import { PubKey } from "@/shared/ui/PubKey";
 import { Skeleton } from "@/shared/ui/skeleton";
 
@@ -200,6 +201,7 @@ export function WorkflowsView({
   });
   const [deleteTarget, setDeleteTarget] = React.useState<Workflow | null>(null);
   const [catalogTab, setCatalogTab] = React.useState<CatalogTab>("workflows");
+  const [agentSearch, setAgentSearch] = React.useState("");
   const isMarketplace = surface === "marketplace";
   const [listingAgent, setListingAgent] = React.useState<ManagedAgent | null>(
     null,
@@ -224,6 +226,24 @@ export function WorkflowsView({
         managedAgents.map((agent) => [agent.pubkey.toLowerCase(), agent]),
       ),
     [managedAgents],
+  );
+  const searchTerm = agentSearch.trim().toLowerCase();
+  const filteredMarketplaceAgents = marketplaceAgents.filter(
+    (agent) =>
+      !searchTerm ||
+      [agent.name, agent.pubkey, agent.description, ...agent.capabilities].some(
+        (value) => value.toLowerCase().includes(searchTerm),
+      ),
+  );
+  const filteredUnpublishedAgents = managedAgents.filter(
+    (agent) =>
+      !marketplaceAgents.some(
+        (listing) => listing.pubkey === agent.pubkey.toLowerCase(),
+      ) &&
+      (!searchTerm ||
+        [agent.name, agent.pubkey].some((value) =>
+          value.toLowerCase().includes(searchTerm),
+        )),
   );
   const marketplaceAgentPubkeys = React.useMemo(
     () => marketplaceAgents.map((agent) => agent.pubkey),
@@ -439,30 +459,74 @@ export function WorkflowsView({
                 Retry
               </Button>
             </div>
-          ) : marketplaceAgents.length === 0 ? (
-            <div className="flex flex-1 flex-col items-center justify-center gap-3 text-muted-foreground">
-              <Bot className="h-10 w-10 opacity-30" />
-              <p className="text-sm">No listed agents</p>
-              <p className="max-w-sm text-center text-xs">
-                Published agent listings for this community appear here.
-              </p>
-            </div>
           ) : (
             <div className="space-y-4">
-              {marketplaceAgents.map((agent) => (
-                <AgentCatalogCard
-                  agent={agent}
-                  key={agent.pubkey}
-                  localAgent={managedAgentByPubkey.get(agent.pubkey)}
-                  onEdit={setListingAgent}
-                  onUnpublish={unpublishAgent}
-                  presenceStatus={
-                    presenceQuery.isSuccess
-                      ? (presenceQuery.data?.[agent.pubkey] ?? "offline")
-                      : null
-                  }
+              <div className="relative">
+                <Search className="absolute left-3 top-2.5 h-4 w-4 text-muted-foreground" />
+                <Input
+                  aria-label="Search agents"
+                  className="pl-9"
+                  onChange={(event) => setAgentSearch(event.target.value)}
+                  placeholder="Search agents"
+                  type="search"
+                  value={agentSearch}
                 />
-              ))}
+              </div>
+              {filteredMarketplaceAgents.length === 0 &&
+              filteredUnpublishedAgents.length === 0 ? (
+                <div className="flex flex-col items-center justify-center gap-3 py-10 text-muted-foreground">
+                  <Bot className="h-10 w-10 opacity-30" />
+                  <p className="text-sm">
+                    {searchTerm
+                      ? "No agents match your search"
+                      : "No agents available"}
+                  </p>
+                </div>
+              ) : (
+                <>
+                  {filteredMarketplaceAgents.map((agent) => (
+                    <AgentCatalogCard
+                      agent={agent}
+                      key={agent.pubkey}
+                      localAgent={managedAgentByPubkey.get(agent.pubkey)}
+                      onEdit={setListingAgent}
+                      onUnpublish={unpublishAgent}
+                      presenceStatus={
+                        presenceQuery.isSuccess
+                          ? (presenceQuery.data?.[agent.pubkey] ?? "offline")
+                          : null
+                      }
+                    />
+                  ))}
+                  {filteredUnpublishedAgents.length > 0 ? (
+                    <div className="space-y-2 border-t pt-4">
+                      <p className="text-xs font-medium text-muted-foreground">
+                        Your unpublished agents
+                      </p>
+                      {filteredUnpublishedAgents.map((agent) => (
+                        <Card
+                          className="flex items-center justify-between gap-3 p-4"
+                          data-testid={`unpublished-agent-${agent.pubkey}`}
+                          key={agent.pubkey}
+                        >
+                          <div className="min-w-0">
+                            <p className="truncate text-sm font-medium">
+                              {agent.name}
+                            </p>
+                            <PubKey pubkey={agent.pubkey} />
+                          </div>
+                          <Button
+                            onClick={() => setListingAgent(agent)}
+                            size="sm"
+                          >
+                            Publish
+                          </Button>
+                        </Card>
+                      ))}
+                    </div>
+                  ) : null}
+                </>
+              )}
             </div>
           )
         ) : allWorkflowsQuery.isLoading ? (

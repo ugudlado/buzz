@@ -135,8 +135,22 @@ test("discovers a listed agent with presence and sanitized pricing", async ({
   await expect(listing).toContainText("Direct use community");
   await expect(listing).not.toContainText("system_prompt");
   const marketplace = page.getByTestId("workflows-view");
-  await expect(marketplace.getByText("Private Local Agent")).toHaveCount(0);
-  await expect(marketplace.getByText("Your unlisted agents")).toHaveCount(0);
+  const unpublished = marketplace.getByTestId(
+    `unpublished-agent-${TEST_IDENTITIES.bob.pubkey}`,
+  );
+  await expect(unpublished).toContainText("Private Local Agent");
+  await unpublished.getByRole("button", { name: "Publish" }).click();
+  const publishDialog = page.getByRole("dialog");
+  await expect(publishDialog).toContainText("Publish agent listing");
+  await publishDialog.getByRole("button", { name: "Cancel" }).click();
+
+  const search = marketplace.getByRole("searchbox", { name: "Search agents" });
+  await search.fill("Private Local");
+  await expect(unpublished).toBeVisible();
+  await expect(listing).toHaveCount(0);
+  await search.fill("Rust Reviewer");
+  await expect(listing).toBeVisible();
+  await expect(unpublished).toHaveCount(0);
 });
 
 test("shows completed and failed assignment receipt evidence", async ({
