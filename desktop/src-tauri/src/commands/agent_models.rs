@@ -57,7 +57,6 @@ pub async fn get_agent_models(
         for pubkey in &exited_pubkeys {
             state.clear_agent_session_caches(pubkey);
         }
-
         let record = records
             .iter()
             .find(|r| r.pubkey == pubkey)
@@ -823,16 +822,17 @@ pub async fn update_managed_agent(
         if input.respond_to_allowlist.is_some() {
             record.respond_to_allowlist = prospective_allowlist;
         }
-
+        if let Some(marketplace) = input.marketplace {
+            record.marketplace = marketplace
+                .map(buzz_core_pkg::marketplace::AgentMarketplace::normalized)
+                .transpose()?;
+        }
         record.updated_at = now_iso();
-
         save_managed_agents(&app, &records)?;
-
         let record = records
             .iter()
             .find(|r| r.pubkey == input.pubkey)
             .ok_or_else(|| format!("agent {} not found", input.pubkey))?;
-
         // Publish the edit to the relay. After-save, inside the lock, before
         // any .await. The retention upsert hashes the opt-IN projection, so an
         // update that touched only runtime/local fields is a no-op publish.

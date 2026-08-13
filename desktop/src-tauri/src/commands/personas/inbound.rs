@@ -428,6 +428,7 @@ fn apply_inbound_managed_agent(
         local.parallelism = inbound.parallelism;
         local.respond_to = inbound.respond_to;
         local.respond_to_allowlist = inbound.respond_to_allowlist;
+        local.marketplace = inbound.marketplace;
     }
 }
 

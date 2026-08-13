@@ -23,6 +23,7 @@
 //!   mutate on every start/stop and describe transient process state.
 
 use buzz_core_pkg::kind::KIND_MANAGED_AGENT;
+use buzz_core_pkg::marketplace::AgentMarketplace;
 use nostr::{EventBuilder, Kind, Tag};
 use serde::{Deserialize, Serialize};
 
@@ -57,6 +58,8 @@ pub struct ManagedAgentEventContent {
     /// public keys, not secrets.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub respond_to_allowlist: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub marketplace: Option<AgentMarketplace>,
 }
 
 /// Project a `ManagedAgentRecord` onto the content fields published in
@@ -103,6 +106,7 @@ pub fn agent_event_content(record: &ManagedAgentRecord) -> ManagedAgentEventCont
         parallelism: record.parallelism,
         respond_to: record.respond_to,
         respond_to_allowlist: record.respond_to_allowlist.clone(),
+        marketplace: record.marketplace.clone(),
     }
 }
 
@@ -117,7 +121,12 @@ pub fn build_agent_event(record: &ManagedAgentRecord) -> Result<EventBuilder, St
         record.system_prompt.as_deref(),
     )
     .map_err(|error| format!("Managed agent definition is unsafe to publish: {error}"))?;
-    let content = serde_json::to_string(&agent_event_content(record))
+    let mut projection = agent_event_content(record);
+    projection.marketplace = projection
+        .marketplace
+        .map(AgentMarketplace::normalized)
+        .transpose()?;
+    let content = serde_json::to_string(&projection)
         .map_err(|e| format!("failed to serialize managed-agent content: {e}"))?;
     let tags =
         vec![Tag::parse(["d", record.pubkey.as_str()]).map_err(|e| format!("invalid d-tag: {e}"))?];
@@ -140,8 +149,13 @@ pub fn build_agent_event(record: &ManagedAgentRecord) -> Result<EventBuilder, St
 pub fn managed_agent_content_from_event(
     event: &nostr::Event,
 ) -> Result<ManagedAgentEventContent, String> {
-    serde_json::from_str(event.content.as_ref())
-        .map_err(|e| format!("failed to parse managed-agent event content: {e}"))
+    let mut content: ManagedAgentEventContent = serde_json::from_str(event.content.as_ref())
+        .map_err(|e| format!("failed to parse managed-agent event content: {e}"))?;
+    content.marketplace = content
+        .marketplace
+        .map(AgentMarketplace::normalized)
+        .transpose()?;
+    Ok(content)
 }
 
 /// Build a NIP-09 deletion (kind:5) targeting an agent's kind:30177 event.
@@ -206,6 +220,7 @@ mod tests {
             last_error_code: None,
             respond_to: RespondTo::Allowlist,
             respond_to_allowlist: vec!["79be667e".to_string()],
+            marketplace: None,
             // Unified-model fields carry real values so the exclusion test
             // proves they are absent from the wire, not vacuously empty.
             display_name: Some("Display Name Secretish".to_string()),

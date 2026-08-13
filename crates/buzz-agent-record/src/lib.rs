@@ -10,6 +10,7 @@
 pub mod record;
 pub mod snapshot;
 
+pub use buzz_core::marketplace::AgentMarketplace;
 pub use record::{
     default_agent_parallelism, default_auto_restart_on_config_change, default_record_active,
     default_start_on_app_launch, validate_respond_to_allowlist, BackendKind, CatalogSource,

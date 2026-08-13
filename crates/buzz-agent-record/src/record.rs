@@ -5,6 +5,7 @@
 //! relay publishing — stay in `desktop/src-tauri`; this crate is the pure
 //! data shape both sides serialize.
 
+use buzz_core::marketplace::AgentMarketplace;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -326,6 +327,10 @@ pub struct ManagedAgentRecord {
     /// Preserved across mode toggles so users don't lose state.
     #[serde(default)]
     pub respond_to_allowlist: Vec<String>,
+    /// Optional public marketplace metadata. This is deliberately separate
+    /// from runtime/backend configuration and is safe to project publicly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub marketplace: Option<AgentMarketplace>,
     /// Optional display name distinct from the unique `name` handle. Absorbed
     /// from `AgentDefinition.display_name` (unified agent model, Phase 1A).
     #[serde(default, skip_serializing_if = "Option::is_none")]

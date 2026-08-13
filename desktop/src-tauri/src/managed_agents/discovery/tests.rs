@@ -18,7 +18,6 @@ fn resolves_known_avatar_for_bare_command() {
 
     assert_eq!(avatar_url, GOOSE_AVATAR_URL);
 }
-
 #[test]
 fn resolves_known_avatar_for_command_paths_and_aliases() {
     assert_eq!(
@@ -273,6 +272,7 @@ fn record_with(
         last_error_code: None,
         respond_to: Default::default(),
         respond_to_allowlist: vec![],
+        marketplace: None,
         display_name: None,
         slug: None,
         runtime: runtime.map(str::to_string),

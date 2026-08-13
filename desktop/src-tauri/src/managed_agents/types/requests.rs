@@ -6,8 +6,8 @@ use std::collections::BTreeMap;
 use serde::Deserialize;
 
 use super::{
-    default_start_on_app_launch, validate_respond_to_allowlist, AgentDefinition, BackendKind,
-    CatalogSource, RelayMeshConfig, RespondTo,
+    default_start_on_app_launch, validate_respond_to_allowlist, AgentDefinition, AgentMarketplace,
+    BackendKind, CatalogSource, RelayMeshConfig, RespondTo,
 };
 
 /// The NIP-AP behavioral group as one grouped request field.
@@ -253,6 +253,9 @@ pub struct UpdateManagedAgentRequest {
     /// normalized server-side).
     #[serde(default)]
     pub respond_to_allowlist: Option<Vec<String>>,
+    /// Absent = don't touch. Present = publish/update or remove marketplace metadata.
+    #[serde(default, deserialize_with = "crate::util::double_option")]
+    pub marketplace: Option<Option<AgentMarketplace>>,
 }
 
 #[cfg(test)]

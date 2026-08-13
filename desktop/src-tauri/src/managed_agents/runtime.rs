@@ -338,6 +338,7 @@ pub fn build_managed_agent_summary(
         log_path,
         respond_to: record.respond_to,
         respond_to_allowlist: record.respond_to_allowlist.clone(),
+        marketplace: record.marketplace.clone(),
     })
 }
 

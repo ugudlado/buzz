@@ -1516,6 +1516,7 @@ mod tests {
             last_error_code: None,
             respond_to: Default::default(),
             respond_to_allowlist: vec![],
+            marketplace: None,
             display_name: None,
             slug: None,
             runtime: None,
@@ -1531,7 +1532,6 @@ mod tests {
             definition_parallelism: None,
             relay_mesh: None,
         };
-
         let runtime = known_acp_runtime_exact("buzz-agent");
         let effective = resolve_effective_agent_env(&record, &[], runtime, &Default::default());
 

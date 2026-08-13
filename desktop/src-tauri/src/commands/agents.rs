@@ -891,6 +891,7 @@ pub async fn create_managed_agent(
             last_error_code: None,
             respond_to: minted.respond_to,
             respond_to_allowlist: minted.respond_to_allowlist.clone(),
+            marketplace: None,
             display_name: None,
             slug: None,
             runtime: None,
@@ -914,7 +915,6 @@ pub async fn create_managed_agent(
                 relay_mesh.clone()
             },
         };
-
         records.push(record);
 
         save_managed_agents(&app, &records)?;

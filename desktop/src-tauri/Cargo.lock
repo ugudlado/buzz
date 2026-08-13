@@ -1062,6 +1062,7 @@ dependencies = [
 name = "buzz-agent-record"
 version = "0.1.0"
 dependencies = [
+ "buzz-core",
  "serde",
  "serde_json",
 ]
