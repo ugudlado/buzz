@@ -106,6 +106,11 @@ pub enum AcpError {
     #[error("Protocol error: {0}")]
     Protocol(String),
 
+    /// Harness-side preparation failed before an ACP request was sent. The
+    /// agent process remains healthy and must not be respawned.
+    #[error("Setup error: {0}")]
+    Setup(String),
+
     #[error("Agent reported error (code {code}): {message}")]
     AgentError { code: i64, message: String },
 }

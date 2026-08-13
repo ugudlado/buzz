@@ -1,4 +1,4 @@
-use crate::{env, identity::Identity, wire::DeployRequest};
+use crate::{config, env, identity::Identity, wire::DeployRequest};
 use rand::RngExt;
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
@@ -28,6 +28,9 @@ pub fn deploy(request: &DeployRequest) -> Result<String, String> {
     if unit_path.exists() {
         verify_owned_unit(&unit_path, identity.pubkey())?;
     }
+    let config = config::parse(&request.provider_config)?;
+    let workspace = resolve_existing_dir(config.workspace_dir.as_deref(), &home, "workspace_dir")?;
+    let repos = resolve_repos_dir(config.repos_dir.as_deref(), &workspace, &home)?;
 
     let launch = request
         .agent
@@ -44,15 +47,23 @@ pub fn deploy(request: &DeployRequest) -> Result<String, String> {
     let acp = resolve_executable("buzz-acp", &remote_path)?;
     let agent = resolve_executable(requested_agent, &remote_path)?;
     let mcp = resolve_executable("buzz-dev-mcp", &remote_path)?;
+    let git = resolve_executable("git", &remote_path)?;
+    validate_git_version(&git)?;
+    let git_credential = resolve_executable("git-credential-nostr", &remote_path)?;
 
     let generation = format!("{:08x}", rand::rng().random::<u32>());
     let resolved_env = env::build(
         &request.agent,
-        &generation,
-        path_text(&agent)?,
-        path_text(&mcp)?,
-        path_text(&home)?,
-        &remote_path,
+        env::RemoteInputs {
+            generation: &generation,
+            agent_command: path_text(&agent)?,
+            mcp_command: path_text(&mcp)?,
+            home: path_text(&home)?,
+            path: &remote_path,
+            repos_dir: path_text(&repos)?,
+            git_command: path_text(&git)?,
+            git_credential_helper: path_text(&git_credential)?,
+        },
     )?;
     let state_dir = home
         .join(".local/state/buzz/agents")
@@ -72,7 +83,13 @@ pub fn deploy(request: &DeployRequest) -> Result<String, String> {
             return Err(format!("could not resolve remote helper path: {error}"));
         }
     };
-    let unit = match unit_file(identity.pubkey(), &executable, &generation_path, &acp) {
+    let unit = match unit_file(
+        identity.pubkey(),
+        &executable,
+        &generation_path,
+        &acp,
+        &workspace,
+    ) {
         Ok(unit) => unit,
         Err(error) => {
             remove_staged_generation(&generation_path);
@@ -101,16 +118,13 @@ pub fn deploy(request: &DeployRequest) -> Result<String, String> {
     Ok(unit_name)
 }
 
-pub fn run(generation_path: &Path, acp: &Path) -> Result<(), String> {
+pub fn run(generation_path: &Path, acp: &Path, workspace: &Path) -> Result<(), String> {
     let bytes =
         fs::read(generation_path).map_err(|e| format!("could not read agent generation: {e}"))?;
     let env: BTreeMap<String, String> =
         serde_json::from_slice(&bytes).map_err(|_| "agent generation is invalid".to_string())?;
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| "HOME is unavailable".to_string())?;
     let mut command = Command::new(acp);
-    command.envs(env).current_dir(home);
+    command.envs(env).current_dir(workspace);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -134,6 +148,55 @@ fn augmented_path(home: &Path) -> Result<String, String> {
         .map_err(|_| "remote PATH is not UTF-8".to_string())
 }
 
+fn expand_remote_path(value: &str, home: &Path) -> PathBuf {
+    if value == "~" {
+        home.to_path_buf()
+    } else if let Some(relative) = value.strip_prefix("~/") {
+        home.join(relative)
+    } else {
+        PathBuf::from(value)
+    }
+}
+
+fn canonical_dir(path: &Path, field: &str) -> Result<PathBuf, String> {
+    let metadata = fs::metadata(path)
+        .map_err(|e| format!("provider_config.{field} is not accessible: {e}"))?;
+    if !metadata.is_dir() {
+        return Err(format!("provider_config.{field} must be a directory"));
+    }
+    path.canonicalize()
+        .map_err(|e| format!("provider_config.{field} could not be canonicalized: {e}"))
+}
+
+fn resolve_existing_dir(
+    configured: Option<&str>,
+    home: &Path,
+    field: &str,
+) -> Result<PathBuf, String> {
+    canonical_dir(
+        &configured
+            .map(|value| expand_remote_path(value, home))
+            .unwrap_or_else(|| home.to_path_buf()),
+        field,
+    )
+}
+
+fn resolve_repos_dir(
+    configured: Option<&str>,
+    workspace: &Path,
+    home: &Path,
+) -> Result<PathBuf, String> {
+    if let Some(value) = configured {
+        return canonical_dir(&expand_remote_path(value, home), "repos_dir");
+    }
+    let path = workspace.join("REPOS");
+    if !path.exists() {
+        create_private_dir(&path)
+            .map_err(|e| format!("could not create default repositories folder: {e}"))?;
+    }
+    canonical_dir(&path, "repos_dir")
+}
+
 fn resolve_executable(command: &str, search_path: &str) -> Result<PathBuf, String> {
     let path = Path::new(command);
     let candidates: Vec<PathBuf> = if path.components().count() > 1 {
@@ -148,6 +211,45 @@ fn resolve_executable(command: &str, search_path: &str) -> Result<PathBuf, Strin
         .find(|candidate| is_executable(candidate))
         .and_then(|candidate| candidate.canonicalize().ok())
         .ok_or_else(|| format!("required remote command {command:?} was not found on PATH"))
+}
+
+fn validate_git_version(git: &Path) -> Result<(), String> {
+    let output = Command::new(git)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("could not query remote Git version: {e}"))?;
+    if !output.status.success() {
+        return Err("remote Git --version failed".into());
+    }
+    let version = std::str::from_utf8(&output.stdout)
+        .ok()
+        .and_then(parse_git_version)
+        .ok_or_else(|| "remote Git returned an unrecognized version".to_string())?;
+    if !supported_git_version(version) {
+        return Err(format!(
+            "remote Git {}.{}.{} is unsupported; Buzz requires Git 2.46 or newer",
+            version.0, version.1, version.2
+        ));
+    }
+    Ok(())
+}
+
+fn supported_git_version(version: (u64, u64, u64)) -> bool {
+    version >= (2, 46, 0)
+}
+
+fn parse_git_version(value: &str) -> Option<(u64, u64, u64)> {
+    let version = value
+        .trim()
+        .strip_prefix("git version ")?
+        .split_whitespace()
+        .next()?;
+    let mut parts = version.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next().unwrap_or("0").parse().ok()?;
+    Some((major, minor, patch))
 }
 
 fn is_executable(path: &Path) -> bool {
@@ -199,12 +301,20 @@ fn verify_owned_unit(path: &Path, pubkey: &str) -> Result<(), String> {
     }
 }
 
-fn unit_file(pubkey: &str, runner: &Path, generation: &Path, acp: &Path) -> Result<String, String> {
+fn unit_file(
+    pubkey: &str,
+    runner: &Path,
+    generation: &Path,
+    acp: &Path,
+    workspace: &Path,
+) -> Result<String, String> {
     Ok(format!(
-        "{UNIT_MARKER}\n# Agent-Pubkey: {pubkey}\n[Unit]\nDescription=Buzz managed agent\n\n[Service]\nType=exec\nExecStart={} run {} {}\nWorkingDirectory=%h\nRestart=no\nKillMode=control-group\nTimeoutStopSec=240\n",
+        "{UNIT_MARKER}\n# Agent-Pubkey: {pubkey}\n[Unit]\nDescription=Buzz managed agent\n\n[Service]\nType=exec\nExecStart={} run {} {} {}\nWorkingDirectory={}\nRestart=no\nKillMode=control-group\nTimeoutStopSec=240\n",
         systemd_arg(path_text(runner)?)?,
         systemd_arg(path_text(generation)?)?,
         systemd_arg(path_text(acp)?)?,
+        systemd_arg(path_text(workspace)?)?,
+        systemd_arg(path_text(workspace)?)?,
     ))
 }
 
@@ -317,11 +427,13 @@ mod tests {
             Path::new("/home/agent/.local/bin/buzz-backend-host"),
             Path::new("/home/agent/.local/state/buzz/generation.json"),
             Path::new("/home/agent/.local/bin/buzz-acp"),
+            Path::new("/srv/buzz workspace"),
         )
         .unwrap();
         assert!(unit.contains("Restart=no"));
         assert!(unit.contains("Type=exec"));
         assert!(unit.contains("KillMode=control-group"));
+        assert!(unit.contains("WorkingDirectory=\"/srv/buzz workspace\""));
         assert!(!unit.contains("BUZZ_PRIVATE_KEY"));
         assert!(!unit.contains("nsec1"));
     }
@@ -330,5 +442,60 @@ mod tests {
     fn systemd_paths_are_quoted_and_specifiers_escaped() {
         assert_eq!(systemd_arg("/tmp/a b%/c").unwrap(), "\"/tmp/a b%%/c\"");
         assert!(systemd_arg("/tmp/a\nb").is_err());
+    }
+
+    #[test]
+    fn resolves_existing_configured_dirs_and_only_creates_the_default_repos_dir() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/host-provider-path-tests")
+            .join(format!(
+                "{}-{:08x}",
+                std::process::id(),
+                rand::rng().random::<u32>()
+            ));
+        let workspace = root.join("workspace");
+        let repos = root.join("repositories");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&repos).unwrap();
+
+        assert_eq!(
+            resolve_existing_dir(Some("~/workspace"), &root, "workspace_dir").unwrap(),
+            workspace.canonicalize().unwrap()
+        );
+        assert_eq!(
+            resolve_repos_dir(Some("~/repositories"), &workspace, &root).unwrap(),
+            repos.canonicalize().unwrap()
+        );
+        assert!(resolve_repos_dir(Some("~/missing"), &workspace, &root).is_err());
+        assert!(!root.join("missing").exists());
+
+        let default_repos = resolve_repos_dir(None, &workspace, &root).unwrap();
+        assert_eq!(
+            default_repos,
+            workspace.join("REPOS").canonicalize().unwrap()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(default_repos).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn parses_and_gates_git_versions() {
+        assert_eq!(parse_git_version("git version 2.46.0\n"), Some((2, 46, 0)));
+        assert_eq!(
+            parse_git_version("git version 2.49.0 (Apple Git-154)"),
+            Some((2, 49, 0))
+        );
+        assert_eq!(parse_git_version("git version 3.0"), Some((3, 0, 0)));
+        assert_eq!(parse_git_version("not git"), None);
+        assert!(!supported_git_version((2, 45, 9)));
+        assert!(supported_git_version((2, 46, 0)));
+        assert!(supported_git_version((3, 0, 0)));
     }
 }

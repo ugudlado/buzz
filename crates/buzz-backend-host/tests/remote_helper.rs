@@ -165,9 +165,19 @@ fn remote_helper_writes_private_state_and_active_deploy_is_a_noop() {
             active.display()
         ),
     );
-    for command in ["buzz-acp", "hermes-acp", "buzz-dev-mcp"] {
+    for command in [
+        "buzz-acp",
+        "hermes-acp",
+        "buzz-dev-mcp",
+        "git",
+        "git-credential-nostr",
+    ] {
         executable(&bin.join(command), "#!/bin/sh\nexit 0\n");
     }
+    executable(
+        &bin.join("git"),
+        "#!/bin/sh\nprintf '%s\\n' 'git version 2.46.0'\n",
+    );
 
     let keys = nostr::Keys::generate();
     let nsec = keys.secret_key().to_bech32().unwrap();
@@ -198,6 +208,27 @@ fn remote_helper_writes_private_state_and_active_deploy_is_a_noop() {
             .to_str()
             .unwrap()
     ));
+    let generation_json: serde_json::Value = serde_json::from_str(&generation_text).unwrap();
+    assert_eq!(
+        generation_json["BUZZ_ACP_REPOS_DIR"],
+        root.join("REPOS").canonicalize().unwrap().to_str().unwrap()
+    );
+    assert_eq!(
+        generation_json["BUZZ_ACP_GIT_COMMAND"],
+        bin.join("git").canonicalize().unwrap().to_str().unwrap()
+    );
+    assert_eq!(
+        generation_json["BUZZ_ACP_GIT_CREDENTIAL_HELPER"],
+        bin.join("git-credential-nostr")
+            .canonicalize()
+            .unwrap()
+            .to_str()
+            .unwrap()
+    );
+    assert_eq!(
+        fs::metadata(root.join("REPOS")).unwrap().mode() & 0o777,
+        0o700
+    );
 
     let unit = fs::read_to_string(
         root.join(".config/systemd/user")
@@ -205,6 +236,10 @@ fn remote_helper_writes_private_state_and_active_deploy_is_a_noop() {
     )
     .unwrap();
     assert!(unit.contains("Restart=no"));
+    assert!(unit.contains(&format!(
+        "WorkingDirectory=\"{}\"",
+        root.canonicalize().unwrap().display()
+    )));
     assert!(!unit.contains(&nsec));
 
     let second = run_helper(&root, bin.to_str().unwrap(), &payload);

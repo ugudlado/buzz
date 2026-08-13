@@ -1,6 +1,8 @@
 #[derive(Debug, PartialEq, Eq)]
 pub struct Config {
     pub host: String,
+    pub workspace_dir: Option<String>,
+    pub repos_dir: Option<String>,
 }
 
 pub fn parse(value: &serde_json::Value) -> Result<Config, String> {
@@ -22,7 +24,30 @@ pub fn parse(value: &serde_json::Value) -> Result<Config, String> {
     }
     Ok(Config {
         host: host.to_string(),
+        workspace_dir: optional_remote_path(object, "workspace_dir")?,
+        repos_dir: optional_remote_path(object, "repos_dir")?,
     })
+}
+
+fn optional_remote_path(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<Option<String>, String> {
+    match object.get(field) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(value)) if value.trim().is_empty() => Ok(None),
+        Some(serde_json::Value::String(value)) => {
+            let value = value.trim();
+            let valid = (value == "~"
+                || value.starts_with("~/")
+                || std::path::Path::new(value).is_absolute())
+                && !value.chars().any(char::is_control);
+            valid.then(|| Some(value.to_string())).ok_or_else(|| {
+                format!("provider_config.{field} must be an absolute path or start with ~/")
+            })
+        }
+        Some(_) => Err(format!("provider_config.{field} must be a string")),
+    }
 }
 
 pub fn schema() -> serde_json::Value {
@@ -33,6 +58,16 @@ pub fn schema() -> serde_json::Value {
                 "type": "string",
                 "title": "Host",
                 "description": "SSH config alias for the host. Authentication and host verification use your existing SSH configuration."
+            },
+            "workspace_dir": {
+                "type": "string",
+                "title": "Workspace folder",
+                "description": "Existing persistent folder on the host. Defaults to the remote user's home."
+            },
+            "repos_dir": {
+                "type": "string",
+                "title": "Repositories folder",
+                "description": "Existing repository folder on the host. Defaults to a persistent REPOS folder inside the workspace."
             }
         },
         "required": ["host"]
@@ -59,6 +94,19 @@ mod tests {
             "host name",
         ] {
             assert!(parse(&serde_json::json!({"host": host})).is_err(), "{host}");
+        }
+    }
+
+    #[test]
+    fn accepts_only_absolute_or_home_relative_remote_paths() {
+        let config = parse(&serde_json::json!({
+            "host": "vps", "workspace_dir": "~/buzz workspace", "repos_dir": "/srv/repos"
+        }))
+        .unwrap();
+        assert_eq!(config.workspace_dir.as_deref(), Some("~/buzz workspace"));
+        assert_eq!(config.repos_dir.as_deref(), Some("/srv/repos"));
+        for value in ["relative/path", "~other/path", "~/bad\npath"] {
+            assert!(parse(&serde_json::json!({"host": "vps", "workspace_dir": value})).is_err());
         }
     }
 }

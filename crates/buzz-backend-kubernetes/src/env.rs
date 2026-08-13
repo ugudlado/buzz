@@ -31,6 +31,9 @@ const AUTHORITATIVE_KEYS: &[&str] = &[
     "BUZZ_ACP_RESPOND_TO",
     "BUZZ_ACP_RESPOND_TO_ALLOWLIST",
     "BUZZ_ACP_MCP_COMMAND",
+    "BUZZ_ACP_REPOS_DIR",
+    "BUZZ_ACP_GIT_COMMAND",
+    "BUZZ_ACP_GIT_CREDENTIAL_HELPER",
     "BUZZ_ACP_EXIT_AFTER_INACTIVITY",
     START_NONCE_KEY,
 ];
@@ -595,6 +598,9 @@ mod tests {
             "BUZZ_ACP_AGENT_ARGS",
             "BUZZ_ACP_RESPOND_TO",
             "BUZZ_ACP_RESPOND_TO_ALLOWLIST",
+            "BUZZ_ACP_REPOS_DIR",
+            "BUZZ_ACP_GIT_COMMAND",
+            "BUZZ_ACP_GIT_CREDENTIAL_HELPER",
         ] {
             assert!(!env.contains_key(absent), "{absent} survived the clear");
         }

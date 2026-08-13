@@ -41,6 +41,12 @@ pub(crate) const RESERVED_ENV_KEYS: &[&str] = &[
     "BUZZ_ACP_AGENT_COMMAND",
     "BUZZ_ACP_AGENT_ARGS",
     "BUZZ_ACP_MCP_COMMAND",
+    // Repository execution root is deployment-owned. In particular, remote
+    // providers must supply a remote-host path rather than accepting a
+    // desktop-local/user environment override.
+    "BUZZ_ACP_REPOS_DIR",
+    "BUZZ_ACP_GIT_COMMAND",
+    "BUZZ_ACP_GIT_CREDENTIAL_HELPER",
     // Control-plane parallelism: the Desktop resolves the effective
     // worker-pool size (applying any per-harness cap) and writes it into
     // launch.policy_env. A user-supplied BUZZ_ACP_AGENTS would bypass the

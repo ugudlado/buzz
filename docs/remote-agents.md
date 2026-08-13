@@ -1417,12 +1417,17 @@ uses the system `ssh` client and a fixed remote helper installed at
 stdin. It does not put the nsec, auth tag, environment, runtime command, or
 runtime arguments in the SSH command line.
 
-`provider_config.host` is an SSH config alias, not a URL or credential. SSH
-authentication, Tailscale routing, proxies, and host-key verification remain
-in the user's normal SSH configuration. The provider enables batch mode,
-disables forwarding and TTY allocation, and does not weaken host-key checking.
-The same provider version MUST be installed on the server because its
-`remote-deploy` mode owns the remote storage and systemd contract.
+`provider_config.host` is an SSH config alias, not a URL or credential. The
+optional `provider_config.workspace_dir` selects an existing remote working
+directory and defaults to the SSH user's home. The optional
+`provider_config.repos_dir` selects an existing repository root and defaults to
+`REPOS` inside the workspace (the helper creates that default directory).
+Configured paths MUST be absolute or begin with `~/`. SSH authentication,
+Tailscale routing, proxies, and host-key verification remain in the user's
+normal SSH configuration. The provider enables batch mode, disables forwarding
+and TTY allocation, and does not weaken host-key checking. The same provider
+version MUST be installed on the server because its `remote-deploy` mode owns
+the remote storage and systemd contract.
 
 The remote helper derives a deterministic user-service name from the agent's
 pubkey. Each deployment generation is written beneath the remote user's state
@@ -1432,6 +1437,9 @@ reads that file and ends in `exec buzz-acp`. `systemd --user` uses
 exit stay final, and children do not escape the unit. An active, identity-
 verified unit is a strict no-op. Full pubkey metadata and a Host-provider
 management marker are required before the provider adopts or cleans anything.
+Consequently, edits to Host provider configuration do not change an active
+unit: the operator MUST Stop it, wait for offline presence, and Start it again
+to publish the next generation.
 
 The unit runs as the SSH user and retains that user's remote `HOME`. Runtime
 binaries and configuration are resolved on the server; desktop absolute paths
@@ -1443,6 +1451,22 @@ servers Buzz supplies and every server in the Hermes profile. Set
 the existing Hermes-configured MCP servers should also start; the normal
 `policy_env < launch.env < authoritative identity` precedence makes that
 explicit override win.
+
+Deployment and Start perform no channel-repository clone or fetch. Before each
+new ACP session for a linked channel—including a replacement session—the
+harness prepares its checkout just in time under `repos_dir`: it clones a
+missing checkout, or fetches `origin` for an existing checkout whose linked URL
+is approved. It never pulls, resets, or checks out a branch, so the current
+branch, index, dirty tracked files, and untracked files remain untouched. A
+manually prepared existing checkout whose origin is outside the automatic
+allowlist remains usable as-is and is not fetched.
+
+Automatic repository network access is limited to the active Buzz relay's Git
+endpoint and public `https://github.com/<owner>/<repo>` URLs. The remote host
+MUST provide Git 2.46 or newer and `git-credential-nostr` on the resolved
+`PATH`; relay access uses that helper, while public GitHub access receives no
+Buzz credential helper. Other origins require a checkout prepared manually
+under `repos_dir`.
 
 Host deployment does not add a management channel. Success means systemd
 confirmed that `buzz-acp` started. Live status still comes only from the
@@ -1571,6 +1595,10 @@ The realization the two lists above require, in this binding's vocabulary:
 3. Provider success requires the systemd user unit to start. Relay liveness is
    deliberately separate and is established only by signed presence in the
    deployed community.
+4. Deploy/Start performs no repository network activity. Repository preparation
+   is delayed until each new or replacement channel session, is restricted to
+   the active relay and public GitHub for automatic access, and never changes
+   the selected branch, index, or worktree of an existing checkout.
 
 Conformance is testable without mechanization: a fake-provider harness can
 exercise L2 items 1–3 and 5 over the wire contract — including the pre-secret

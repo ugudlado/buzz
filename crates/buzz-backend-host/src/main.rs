@@ -15,15 +15,19 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.as_slice() {
         [command] if command == "remote-deploy" => remote_deploy_main(),
-        [command, generation, acp] if command == "run" => {
-            if let Err(error) = remote::run(Path::new(generation), Path::new(acp)) {
+        [command, generation, acp, workspace] if command == "run" => {
+            if let Err(error) =
+                remote::run(Path::new(generation), Path::new(acp), Path::new(workspace))
+            {
                 eprintln!("buzz-backend-host runner: {error}");
                 std::process::exit(1);
             }
         }
         [] => provider_main(),
         _ => {
-            eprintln!("usage: buzz-backend-host [remote-deploy|run <generation> <buzz-acp>]");
+            eprintln!(
+                "usage: buzz-backend-host [remote-deploy|run <generation> <buzz-acp> <workspace>]"
+            );
             std::process::exit(1);
         }
     }
@@ -120,18 +124,15 @@ mod tests {
     }
 
     #[test]
-    fn info_is_pure_and_exposes_only_the_host_field() {
+    fn info_is_pure_and_exposes_host_workspace_and_repos_fields() {
         let value = serde_json::to_value(respond(r#"{"op":"info"}"#)).unwrap();
         assert_eq!(value["ok"], true);
         assert_eq!(value["protocol_version"], wire::PROTOCOL_VERSION);
         assert!(value["config_schema"]["properties"]["host"].is_object());
-        assert_eq!(
-            value["config_schema"]["properties"]
-                .as_object()
-                .unwrap()
-                .len(),
-            1
-        );
+        let properties = value["config_schema"]["properties"].as_object().unwrap();
+        assert_eq!(properties.len(), 3);
+        assert!(properties["workspace_dir"].is_object());
+        assert!(properties["repos_dir"].is_object());
     }
 
     #[test]

@@ -14,6 +14,9 @@ const AUTHORITATIVE: &[&str] = &[
     "BUZZ_ACP_RESPOND_TO_ALLOWLIST",
     "BUZZ_ACP_MCP_COMMAND",
     "BUZZ_ACP_EXIT_AFTER_INACTIVITY",
+    "BUZZ_ACP_REPOS_DIR",
+    "BUZZ_ACP_GIT_COMMAND",
+    "BUZZ_ACP_GIT_CREDENTIAL_HELPER",
     START_NONCE,
 ];
 
@@ -46,13 +49,20 @@ fn validate_access(mode: &str, allowlist: Option<&[String]>) -> Result<(), Strin
     Ok(())
 }
 
+pub struct RemoteInputs<'a> {
+    pub generation: &'a str,
+    pub agent_command: &'a str,
+    pub mcp_command: &'a str,
+    pub home: &'a str,
+    pub path: &'a str,
+    pub repos_dir: &'a str,
+    pub git_command: &'a str,
+    pub git_credential_helper: &'a str,
+}
+
 pub fn build(
     agent: &AgentPayload,
-    generation: &str,
-    agent_command: &str,
-    mcp_command: &str,
-    remote_home: &str,
-    remote_path: &str,
+    remote: RemoteInputs<'_>,
 ) -> Result<BTreeMap<String, String>, String> {
     let default_launch = LaunchBlock::default();
     let launch = agent.launch.as_ref().unwrap_or(&default_launch);
@@ -105,13 +115,19 @@ pub fn build(
         env.insert("BUZZ_ACP_AGENT_OWNER".into(), value.into());
     }
 
-    env.insert("BUZZ_ACP_AGENT_COMMAND".into(), agent_command.into());
+    env.insert("BUZZ_ACP_AGENT_COMMAND".into(), remote.agent_command.into());
     if !launch.args.is_empty() {
         env.insert("BUZZ_ACP_AGENT_ARGS".into(), launch.args.join(","));
     }
-    env.insert("BUZZ_ACP_MCP_COMMAND".into(), mcp_command.into());
-    env.insert("HOME".into(), remote_home.into());
-    env.insert("PATH".into(), remote_path.into());
+    env.insert("BUZZ_ACP_MCP_COMMAND".into(), remote.mcp_command.into());
+    env.insert("HOME".into(), remote.home.into());
+    env.insert("PATH".into(), remote.path.into());
+    env.insert("BUZZ_ACP_REPOS_DIR".into(), remote.repos_dir.into());
+    env.insert("BUZZ_ACP_GIT_COMMAND".into(), remote.git_command.into());
+    env.insert(
+        "BUZZ_ACP_GIT_CREDENTIAL_HELPER".into(),
+        remote.git_credential_helper.into(),
+    );
     if let Some(mode) = agent.respond_to.as_deref().filter(|mode| !mode.is_empty()) {
         validate_access(mode, agent.respond_to_allowlist.as_deref())?;
         env.insert("BUZZ_ACP_RESPOND_TO".into(), mode.into());
@@ -123,7 +139,7 @@ pub fn build(
     {
         env.insert("BUZZ_ACP_RESPOND_TO_ALLOWLIST".into(), list.join(","));
     }
-    env.insert(START_NONCE.into(), generation.into());
+    env.insert(START_NONCE.into(), remote.generation.into());
     Ok(env)
 }
 
@@ -152,23 +168,23 @@ mod tests {
                 "HOME": "/Users/local",
                 "PATH": "/local/bin",
                 "BUZZ_PRIVATE_KEY": "forged",
-                "BUZZ_ACP_AGENT_COMMAND": "bad"
+                "BUZZ_ACP_AGENT_COMMAND": "bad",
+                "BUZZ_ACP_REPOS_DIR": "/attacker/repos",
+                "BUZZ_ACP_GIT_COMMAND": "/attacker/git",
+                "BUZZ_ACP_GIT_CREDENTIAL_HELPER": "/attacker/helper"
             }
         }}));
-        let env = build(
-            &payload,
-            "generation",
-            "/remote/hermes-acp",
-            "/remote/buzz-dev-mcp",
-            "/home/remote",
-            "/home/remote/.local/bin:/usr/bin",
-        )
-        .unwrap();
+        let env = build(&payload, inputs()).unwrap();
         assert_eq!(env["BUZZ_PRIVATE_KEY"], "nsec1example");
         assert_eq!(env["BUZZ_ACP_AGENT_COMMAND"], "/remote/hermes-acp");
         assert_eq!(env["BUZZ_ACP_MCP_COMMAND"], "/remote/buzz-dev-mcp");
-        assert_eq!(env["HOME"], "/home/remote");
         assert_eq!(env["PATH"], "/home/remote/.local/bin:/usr/bin");
+        assert_eq!(env["BUZZ_ACP_REPOS_DIR"], "/srv/repos");
+        assert_eq!(env["BUZZ_ACP_GIT_COMMAND"], "/usr/bin/git");
+        assert_eq!(
+            env["BUZZ_ACP_GIT_CREDENTIAL_HELPER"],
+            "/usr/bin/git-credential-nostr"
+        );
     }
 
     #[test]
@@ -177,10 +193,23 @@ mod tests {
             "relay_url": "wss://relay", "private_key_nsec": "x"
         }))
         .unwrap();
-        assert!(build(&no_owner, "g", "agent", "mcp", "/home/a", "/usr/bin").is_err());
+        assert!(build(&no_owner, inputs()).is_err());
         let suppressed = agent(serde_json::json!({"launch": {
             "owner_pubkey": "beef", "env": {"BUZZ_ACP_NO_PRESENCE": "1"}
         }}));
-        assert!(build(&suppressed, "g", "agent", "mcp", "/home/a", "/usr/bin").is_err());
+        assert!(build(&suppressed, inputs()).is_err());
+    }
+
+    fn inputs() -> RemoteInputs<'static> {
+        RemoteInputs {
+            generation: "generation",
+            agent_command: "/remote/hermes-acp",
+            mcp_command: "/remote/buzz-dev-mcp",
+            home: "/home/remote",
+            path: "/home/remote/.local/bin:/usr/bin",
+            repos_dir: "/srv/repos",
+            git_command: "/usr/bin/git",
+            git_credential_helper: "/usr/bin/git-credential-nostr",
+        }
     }
 }
