@@ -47,6 +47,7 @@ pub fn deploy(request: &DeployRequest) -> Result<String, String> {
     let acp = resolve_executable("buzz-acp", &remote_path)?;
     let agent = resolve_executable(requested_agent, &remote_path)?;
     let mcp = resolve_executable("buzz-dev-mcp", &remote_path)?;
+    resolve_executable("buzz", &remote_path)?;
     let git = resolve_executable("git", &remote_path)?;
     validate_git_version(&git)?;
     let git_credential = resolve_executable("git-credential-nostr", &remote_path)?;

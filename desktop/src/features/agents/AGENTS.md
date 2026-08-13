@@ -183,6 +183,12 @@ with a TypeScript lookup table or an id comparison in a component.
    import boundary. Do not silently strip them: rejection keeps the reviewed
    string identical to the executed string. New sharing paths must reuse the
    same validation before they persist or activate a definition.
+13. **Remote-provider setup guidance comes from the provider probe.**
+   `WhereToRunSection` renders `BackendProviderProbeResult.description` above
+   the schema-driven fields. Keep machine prerequisites in the provider's
+   protocol `info.description`; do not add Host/Kubernetes ID checks or a
+   second frontend lookup table. Agent creation may explain or test remote
+   readiness, but it must not silently install packages or change the host.
 
 ## The tests that enforce this
 

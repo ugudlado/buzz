@@ -169,6 +169,7 @@ fn remote_helper_writes_private_state_and_active_deploy_is_a_noop() {
         "buzz-acp",
         "hermes-acp",
         "buzz-dev-mcp",
+        "buzz",
         "git",
         "git-credential-nostr",
     ] {

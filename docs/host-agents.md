@@ -38,6 +38,59 @@ credentials, or disable host-key verification for you. The managed agent's
 Buzz identity is transferred over SSH and stored in its private launch file as
 described below.
 
+## Set up the remote machine
+
+Run this once as the same Unix user named by the SSH alias. Replace
+`/path/to/buzz-release` with an unpacked Buzz release built for the server's
+architecture:
+
+```bash
+install -d -m 700 \
+  "$HOME/.local/bin" \
+  "$HOME/REPOS"
+
+for binary in \
+  buzz-backend-host \
+  buzz-acp \
+  buzz-dev-mcp \
+  git-credential-nostr \
+  buzz
+do
+  install -m 755 "/path/to/buzz-release/$binary" "$HOME/.local/bin/$binary"
+done
+
+# Install the chosen ACP runtime separately. For an existing Hermes setup,
+# this should resolve to the wrapper that already uses the remote HOME/config.
+command -v hermes-acp
+```
+
+Then verify the non-interactive environment the Host provider uses:
+
+```bash
+ssh buzz-vps '
+  set -eu
+  export PATH="$HOME/.local/bin:$PATH"
+  git version
+  command -v buzz-backend-host
+  command -v buzz-acp
+  command -v buzz-dev-mcp
+  command -v git-credential-nostr
+  command -v buzz
+  command -v hermes-acp
+  systemctl --user show-environment >/dev/null
+'
+```
+
+The Host provider performs a stricter Git 2.46-or-newer check during deploy.
+It also verifies all required commands before writing agent state. A failed
+preflight is safe to retry after fixing the remote installation.
+
+Machine setup is intentionally separate from **Add agent**. Desktop may offer
+this checklist or a future explicit **Set up host** action, but creating an
+agent must not silently install packages, change `sshd`, enable lingering, or
+replace an existing harness. That keeps agent creation repeatable and makes
+the remote trust change visible to the operator.
+
 ## Add and verify an agent
 
 In the agent dialog, choose the Host backend and enter `buzz-vps` in **Host**.

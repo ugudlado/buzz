@@ -84,7 +84,7 @@ impl Response {
             name: "host",
             version: env!("CARGO_PKG_VERSION"),
             protocol_version: PROTOCOL_VERSION,
-            description: "Runs an agent on an existing host over SSH",
+            description: "Remote setup required: install the matching Buzz host provider, ACP harness, developer MCP, Buzz CLI, Git 2.46+, git-credential-nostr, and the selected runtime before adding this agent. See https://github.com/block/buzz/blob/main/docs/host-agents.md.",
             config_schema: crate::config::schema(),
         })
     }

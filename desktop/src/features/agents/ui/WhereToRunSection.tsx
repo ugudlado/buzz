@@ -124,6 +124,11 @@ export function WhereToRunSection({
               Could not probe provider: {probeError}
             </p>
           ) : null}
+          {draft.probedProvider?.description ? (
+            <p className="text-sm text-muted-foreground">
+              {draft.probedProvider.description}
+            </p>
+          ) : null}
           {draft.probedProvider?.config_schema ? (
             <ProviderConfigFields
               config={draft.providerConfig}

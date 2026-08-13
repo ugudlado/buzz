@@ -128,6 +128,10 @@ mod tests {
         let value = serde_json::to_value(respond(r#"{"op":"info"}"#)).unwrap();
         assert_eq!(value["ok"], true);
         assert_eq!(value["protocol_version"], wire::PROTOCOL_VERSION);
+        assert!(value["description"]
+            .as_str()
+            .unwrap()
+            .contains("https://github.com/block/buzz/blob/main/docs/host-agents.md"));
         assert!(value["config_schema"]["properties"]["host"].is_object());
         let properties = value["config_schema"]["properties"].as_object().unwrap();
         assert_eq!(properties.len(), 3);
