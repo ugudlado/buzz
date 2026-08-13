@@ -40,14 +40,40 @@ described below.
 
 ## Set up the remote machine
 
-Run this once as the same Unix user named by the SSH alias. Replace
-`/path/to/buzz-release` with an unpacked Buzz release built for the server's
-architecture:
+From a matching Buzz source checkout on the server, run the explicit setup
+script as the same Unix user named by the SSH alias:
 
 ```bash
-install -d -m 700 \
-  "$HOME/.local/bin" \
-  "$HOME/REPOS"
+./scripts/setup-host-agent.sh \
+  --runtime hermes-acp \
+  --install-system-deps \
+  --enable-linger
+```
+
+The two flags authorize the script to use `apt`/`sudo` for build dependencies
+and to enable the current user's lingering systemd manager. Omit them when the
+host is already prepared. The script builds and installs all Buzz-owned
+components under `~/.local/bin`, installs a checksum-pinned user-local Git
+2.50.1 when Git is older than 2.46, and verifies the selected ACP runtime.
+Runtime installation and credentials remain runtime-specific and are not
+guessed by Buzz. The script uses the network for Cargo dependencies and, when
+required, the checksum-pinned Git source from `kernel.org`; use the manual
+prebuilt-release path below for an offline host.
+
+To use non-default persistent directories:
+
+```bash
+./scripts/setup-host-agent.sh \
+  --runtime hermes-acp \
+  --workspace "$HOME/buzz-workspace" \
+  --repos-dir "$HOME/repositories"
+```
+
+For a prebuilt release instead of a source checkout, install its binaries
+manually:
+
+```bash
+mkdir -p "$HOME/.local/bin" "$HOME/REPOS"
 
 for binary in \
   buzz-backend-host \
@@ -86,10 +112,10 @@ It also verifies all required commands before writing agent state. A failed
 preflight is safe to retry after fixing the remote installation.
 
 Machine setup is intentionally separate from **Add agent**. Desktop may offer
-this checklist or a future explicit **Set up host** action, but creating an
-agent must not silently install packages, change `sshd`, enable lingering, or
-replace an existing harness. That keeps agent creation repeatable and makes
-the remote trust change visible to the operator.
+this script/checklist, but creating an agent must not silently run it, install
+packages, change `sshd`, enable lingering, or replace an existing harness.
+That keeps agent creation repeatable and makes the remote trust change visible
+to the operator.
 
 ## Add and verify an agent
 
