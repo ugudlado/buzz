@@ -11,7 +11,7 @@ use crate::agent_management::{build_create, build_update, CreateAgentDraft, Upda
 use crate::client::BuzzClient;
 use crate::error::CliError;
 use crate::validate::{read_or_stdin, validate_hex64};
-use crate::{AgentsCmd, RespondToArg};
+use crate::{AgentAccessArg, AgentsCmd, RespondToArg};
 
 pub async fn dispatch(command: AgentsCmd, client: &BuzzClient) -> Result<(), CliError> {
     match command {
@@ -32,6 +32,20 @@ pub async fn dispatch(command: AgentsCmd, client: &BuzzClient) -> Result<(), Cli
             println!("{output}");
             Ok(())
         }
+
+        AgentsCmd::SetAccess {
+            pubkey,
+            respond_to,
+            allowlist,
+            store_dir,
+            identifier,
+        } => set_agent_access(
+            &pubkey,
+            respond_to,
+            &allowlist,
+            store_dir.as_deref(),
+            &identifier,
+        ),
 
         AgentsCmd::DraftCreate {
             channel,
@@ -524,6 +538,70 @@ fn remove_agent(
         "removed": before - remaining.len(),
         "store_path": store_path.display().to_string(),
     }))
+}
+
+fn set_agent_access(
+    pubkey: &str,
+    respond_to: AgentAccessArg,
+    allowlist: &[String],
+    store_dir: Option<&std::path::Path>,
+    identifier: &str,
+) -> Result<(), CliError> {
+    validate_hex64(pubkey)?;
+    let store_path = resolve_store_path(store_dir, identifier)?;
+    refuse_if_desktop_running()?;
+    let content = std::fs::read_to_string(&store_path)
+        .map_err(|e| CliError::Other(format!("failed to read {}: {e}", store_path.display())))?;
+    let mut records: Vec<ManagedAgentRecord> = serde_json::from_str(&content).map_err(|e| {
+        CliError::Other(format!(
+            "{} is not valid JSON — refusing to rewrite a store this build cannot parse: {e}",
+            store_path.display()
+        ))
+    })?;
+    let normalized = validate_respond_to_allowlist(allowlist)
+        .map_err(|e| CliError::Usage(format!("invalid allowlist: {e}")))?;
+    let mode = match respond_to {
+        AgentAccessArg::OwnerOnly => RespondTo::OwnerOnly,
+        AgentAccessArg::Allowlist => RespondTo::Allowlist,
+        AgentAccessArg::Anyone => RespondTo::Anyone,
+    };
+    if mode == RespondTo::Allowlist && normalized.is_empty() {
+        return Err(CliError::Usage(
+            "--respond-to allowlist requires at least one --allow pubkey".into(),
+        ));
+    }
+    if mode != RespondTo::Allowlist && !normalized.is_empty() {
+        return Err(CliError::Usage(
+            "--allow is only valid with --respond-to allowlist".into(),
+        ));
+    }
+    let record = records
+        .iter_mut()
+        .find(|record| record.pubkey == pubkey)
+        .ok_or_else(|| {
+            CliError::Usage(format!(
+                "no record with pubkey {pubkey} in {}",
+                store_path.display()
+            ))
+        })?;
+    record.respond_to = mode;
+    record.respond_to_allowlist = normalized;
+    let saved_mode = record.respond_to;
+    let allowlist_count = record.respond_to_allowlist.len();
+    let json = serde_json::to_string_pretty(&records)
+        .map_err(|e| CliError::Other(format!("failed to serialize agent store: {e}")))?;
+    std::fs::write(&store_path, json)
+        .map_err(|e| CliError::Other(format!("failed to write {}: {e}", store_path.display())))?;
+    println!(
+        "{}",
+        json!({
+            "pubkey": pubkey,
+            "respond_to": saved_mode,
+            "allowlist_count": allowlist_count,
+            "store_path": store_path.display().to_string(),
+        })
+    );
+    Ok(())
 }
 
 /// Resolve `managed-agents.json`'s directory the same way Tauri's
@@ -1961,5 +2039,34 @@ mod tests {
         );
         let after = std::fs::read(&path).unwrap();
         assert_eq!(before, after, "failed remove must not mutate the store");
+    }
+
+    #[test]
+    fn set_access_updates_only_the_matching_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = hex64('a');
+        let untouched = hex64('b');
+        let path = write_temp_store(
+            dir.path(),
+            &[
+                sample_managed_record(&target, "Target"),
+                sample_managed_record(&untouched, "Untouched"),
+            ],
+        );
+
+        set_agent_access(
+            &target,
+            AgentAccessArg::Allowlist,
+            std::slice::from_ref(&untouched),
+            Some(dir.path()),
+            "xyz.block.buzz.app",
+        )
+        .expect("access update should succeed");
+
+        let records: Vec<ManagedAgentRecord> =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(records[0].respond_to, RespondTo::Allowlist);
+        assert_eq!(records[0].respond_to_allowlist, vec![untouched]);
+        assert_eq!(records[1].respond_to, RespondTo::OwnerOnly);
     }
 }

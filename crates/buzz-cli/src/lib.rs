@@ -250,6 +250,14 @@ pub enum RespondToArg {
     Anyone,
 }
 
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub enum AgentAccessArg {
+    #[value(name = "owner-only")]
+    OwnerOnly,
+    Allowlist,
+    Anyone,
+}
+
 impl RespondToArg {
     fn to_wire(self) -> String {
         match self {
@@ -316,6 +324,20 @@ buzz agents remove <PUBKEY>"
         #[arg(long)]
         store_dir: Option<std::path::PathBuf>,
         /// Tauri bundle identifier whose app-data dir to target
+        #[arg(long, default_value = "xyz.block.buzz.app")]
+        identifier: String,
+    },
+    /// Set who may instruct a managed agent. Local-only; Desktop must be stopped.
+    SetAccess {
+        /// Full 64-hex pubkey of the managed agent
+        pubkey: String,
+        #[arg(long)]
+        respond_to: AgentAccessArg,
+        /// Allowed pubkey; repeat for each person or agent
+        #[arg(long = "allow")]
+        allowlist: Vec<String>,
+        #[arg(long)]
+        store_dir: Option<std::path::PathBuf>,
         #[arg(long, default_value = "xyz.block.buzz.app")]
         identifier: String,
     },
@@ -2234,6 +2256,7 @@ mod tests {
                 "draft-update",
                 "import",
                 "remove",
+                "set-access",
                 "unarchive"
             ]
         );
