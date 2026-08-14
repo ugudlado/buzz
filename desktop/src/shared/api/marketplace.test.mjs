@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   MARKETPLACE_AGENT_FILTER,
   marketplaceAgentQueryKey,
+  marketplacePresenceTargets,
   parseMarketplaceAgents,
 } from "./marketplace.ts";
 
@@ -34,6 +35,25 @@ test("catalog cache key includes the joined communities", () => {
     marketplaceAgentQueryKey([
       { id: "b", name: "B", relayUrl: "wss://community-b.example" },
     ]),
+  );
+});
+
+test("remote presence batches agents once per source community", () => {
+  const sourceCommunity = (relayUrl) => ({
+    id: relayUrl,
+    name: relayUrl,
+    relayUrl,
+  });
+  assert.deepEqual(
+    marketplacePresenceTargets(
+      [
+        { pubkey: AGENT, sourceCommunity: sourceCommunity("wss://a.example") },
+        { pubkey: AGENT, sourceCommunity: sourceCommunity("wss://a.example") },
+        { pubkey: OWNER, sourceCommunity: sourceCommunity("wss://b.example") },
+      ],
+      "wss://b.example",
+    ),
+    [{ relayUrl: "wss://a.example", pubkeys: [AGENT] }],
   );
 });
 

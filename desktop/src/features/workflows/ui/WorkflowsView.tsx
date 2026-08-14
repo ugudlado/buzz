@@ -20,13 +20,18 @@ import {
   formatMicrounits,
   getWorkflowMarketplace,
 } from "@/features/workflows/marketplace";
-import { usePresenceQuery } from "@/features/presence/hooks";
+import {
+  PRESENCE_REFETCH_INTERVAL_MS,
+  presenceFocusRefetchPolicy,
+  usePresenceQuery,
+} from "@/features/presence/hooks";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import { getPresenceLabel } from "@/features/presence/lib/presence";
 import { PresenceBadge } from "@/features/presence/ui/PresenceBadge";
 import {
   getMarketplaceAgents,
   marketplaceAgentQueryKey,
+  marketplacePresenceTargets,
   type MarketplaceAgent,
 } from "@/shared/api/marketplace";
 import type {
@@ -41,7 +46,7 @@ import {
   getChannelsWorkflows,
   triggerWorkflow,
 } from "@/shared/api/tauriWorkflows";
-import { normalizeRelayUrl } from "@/shared/lib/normalizeRelayUrl";
+import { getPresence } from "@/shared/api/tauri";
 import { Button } from "@/shared/ui/button";
 import { Badge } from "@/shared/ui/badge";
 import { Card } from "@/shared/ui/card";
@@ -330,8 +335,6 @@ export function WorkflowsView({
   );
   const filteredUnpublishedAgents = managedAgents.filter(
     (agent) =>
-      normalizeRelayUrl(agent.relayUrl) ===
-        normalizeRelayUrl(activeCommunity?.relayUrl ?? "") &&
       !marketplaceAgents.some(
         (listing) =>
           listing.ownerPubkey === identityPubkey &&
@@ -356,6 +359,46 @@ export function WorkflowsView({
     [activeMarketplaceAgents],
   );
   const presenceQuery = usePresenceQuery(marketplaceAgentPubkeys);
+  const remotePresenceTargets = React.useMemo(
+    () =>
+      marketplacePresenceTargets(marketplaceAgents, activeCommunity?.relayUrl),
+    [activeCommunity?.relayUrl, marketplaceAgents],
+  );
+  const remotePresenceQuery = useQuery({
+    queryKey: [
+      "marketplace-presence",
+      ...remotePresenceTargets.map(
+        ({ relayUrl, pubkeys }) => `${relayUrl}:${pubkeys.join(",")}`,
+      ),
+    ],
+    queryFn: async () =>
+      Object.fromEntries(
+        await Promise.all(
+          remotePresenceTargets.map(async ({ relayUrl, pubkeys }) => [
+            relayUrl,
+            await getPresence(pubkeys, relayUrl).catch(() => null),
+          ]),
+        ),
+      ),
+    enabled: remotePresenceTargets.length > 0,
+    refetchInterval: PRESENCE_REFETCH_INTERVAL_MS,
+    retry: 0,
+    ...presenceFocusRefetchPolicy,
+  });
+  const marketplacePresenceStatus = (
+    agent: MarketplaceAgent,
+  ): PresenceStatus | null => {
+    const sourceRelayUrl = agent.sourceCommunity?.relayUrl;
+    const presence =
+      sourceRelayUrl === activeCommunity?.relayUrl
+        ? presenceQuery.isSuccess
+          ? presenceQuery.data
+          : null
+        : sourceRelayUrl
+          ? remotePresenceQuery.data?.[sourceRelayUrl]
+          : null;
+    return presence ? (presence[agent.pubkey] ?? "offline") : null;
+  };
 
   const memberChannels = channels.filter((c) => c.isMember);
   const channelIds = memberChannels.map((c) => c.id).sort();
@@ -651,12 +694,7 @@ export function WorkflowsView({
                       }
                       onEdit={setListingAgent}
                       onUnpublish={unpublishAgent}
-                      presenceStatus={
-                        agent.sourceCommunity?.relayUrl ===
-                          activeCommunity?.relayUrl && presenceQuery.isSuccess
-                          ? (presenceQuery.data?.[agent.pubkey] ?? "offline")
-                          : null
-                      }
+                      presenceStatus={marketplacePresenceStatus(agent)}
                     />
                   ))}
                   {filteredUnpublishedAgents.length > 0 ? (

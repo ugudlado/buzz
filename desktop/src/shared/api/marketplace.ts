@@ -48,6 +48,23 @@ export const marketplaceAgentQueryKey = (
     .sort(),
 ];
 
+export function marketplacePresenceTargets(
+  agents: readonly MarketplaceAgent[],
+  excludeRelayUrl: string | undefined,
+) {
+  const pubkeysByRelay = new Map<string, Set<string>>();
+  for (const agent of agents) {
+    const relayUrl = agent.sourceCommunity?.relayUrl;
+    if (!relayUrl || relayUrl === excludeRelayUrl) continue;
+    const pubkeys = pubkeysByRelay.get(relayUrl) ?? new Set<string>();
+    pubkeys.add(agent.pubkey);
+    pubkeysByRelay.set(relayUrl, pubkeys);
+  }
+  return [...pubkeysByRelay]
+    .map(([relayUrl, pubkeys]) => ({ relayUrl, pubkeys: [...pubkeys].sort() }))
+    .sort((left, right) => left.relayUrl.localeCompare(right.relayUrl));
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }

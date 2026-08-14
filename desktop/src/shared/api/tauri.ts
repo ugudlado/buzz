@@ -338,9 +338,13 @@ function fromRawSearchHit(hit: RawSearchHit) {
   };
 }
 
-export async function getPresence(pubkeys: string[]): Promise<PresenceLookup> {
+export async function getPresence(
+  pubkeys: string[],
+  relayUrl?: string,
+): Promise<PresenceLookup> {
   const response = await invokeTauri<RawPresenceLookup>("get_presence", {
     pubkeys,
+    relayUrl,
   });
 
   return Object.fromEntries(
