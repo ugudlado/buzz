@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   MARKETPLACE_AGENT_FILTER,
+  isAgentForRelay,
   marketplaceAgentQueryKey,
   parseMarketplaceAgents,
 } from "./marketplace.ts";
@@ -24,6 +25,17 @@ function event(content, createdAt = 1, id = "a") {
 
 test("catalog query is explicitly scoped to managed-agent events", () => {
   assert.deepEqual(MARKETPLACE_AGENT_FILTER, { kinds: [30177], limit: 500 });
+});
+
+test("local publish candidates are scoped to their community relay", () => {
+  assert.equal(
+    isAgentForRelay("WSS://COMMUNITY-A.EXAMPLE/", "wss://community-a.example"),
+    true,
+  );
+  assert.equal(
+    isAgentForRelay("wss://community-a.example", "wss://community-b.example"),
+    false,
+  );
 });
 
 test("catalog cache key includes the joined communities", () => {

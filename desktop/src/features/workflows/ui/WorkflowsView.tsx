@@ -26,6 +26,7 @@ import { getPresenceLabel } from "@/features/presence/lib/presence";
 import { PresenceBadge } from "@/features/presence/ui/PresenceBadge";
 import {
   getMarketplaceAgents,
+  isAgentForRelay,
   marketplaceAgentQueryKey,
   type MarketplaceAgent,
 } from "@/shared/api/marketplace";
@@ -329,6 +330,7 @@ export function WorkflowsView({
   );
   const filteredUnpublishedAgents = managedAgents.filter(
     (agent) =>
+      isAgentForRelay(agent.relayUrl, activeCommunity?.relayUrl ?? "") &&
       !marketplaceAgents.some(
         (listing) =>
           listing.ownerPubkey === identityPubkey &&
