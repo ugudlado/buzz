@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   MARKETPLACE_AGENT_FILTER,
+  marketplaceAgentQueryKey,
   parseMarketplaceAgents,
 } from "./marketplace.ts";
 
@@ -23,6 +24,40 @@ function event(content, createdAt = 1, id = "a") {
 
 test("catalog query is explicitly scoped to managed-agent events", () => {
   assert.deepEqual(MARKETPLACE_AGENT_FILTER, { kinds: [30177], limit: 500 });
+});
+
+test("catalog cache key includes the joined communities", () => {
+  assert.notDeepEqual(
+    marketplaceAgentQueryKey([
+      { id: "a", name: "A", relayUrl: "wss://community-a.example" },
+    ]),
+    marketplaceAgentQueryKey([
+      { id: "b", name: "B", relayUrl: "wss://community-b.example" },
+    ]),
+  );
+});
+
+test("parser retains the source community for federated listings", () => {
+  const sourceCommunity = {
+    id: "community-a",
+    name: "Community A",
+    relayUrl: "wss://community-a.example",
+  };
+  const [listing] = parseMarketplaceAgents(
+    [
+      event({
+        name: "Bumble",
+        marketplace: {
+          listed: true,
+          description: "Community agent",
+          capabilities: [],
+          deployment: "local",
+        },
+      }),
+    ],
+    sourceCommunity,
+  );
+  assert.deepEqual(listing.sourceCommunity, sourceCommunity);
 });
 
 test("parser returns only sanitized listed metadata", () => {

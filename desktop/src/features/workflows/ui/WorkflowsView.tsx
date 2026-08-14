@@ -10,6 +10,7 @@ import {
   useManagedAgentsQuery,
   useUpdateManagedAgentMutation,
 } from "@/features/agents/hooks";
+import { useCommunities } from "@/features/communities/useCommunities";
 import { AgentMarketplaceDialog } from "@/features/workflows/ui/AgentMarketplaceDialog";
 import { WorkflowCard } from "@/features/workflows/ui/WorkflowCard";
 import { WorkflowDeleteDialog } from "@/features/workflows/ui/WorkflowDeleteDialog";
@@ -25,6 +26,7 @@ import { getPresenceLabel } from "@/features/presence/lib/presence";
 import { PresenceBadge } from "@/features/presence/ui/PresenceBadge";
 import {
   getMarketplaceAgents,
+  marketplaceAgentQueryKey,
   type MarketplaceAgent,
 } from "@/shared/api/marketplace";
 import type {
@@ -66,6 +68,52 @@ type DialogState =
   | { mode: "duplicate"; workflow: Workflow };
 
 type CatalogTab = "agents" | "workflows";
+
+function marketplaceFromListing(
+  agent: MarketplaceAgent,
+): ManagedAgentMarketplace {
+  return {
+    listed: true,
+    description: agent.description,
+    capabilities: agent.capabilities,
+    deployment: agent.deployment,
+    pricing: agent.pricing
+      ? {
+          currency: agent.pricing.currency,
+          microunits_per_hour: agent.pricing.microunitsPerHour,
+        }
+      : null,
+  };
+}
+
+function marketplaceAgentFromLocal(
+  agent: ManagedAgent,
+  ownerPubkey: string,
+  marketplace: ManagedAgentMarketplace,
+  sourceCommunity: NonNullable<MarketplaceAgent["sourceCommunity"]>,
+): MarketplaceAgent {
+  return {
+    pubkey: agent.pubkey.toLowerCase(),
+    name: agent.name,
+    ownerPubkey,
+    description: marketplace.description,
+    capabilities: marketplace.capabilities,
+    deployment: marketplace.deployment,
+    pricing: marketplace.pricing
+      ? {
+          currency: marketplace.pricing.currency,
+          microunitsPerHour: marketplace.pricing.microunits_per_hour,
+        }
+      : null,
+    directUse:
+      agent.respondTo === "anyone"
+        ? "community"
+        : agent.respondTo === "allowlist"
+          ? "restricted"
+          : "owner",
+    sourceCommunity,
+  };
+}
 
 function WorkflowsListSkeleton() {
   return (
@@ -161,6 +209,10 @@ function AgentCatalogCard({
               </p>
             </div>
             <div className="sm:col-span-2">
+              <p className="text-2xs text-muted-foreground">Community</p>
+              <p>{agent.sourceCommunity?.name ?? "Current community"}</p>
+            </div>
+            <div className="sm:col-span-2">
               <p className="text-2xs text-muted-foreground">Publisher</p>
               <PubKey pubkey={agent.ownerPubkey} />
             </div>
@@ -203,19 +255,25 @@ export function WorkflowsView({
   const [catalogTab, setCatalogTab] = React.useState<CatalogTab>("workflows");
   const [agentSearch, setAgentSearch] = React.useState("");
   const [workflowSearch, setWorkflowSearch] = React.useState("");
+  const [listingOverrides, setListingOverrides] = React.useState(
+    () => new Map<string, ManagedAgentMarketplace | null>(),
+  );
   const isMarketplace = surface === "marketplace";
   const [listingAgent, setListingAgent] = React.useState<ManagedAgent | null>(
     null,
   );
   const queryClient = useQueryClient();
+  const { activeCommunity, communities } = useCommunities();
   const identityPubkey = useIdentityQuery().data?.pubkey.toLowerCase() ?? null;
   const managedAgentsQuery = useManagedAgentsQuery();
   const updateManagedAgent = useUpdateManagedAgentMutation();
   const updateManagedAgentMutate = updateManagedAgent.mutate;
 
   const marketplaceAgentsQuery = useQuery({
-    queryKey: ["marketplace-agents"],
-    queryFn: getMarketplaceAgents,
+    queryKey: marketplaceAgentQueryKey(communities),
+    queryFn: () =>
+      getMarketplaceAgents(communities, activeCommunity?.relayUrl ?? ""),
+    enabled: Boolean(activeCommunity),
     staleTime: 30_000,
     refetchOnWindowFocus: true,
   });
@@ -229,45 +287,31 @@ export function WorkflowsView({
     [managedAgents],
   );
   const marketplaceAgents = React.useMemo(() => {
-    const localMarketplaceAgents: MarketplaceAgent[] = identityPubkey
-      ? managedAgents.flatMap((agent) => {
-          const marketplace = agent.marketplace;
-          if (!marketplace?.listed) return [];
-          return [
-            {
-              pubkey: agent.pubkey.toLowerCase(),
-              name: agent.name,
-              ownerPubkey: identityPubkey,
-              description: marketplace.description,
-              capabilities: marketplace.capabilities,
-              deployment: marketplace.deployment,
-              pricing: marketplace.pricing
-                ? {
-                    currency: marketplace.pricing.currency,
-                    microunitsPerHour: marketplace.pricing.microunits_per_hour,
-                  }
-                : null,
-              directUse:
-                agent.respondTo === "anyone"
-                  ? "community"
-                  : agent.respondTo === "allowlist"
-                    ? "restricted"
-                    : "owner",
-            },
-          ];
-        })
-      : [];
-    return [
-      ...relayMarketplaceAgents.filter((agent) => {
-        if (agent.ownerPubkey !== identityPubkey) return true;
-        return !managedAgentByPubkey.get(agent.pubkey)?.marketplace;
-      }),
-      ...localMarketplaceAgents,
-    ];
+    const merged = relayMarketplaceAgents.filter(
+      (agent) =>
+        agent.sourceCommunity?.relayUrl !== activeCommunity?.relayUrl ||
+        agent.ownerPubkey !== identityPubkey ||
+        !listingOverrides.has(agent.pubkey),
+    );
+    if (!identityPubkey || !activeCommunity) return merged;
+    for (const [pubkey, marketplace] of listingOverrides) {
+      const localAgent = managedAgentByPubkey.get(pubkey);
+      if (localAgent && marketplace?.listed) {
+        merged.push(
+          marketplaceAgentFromLocal(localAgent, identityPubkey, marketplace, {
+            id: activeCommunity.id,
+            name: activeCommunity.name,
+            relayUrl: activeCommunity.relayUrl,
+          }),
+        );
+      }
+    }
+    return merged.sort((left, right) => left.name.localeCompare(right.name));
   }, [
+    activeCommunity,
     identityPubkey,
+    listingOverrides,
     managedAgentByPubkey,
-    managedAgents,
     relayMarketplaceAgents,
   ]);
   const agentSearchTerm = agentSearch.trim().toLowerCase();
@@ -279,6 +323,7 @@ export function WorkflowsView({
         agent.pubkey,
         agent.ownerPubkey,
         agent.description,
+        agent.sourceCommunity?.name ?? "",
         ...agent.capabilities,
       ].some((value) => value.toLowerCase().includes(agentSearchTerm)),
   );
@@ -287,6 +332,7 @@ export function WorkflowsView({
       !marketplaceAgents.some(
         (listing) =>
           listing.ownerPubkey === identityPubkey &&
+          listing.sourceCommunity?.relayUrl === activeCommunity?.relayUrl &&
           listing.pubkey === agent.pubkey.toLowerCase(),
       ) &&
       (!agentSearchTerm ||
@@ -294,9 +340,17 @@ export function WorkflowsView({
           value.toLowerCase().includes(agentSearchTerm),
         )),
   );
+  const activeMarketplaceAgents = React.useMemo(
+    () =>
+      marketplaceAgents.filter(
+        (agent) =>
+          agent.sourceCommunity?.relayUrl === activeCommunity?.relayUrl,
+      ),
+    [activeCommunity?.relayUrl, marketplaceAgents],
+  );
   const marketplaceAgentPubkeys = React.useMemo(
-    () => marketplaceAgents.map((agent) => agent.pubkey),
-    [marketplaceAgents],
+    () => activeMarketplaceAgents.map((agent) => agent.pubkey),
+    [activeMarketplaceAgents],
   );
   const presenceQuery = usePresenceQuery(marketplaceAgentPubkeys);
 
@@ -412,6 +466,12 @@ export function WorkflowsView({
         { pubkey: listingAgent.pubkey, marketplace },
         {
           onSuccess: () => {
+            setListingOverrides((current) =>
+              new Map(current).set(
+                listingAgent.pubkey.toLowerCase(),
+                marketplace,
+              ),
+            );
             setListingAgent(null);
             void marketplaceAgentsQuery.refetch();
           },
@@ -427,7 +487,14 @@ export function WorkflowsView({
       if (!current) return;
       updateManagedAgentMutate(
         { pubkey: agent.pubkey, marketplace: { ...current, listed: false } },
-        { onSuccess: () => void marketplaceAgentsQuery.refetch() },
+        {
+          onSuccess: () => {
+            setListingOverrides((overrides) =>
+              new Map(overrides).set(agent.pubkey.toLowerCase(), null),
+            );
+            void marketplaceAgentsQuery.refetch();
+          },
+        },
       );
     },
     [marketplaceAgentsQuery.refetch, updateManagedAgentMutate],
@@ -561,16 +628,29 @@ export function WorkflowsView({
                   {filteredMarketplaceAgents.map((agent) => (
                     <AgentCatalogCard
                       agent={agent}
-                      key={agent.pubkey}
+                      key={`${agent.sourceCommunity?.relayUrl}:${agent.ownerPubkey}:${agent.pubkey}`}
                       localAgent={
-                        agent.ownerPubkey === identityPubkey
-                          ? managedAgentByPubkey.get(agent.pubkey)
+                        agent.ownerPubkey === identityPubkey &&
+                        agent.sourceCommunity?.relayUrl ===
+                          activeCommunity?.relayUrl
+                          ? (() => {
+                              const local = managedAgentByPubkey.get(
+                                agent.pubkey,
+                              );
+                              return local
+                                ? {
+                                    ...local,
+                                    marketplace: marketplaceFromListing(agent),
+                                  }
+                                : undefined;
+                            })()
                           : undefined
                       }
                       onEdit={setListingAgent}
                       onUnpublish={unpublishAgent}
                       presenceStatus={
-                        presenceQuery.isSuccess
+                        agent.sourceCommunity?.relayUrl ===
+                          activeCommunity?.relayUrl && presenceQuery.isSuccess
                           ? (presenceQuery.data?.[agent.pubkey] ?? "offline")
                           : null
                       }
@@ -594,7 +674,9 @@ export function WorkflowsView({
                             <PubKey pubkey={agent.pubkey} />
                           </div>
                           <Button
-                            onClick={() => setListingAgent(agent)}
+                            onClick={() =>
+                              setListingAgent({ ...agent, marketplace: null })
+                            }
                             size="sm"
                           >
                             Publish
@@ -656,7 +738,7 @@ export function WorkflowsView({
                 onEdit={handleEdit}
                 onSelect={onSelectWorkflow}
                 onTrigger={handleTrigger}
-                marketplaceAgents={marketplaceAgents}
+                marketplaceAgents={activeMarketplaceAgents}
                 presence={presenceQuery.data}
                 presenceLoaded={presenceQuery.isSuccess}
                 workflow={workflow}
@@ -675,7 +757,7 @@ export function WorkflowsView({
                 ?.workflow.ownerPubkey.toLowerCase() === identityPubkey
             }
             key={selectedWorkflowId}
-            marketplaceAgents={marketplaceAgents}
+            marketplaceAgents={activeMarketplaceAgents}
             onClose={onCloseWorkflow}
             onEdit={handleEdit}
             workflowId={selectedWorkflowId}

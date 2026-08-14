@@ -1,4 +1,5 @@
 import { relayClient } from "@/shared/api/relayClient";
+import { withReadOnlyRelayClient } from "@/shared/api/readOnlyRelayClient";
 import type { RelayEvent } from "@/shared/api/types";
 import { KIND_MANAGED_AGENT } from "@/shared/constants/kinds";
 
@@ -16,6 +17,13 @@ export type MarketplaceAgent = {
     microunitsPerHour: number;
   } | null;
   directUse: "community" | "restricted" | "owner";
+  sourceCommunity?: MarketplaceCommunity;
+};
+
+export type MarketplaceCommunity = {
+  id: string;
+  name: string;
+  relayUrl: string;
 };
 
 export type ManagedAgentMarketplace = {
@@ -30,6 +38,15 @@ export const MARKETPLACE_AGENT_FILTER = {
   kinds: [KIND_MANAGED_AGENT],
   limit: 500,
 };
+
+export const marketplaceAgentQueryKey = (
+  communities: readonly MarketplaceCommunity[],
+) => [
+  "marketplace-agents",
+  ...communities
+    .map(({ id, name, relayUrl }) => `${id}:${name}:${relayUrl}`)
+    .sort(),
+];
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -118,6 +135,7 @@ function parseMarketplaceAgent(event: RelayEvent): MarketplaceAgent | null {
 
 export function parseMarketplaceAgents(
   events: readonly RelayEvent[],
+  sourceCommunity?: MarketplaceCommunity,
 ): MarketplaceAgent[] {
   const latestByCoordinate = new Map<string, RelayEvent>();
 
@@ -141,11 +159,34 @@ export function parseMarketplaceAgents(
   return [...latestByCoordinate.values()]
     .map(parseMarketplaceAgent)
     .filter((listing): listing is MarketplaceAgent => listing !== null)
+    .map((listing) =>
+      sourceCommunity ? { ...listing, sourceCommunity } : listing,
+    )
     .sort((left, right) => left.name.localeCompare(right.name));
 }
 
-export async function getMarketplaceAgents(): Promise<MarketplaceAgent[]> {
-  return parseMarketplaceAgents(
-    await relayClient.fetchEvents(MARKETPLACE_AGENT_FILTER),
+export async function getMarketplaceAgents(
+  communities: readonly MarketplaceCommunity[],
+  activeRelayUrl: string,
+): Promise<MarketplaceAgent[]> {
+  const results = await Promise.allSettled(
+    communities.map(async (community) => {
+      const events =
+        community.relayUrl === activeRelayUrl
+          ? await relayClient.fetchEvents(MARKETPLACE_AGENT_FILTER)
+          : await withReadOnlyRelayClient(community.relayUrl, (client) =>
+              client.fetchEvents(MARKETPLACE_AGENT_FILTER),
+            );
+      return parseMarketplaceAgents(events, community);
+    }),
   );
+  if (
+    results.length > 0 &&
+    results.every((result) => result.status === "rejected")
+  ) {
+    throw results[0].reason;
+  }
+  return results
+    .flatMap((result) => (result.status === "fulfilled" ? result.value : []))
+    .sort((left, right) => left.name.localeCompare(right.name));
 }

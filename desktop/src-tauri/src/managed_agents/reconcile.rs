@@ -21,7 +21,7 @@
 use std::path::Path;
 
 use super::{
-    agent_events::build_agent_event,
+    agent_events::{build_agent_event, ManagedAgentEventContent},
     persona_events::monotonic_created_at,
     retention::{get_retained_event, open_retention_db, retain_event, RetainedEvent},
     ManagedAgentRecord,
@@ -104,12 +104,39 @@ fn reconcile_agents_in_dir_at(
             continue;
         }
 
-        if retain_agent_record(&conn, keys, record)? {
+        if retain_agent_record_for_scope(&conn, keys, record)? {
             reconciled += 1;
         }
     }
 
     Ok(reconciled)
+}
+
+/// Reconcile portable agent identity fields while preserving the listing state
+/// already stored for this relay+owner scope. Marketplace publication is a
+/// community decision; the managed-agent record itself is shared globally.
+pub(crate) fn retain_agent_record_for_scope(
+    conn: &rusqlite::Connection,
+    keys: &nostr::Keys,
+    record: &ManagedAgentRecord,
+) -> Result<bool, String> {
+    let owner_pubkey = keys.public_key().to_hex();
+    let existing = get_retained_event(conn, KIND_MANAGED_AGENT, &owner_pubkey, &record.pubkey)?;
+    let mut scoped_record = record.clone();
+    scoped_record.marketplace = existing
+        .map(|row| {
+            serde_json::from_str::<ManagedAgentEventContent>(&row.content)
+                .map(|content| content.marketplace)
+                .map_err(|error| {
+                    format!(
+                        "failed to read retained marketplace state for '{}': {error}",
+                        record.name
+                    )
+                })
+        })
+        .transpose()?
+        .flatten();
+    retain_agent_record(conn, keys, &scoped_record)
 }
 
 /// Retain `record`'s kind:30177 identity record, marking it `pending_sync`
