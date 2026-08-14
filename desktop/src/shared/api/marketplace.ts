@@ -2,7 +2,6 @@ import { relayClient } from "@/shared/api/relayClient";
 import { withReadOnlyRelayClient } from "@/shared/api/readOnlyRelayClient";
 import type { RelayEvent } from "@/shared/api/types";
 import { KIND_MANAGED_AGENT } from "@/shared/constants/kinds";
-import { normalizeRelayUrl } from "@/shared/lib/normalizeRelayUrl";
 
 const MAX_MICROUNITS = Number.MAX_SAFE_INTEGER;
 
@@ -48,9 +47,6 @@ export const marketplaceAgentQueryKey = (
     .map(({ id, name, relayUrl }) => `${id}:${name}:${relayUrl}`)
     .sort(),
 ];
-
-export const isAgentForRelay = (agentRelayUrl: string, relayUrl: string) =>
-  normalizeRelayUrl(agentRelayUrl) === normalizeRelayUrl(relayUrl);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);

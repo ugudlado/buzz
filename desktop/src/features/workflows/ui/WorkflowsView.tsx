@@ -26,7 +26,6 @@ import { getPresenceLabel } from "@/features/presence/lib/presence";
 import { PresenceBadge } from "@/features/presence/ui/PresenceBadge";
 import {
   getMarketplaceAgents,
-  isAgentForRelay,
   marketplaceAgentQueryKey,
   type MarketplaceAgent,
 } from "@/shared/api/marketplace";
@@ -42,6 +41,7 @@ import {
   getChannelsWorkflows,
   triggerWorkflow,
 } from "@/shared/api/tauriWorkflows";
+import { normalizeRelayUrl } from "@/shared/lib/normalizeRelayUrl";
 import { Button } from "@/shared/ui/button";
 import { Badge } from "@/shared/ui/badge";
 import { Card } from "@/shared/ui/card";
@@ -330,7 +330,8 @@ export function WorkflowsView({
   );
   const filteredUnpublishedAgents = managedAgents.filter(
     (agent) =>
-      isAgentForRelay(agent.relayUrl, activeCommunity?.relayUrl ?? "") &&
+      normalizeRelayUrl(agent.relayUrl) ===
+        normalizeRelayUrl(activeCommunity?.relayUrl ?? "") &&
       !marketplaceAgents.some(
         (listing) =>
           listing.ownerPubkey === identityPubkey &&
