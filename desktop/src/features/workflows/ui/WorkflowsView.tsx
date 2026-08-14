@@ -219,6 +219,13 @@ function AgentCatalogCard({
               <p>{agent.sourceCommunity?.name ?? "Current community"}</p>
             </div>
             <div className="sm:col-span-2">
+              <p className="text-2xs text-muted-foreground">Agent</p>
+              <PubKey
+                pubkey={agent.pubkey}
+                testId={`marketplace-agent-pubkey-${agent.pubkey}`}
+              />
+            </div>
+            <div className="sm:col-span-2">
               <p className="text-2xs text-muted-foreground">Publisher</p>
               <PubKey pubkey={agent.ownerPubkey} />
             </div>
@@ -659,6 +666,9 @@ export function WorkflowsView({
                   value={agentSearch}
                 />
               </div>
+              <p className="text-xs text-muted-foreground">
+                Published listings from every community configured in this app.
+              </p>
               {filteredMarketplaceAgents.length === 0 &&
               filteredUnpublishedAgents.length === 0 ? (
                 <div className="flex flex-col items-center justify-center gap-3 py-10 text-muted-foreground">

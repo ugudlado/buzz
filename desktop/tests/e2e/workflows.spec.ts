@@ -45,6 +45,10 @@ test.beforeEach(async ({ page }) => {
         pubkey: TEST_IDENTITIES.bob.pubkey,
         name: "Private Local Agent",
       },
+      {
+        pubkey: TEST_IDENTITIES.charlie.pubkey,
+        name: "Rust Reviewer",
+      },
     ],
     relayAgents: [
       {
@@ -138,6 +142,11 @@ test("discovers a listed agent with presence and sanitized pricing", async ({
     .getByTestId("workflows-view")
     .getByRole("button", { name: "Agents", exact: true })
     .click();
+  await expect(
+    page.getByText(
+      "Published listings from every community configured in this app.",
+    ),
+  ).toBeVisible();
 
   const listing = page.getByTestId(
     `marketplace-agent-${MARKETPLACE_AGENT_PUBKEY}`,
@@ -148,7 +157,14 @@ test("discovers a listed agent with presence and sanitized pricing", async ({
   await expect(listing).toContainText("remote");
   await expect(listing).toContainText("Direct use community");
   await expect(listing).not.toContainText("system_prompt");
+  await expect(
+    listing.getByTestId(`marketplace-agent-pubkey-${MARKETPLACE_AGENT_PUBKEY}`),
+  ).toBeVisible();
   const marketplace = page.getByTestId("workflows-view");
+  const sameNameUnpublished = marketplace.getByTestId(
+    `unpublished-agent-${TEST_IDENTITIES.charlie.pubkey}`,
+  );
+  await expect(sameNameUnpublished).toContainText("Rust Reviewer");
   const unpublished = marketplace.getByTestId(
     `unpublished-agent-${TEST_IDENTITIES.bob.pubkey}`,
   );
