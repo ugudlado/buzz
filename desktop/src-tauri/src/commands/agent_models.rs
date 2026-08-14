@@ -708,7 +708,7 @@ pub async fn update_managed_agent(
     state: State<'_, AppState>,
 ) -> Result<UpdateManagedAgentResponse, String> {
     // Phase 1: local save (synchronous, under lock)
-    let (summary, sync_params, rollback) = {
+    let (summary, sync_params, rollback, marketplace_changed) = {
         let _store_guard = state
             .managed_agents_store_lock
             .lock()
@@ -875,7 +875,7 @@ pub async fn update_managed_agent(
             )?
         };
         let rollback = name_changed.then(|| AgentUpdateRollback::new(previous_record, record));
-        (summary, sync_params, rollback)
+        (summary, sync_params, rollback, marketplace_changed)
     }; // lock dropped here
 
     try_regenerate_nest(&app);
@@ -901,6 +901,17 @@ pub async fn update_managed_agent(
             return Err(format!(
                 "Agent rename failed because its relay profile could not be updated. No changes were saved: {sync_error}"
             ));
+        }
+    }
+
+    // Marketplace readers query relay state immediately after this command.
+    // Flush this durable write now so switching communities cannot leave it
+    // waiting indefinitely in the previous community's active-only sweep.
+    if marketplace_changed {
+        if let Err(error) =
+            crate::managed_agents::persona_events::flush_active_pending_events(&app, &state).await
+        {
+            eprintln!("buzz-desktop: marketplace event flush: {error}");
         }
     }
 
