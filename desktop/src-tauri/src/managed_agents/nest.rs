@@ -7,7 +7,7 @@
 //! Static template content in AGENTS.md (above the managed-section markers)
 //! and SKILL.md is refreshed when the embedded template version changes.
 
-use super::{load_managed_agents, load_personas, AgentDefinition, ManagedAgentRecord};
+use super::{load_managed_agent_metadata, load_personas, AgentDefinition, ManagedAgentRecord};
 #[cfg(test)]
 use super::{BackendKind, RespondTo};
 use crate::app_state::AppState;
@@ -654,7 +654,7 @@ pub fn regenerate_nest_context(app: &AppHandle) -> Result<(), String> {
     }
 
     let personas = load_personas(app)?;
-    let agents = load_managed_agents(app)?;
+    let agents = load_managed_agent_metadata(app)?;
     let state = app.state::<AppState>();
     let relay_url = relay_ws_url_with_override(&state);
     let content = render_dynamic_section(&personas, &agents, &relay_url);

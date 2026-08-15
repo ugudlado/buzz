@@ -1,7 +1,7 @@
 use super::{
-    find_managed_agent_mut, kill_stale_tracked_processes, load_managed_agents, load_personas,
-    save_managed_agents, spawn_agent_child, sync_managed_agent_processes, BackendKind,
-    ManagedAgentProcess,
+    find_managed_agent_mut, kill_stale_tracked_processes, load_managed_agent_metadata,
+    load_managed_agents, load_personas, save_managed_agent_metadata, save_managed_agents,
+    spawn_agent_child, sync_managed_agent_processes, BackendKind, ManagedAgentProcess,
 };
 use crate::app_state::AppState;
 use crate::util;
@@ -46,7 +46,7 @@ pub fn backfill_persona_snapshots(app: &tauri::AppHandle) -> Result<(), String> 
         .lock()
         .map_err(|error| error.to_string())?;
 
-    let mut records = load_managed_agents(app)?;
+    let mut records = load_managed_agent_metadata(app)?;
     let needs_backfill = records
         .iter()
         .any(|r| r.persona_id.is_some() && r.persona_source_version.is_none());
@@ -80,7 +80,7 @@ pub fn backfill_persona_snapshots(app: &tauri::AppHandle) -> Result<(), String> 
     }
 
     if changed {
-        save_managed_agents(app, &records)?;
+        save_managed_agent_metadata(app, &records)?;
     }
     Ok(())
 }
