@@ -1,0 +1,38 @@
+version: 1
+
+agents:
+  teamlead:
+    name: TeamLead
+    pubkey: af57cb13bf194c4b577c0d85d990706ea955c05ae7c592b81324ead51afb8bca
+    snapshot: .agents/agents/teamlead.agent.json
+  explorer:
+    name: Explorer
+    pubkey: 5692a2509eb438dd610b50d6444ff6f1f755234d134cc610a77da5b13257d1cc
+    snapshot: .agents/agents/explorer.agent.json
+  ux-designer:
+    name: UxDesigner
+    pubkey: 8713a59cfca0429048f86bdcf1fdf8dd274fcf99f7195075ca2b1127d55ebd26
+    snapshot: .agents/agents/uxdesigner.agent.json
+  designer:
+    name: Designer
+    pubkey: 7b6ca88ae7b8dc8441b3459b1e2cd8a932041b47462d4b99c8b95406913ef73d
+    snapshot: .agents/agents/designer.agent.json
+  implementer:
+    name: Implementer
+    pubkey: 593fd428d62067228ece11d98a9b984d258ced1466b2b178572b3036465a32e8
+    snapshot: .agents/agents/implementer.agent.json
+  reviewer:
+    name: Reviewer
+    pubkey: afcdd6783238033a3e5c69a9dd73aaa2d5ac7b0862f83e73adb6b663d8874254
+    snapshot: .agents/agents/reviewer.agent.json
+
+steps:
+  explore: explorer
+  diagnose: explorer
+  ux-design: ux-designer
+  ux-critique: ux-designer
+  design: designer
+  design-review: reviewer
+  implement: implementer
+  code-review: reviewer
+  learn: reviewer
