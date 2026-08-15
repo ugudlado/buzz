@@ -283,7 +283,8 @@ Only the JSON `.agent.json` format is supported — not the `.agent.png` trading
 not locked/encrypted snapshot envelopes. Memory entries and avatar images in the snapshot are not \
 imported; the agent starts with no memory and no avatar.\n\n\
 Example:\n  buzz agents import ./teamlead.agent.json\n  \
-buzz agents import --dry-run ./teamlead.agent.json"
+buzz agents import --dry-run ./teamlead.agent.json\n  \
+buzz agents import ./teamlead.agent.json --replace-pubkey <PUBKEY> --prune-unreferenced-definitions"
     )]
     Import {
         /// Path to a `buzz-agent-snapshot v1` `.agent.json` file
@@ -299,6 +300,15 @@ buzz agents import --dry-run ./teamlead.agent.json"
         /// the agent store
         #[arg(long, default_value_t = false)]
         dry_run: bool,
+        /// Update this existing agent identity instead of generating a new
+        /// keypair. The pubkey, private key, owner binding, and runtime state
+        /// are preserved.
+        #[arg(long)]
+        replace_pubkey: Option<String>,
+        /// When replacing an agent, remove key-less definitions with the same
+        /// name that are not referenced by any remaining agent instance.
+        #[arg(long, default_value_t = false, requires = "replace_pubkey")]
+        prune_unreferenced_definitions: bool,
     },
     /// Remove a managed agent record from Buzz Desktop's local store by
     /// pubkey. Local-only, desktop must be stopped; does not touch the relay.

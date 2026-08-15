@@ -20,7 +20,17 @@ pub async fn dispatch(command: AgentsCmd, client: &BuzzClient) -> Result<(), Cli
             store_dir,
             identifier,
             dry_run,
-        } => import_agent(client, &file, store_dir.as_deref(), &identifier, dry_run),
+            replace_pubkey,
+            prune_unreferenced_definitions,
+        } => import_agent(
+            client,
+            &file,
+            store_dir.as_deref(),
+            &identifier,
+            dry_run,
+            replace_pubkey.as_deref(),
+            prune_unreferenced_definitions,
+        ),
 
         AgentsCmd::Remove {
             pubkey,
@@ -225,6 +235,8 @@ fn import_agent(
     store_dir: Option<&std::path::Path>,
     identifier: &str,
     dry_run: bool,
+    replace_pubkey: Option<&str>,
+    prune_unreferenced_definitions: bool,
 ) -> Result<(), CliError> {
     let bytes = std::fs::read(file)
         .map_err(|e| CliError::Usage(format!("cannot read {}: {e}", file.display())))?;
@@ -279,29 +291,39 @@ fn import_agent(
         return Err(CliError::Usage("snapshot display name is empty".into()));
     }
 
-    let (store_path, existing): (Option<std::path::PathBuf>, Vec<ManagedAgentRecord>) = if dry_run {
-        (None, Vec::new())
-    } else {
-        let store_path = resolve_store_path(store_dir, identifier)?;
-        refuse_if_desktop_running()?;
+    let replace_pubkey = replace_pubkey
+        .map(|value| {
+            validate_hex64(value)?;
+            Ok::<_, CliError>(value.to_ascii_lowercase())
+        })
+        .transpose()?;
+    let needs_store = !dry_run || replace_pubkey.is_some();
+    let (store_path, existing): (Option<std::path::PathBuf>, Vec<ManagedAgentRecord>) =
+        if !needs_store {
+            (None, Vec::new())
+        } else {
+            let store_path = resolve_store_path(store_dir, identifier)?;
+            if !dry_run {
+                refuse_if_desktop_running()?;
+            }
 
-        let existing = if store_path.exists() {
-            let content = std::fs::read_to_string(&store_path).map_err(|e| {
-                CliError::Other(format!("failed to read {}: {e}", store_path.display()))
-            })?;
-            serde_json::from_str(&content).map_err(|e| {
-                CliError::Other(format!(
-                    "{} is not valid JSON — refusing to write over a store this build cannot \
+            let existing = if store_path.exists() {
+                let content = std::fs::read_to_string(&store_path).map_err(|e| {
+                    CliError::Other(format!("failed to read {}: {e}", store_path.display()))
+                })?;
+                serde_json::from_str(&content).map_err(|e| {
+                    CliError::Other(format!(
+                        "{} is not valid JSON — refusing to write over a store this build cannot \
                      parse (desktop's own malformed-store guard did not fire because this is the \
                      CLI path): {e}",
-                    store_path.display()
-                ))
-            })?
-        } else {
-            Vec::new()
+                        store_path.display()
+                    ))
+                })?
+            } else {
+                Vec::new()
+            };
+            (Some(store_path), existing)
         };
-        (Some(store_path), existing)
-    };
 
     let respond_to = match snapshot.definition.respond_to.as_deref() {
         Some(wire) => Some(
@@ -336,6 +358,28 @@ fn import_agent(
         snapshot.definition.runtime.as_deref(),
         snapshot.definition.model.as_deref(),
     );
+
+    if let Some(target_pubkey) = replace_pubkey.as_deref() {
+        let store_path = store_path.as_ref().ok_or_else(|| {
+            CliError::Other("store path unresolved for replacement import — this is a bug".into())
+        })?;
+        let result = replace_agent_from_snapshot(
+            existing,
+            &snapshot,
+            &display_name,
+            target_pubkey,
+            runtime,
+            model,
+            parallelism,
+            respond_to.unwrap_or_default(),
+            allowlist,
+            store_path,
+            dry_run,
+            prune_unreferenced_definitions,
+        )?;
+        println!("{result}");
+        return Ok(());
+    }
 
     let agent_keys = nostr::Keys::generate();
     let pubkey = agent_keys.public_key().to_hex();
@@ -448,6 +492,166 @@ fn import_agent(
         })
     );
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn replace_agent_from_snapshot(
+    mut records: Vec<ManagedAgentRecord>,
+    snapshot: &buzz_agent_record::AgentSnapshot,
+    display_name: &str,
+    target_pubkey: &str,
+    runtime: Option<String>,
+    model: Option<String>,
+    parallelism: u32,
+    respond_to: RespondTo,
+    allowlist: Vec<String>,
+    store_path: &std::path::Path,
+    dry_run: bool,
+    prune_unreferenced_definitions: bool,
+) -> Result<serde_json::Value, CliError> {
+    let target_index = records
+        .iter()
+        .position(|record| record.pubkey.eq_ignore_ascii_case(target_pubkey))
+        .ok_or_else(|| {
+            CliError::Usage(format!(
+                "no managed agent with pubkey {target_pubkey} in {}",
+                store_path.display()
+            ))
+        })?;
+    if records[target_index].name != display_name {
+        return Err(CliError::Usage(format!(
+            "snapshot name '{display_name}' does not match agent {} named '{}'",
+            target_pubkey, records[target_index].name
+        )));
+    }
+
+    let same_name_instances = records
+        .iter()
+        .filter(|record| !record.pubkey.is_empty() && record.name == display_name)
+        .count();
+    if prune_unreferenced_definitions && same_name_instances > 1 {
+        return Err(CliError::Usage(format!(
+            "{same_name_instances} keyed agents are named '{display_name}'; refusing to guess which identities are duplicates. Remove unwanted pubkeys explicitly first"
+        )));
+    }
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let persona_id = records[target_index].persona_id.clone();
+    apply_snapshot_config(
+        &mut records[target_index],
+        snapshot,
+        display_name,
+        runtime.clone(),
+        model.clone(),
+        parallelism,
+        respond_to,
+        allowlist.clone(),
+        false,
+        &now,
+    );
+
+    if let Some(persona_id) = persona_id.as_deref() {
+        if let Some(definition) = records
+            .iter_mut()
+            .find(|record| record.pubkey.is_empty() && record.slug.as_deref() == Some(persona_id))
+        {
+            apply_snapshot_config(
+                definition,
+                snapshot,
+                display_name,
+                runtime,
+                model,
+                parallelism,
+                respond_to,
+                allowlist,
+                true,
+                &now,
+            );
+        }
+    }
+
+    let referenced_definitions: std::collections::HashSet<String> = records
+        .iter()
+        .filter(|record| !record.pubkey.is_empty())
+        .filter_map(|record| record.persona_id.clone())
+        .collect();
+    let before = records.len();
+    if prune_unreferenced_definitions {
+        records.retain(|record| {
+            !record.pubkey.is_empty()
+                || record.name != display_name
+                || record
+                    .slug
+                    .as_ref()
+                    .is_some_and(|slug| referenced_definitions.contains(slug))
+        });
+    }
+    let pruned_definitions = before - records.len();
+
+    let backup_path = store_path.with_file_name("managed-agents.json.pre-roster-import.bak");
+    if !dry_run {
+        if !backup_path.exists() {
+            std::fs::copy(store_path, &backup_path).map_err(|e| {
+                CliError::Other(format!(
+                    "failed to back up {} to {}: {e}",
+                    store_path.display(),
+                    backup_path.display()
+                ))
+            })?;
+        }
+        let json = serde_json::to_string_pretty(&records)
+            .map_err(|e| CliError::Other(format!("failed to serialize agent store: {e}")))?;
+        std::fs::write(store_path, json).map_err(|e| {
+            CliError::Other(format!("failed to write {}: {e}", store_path.display()))
+        })?;
+    }
+
+    Ok(json!({
+        "pubkey": target_pubkey,
+        "name": display_name,
+        "updated": true,
+        "dry_run": dry_run,
+        "pruned_definitions": pruned_definitions,
+        "store_path": store_path.display().to_string(),
+        "backup_path": backup_path.display().to_string(),
+        "message": "Updated the pinned agent identity. Start Buzz Desktop to publish the refreshed profile and managed-agent event."
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_snapshot_config(
+    record: &mut ManagedAgentRecord,
+    snapshot: &buzz_agent_record::AgentSnapshot,
+    display_name: &str,
+    runtime: Option<String>,
+    model: Option<String>,
+    parallelism: u32,
+    respond_to: RespondTo,
+    allowlist: Vec<String>,
+    is_definition: bool,
+    now: &str,
+) {
+    record.name = display_name.to_string();
+    record.display_name = is_definition.then(|| display_name.to_string());
+    record.system_prompt = snapshot.definition.system_prompt.clone();
+    record.runtime = runtime;
+    record.model = model;
+    record.provider = snapshot.definition.provider.clone();
+    record.parallelism = parallelism;
+    record.respond_to = respond_to;
+    record.respond_to_allowlist = allowlist;
+    record.definition_respond_to = snapshot.definition.respond_to.clone();
+    record.definition_respond_to_allowlist = snapshot.definition.respond_to_allowlist.clone();
+    record.definition_parallelism = snapshot.definition.parallelism;
+    record.name_pool = snapshot.definition.name_pool.clone();
+    record.idle_timeout_seconds = snapshot.definition.idle_timeout_seconds;
+    record.max_turn_duration_seconds = snapshot.definition.max_turn_duration_seconds;
+    record.avatar_url = snapshot
+        .profile
+        .avatar_url
+        .clone()
+        .or(snapshot.profile.avatar_data_url.clone());
+    record.updated_at = now.to_string();
 }
 
 /// Render `record` as the `--dry-run` output: pretty JSON with the generated
@@ -1058,7 +1262,15 @@ mod tests {
         let file = write_snapshot(dir.path(), &valid_snapshot_json());
         let store_dir = dir.path().join("store");
 
-        let result = import_agent(&offline_client(), &file, Some(&store_dir), "test.id", true);
+        let result = import_agent(
+            &offline_client(),
+            &file,
+            Some(&store_dir),
+            "test.id",
+            true,
+            None,
+            false,
+        );
 
         assert!(result.is_ok(), "dry-run should succeed: {result:?}");
         assert!(
@@ -1078,8 +1290,16 @@ mod tests {
         snapshot["format"] = json!("not-a-buzz-snapshot");
         let file = write_snapshot(dir.path(), &snapshot);
 
-        let err = import_agent(&offline_client(), &file, Some(dir.path()), "test.id", true)
-            .expect_err("wrong format must fail");
+        let err = import_agent(
+            &offline_client(),
+            &file,
+            Some(dir.path()),
+            "test.id",
+            true,
+            None,
+            false,
+        )
+        .expect_err("wrong format must fail");
         match err {
             CliError::Usage(msg) => assert_eq!(
                 msg,
@@ -1096,8 +1316,16 @@ mod tests {
         snapshot["profile"]["displayName"] = json!("   ");
         let file = write_snapshot(dir.path(), &snapshot);
 
-        let err = import_agent(&offline_client(), &file, Some(dir.path()), "test.id", true)
-            .expect_err("empty display name must fail");
+        let err = import_agent(
+            &offline_client(),
+            &file,
+            Some(dir.path()),
+            "test.id",
+            true,
+            None,
+            false,
+        )
+        .expect_err("empty display name must fail");
         match err {
             CliError::Usage(msg) => assert_eq!(msg, "snapshot display name is empty"),
             other => panic!("expected CliError::Usage, got {other:?}"),
@@ -2068,5 +2296,108 @@ mod tests {
         assert_eq!(records[0].respond_to, RespondTo::Allowlist);
         assert_eq!(records[0].respond_to_allowlist, vec![untouched]);
         assert_eq!(records[1].respond_to, RespondTo::OwnerOnly);
+    }
+
+    #[test]
+    fn replacement_import_preserves_identity_and_prunes_only_orphan_definitions() {
+        let dir = tempfile::tempdir().unwrap();
+        let pubkey = hex64('a');
+        let mut instance = sample_managed_record(&pubkey, "Explorer");
+        instance.persona_id = Some("explorer-linked".into());
+        let original_secret = instance.private_key_nsec.clone();
+
+        let mut linked = sample_managed_record("", "Explorer");
+        linked.slug = Some("explorer-linked".into());
+        let mut orphan = sample_managed_record("", "Explorer");
+        orphan.slug = Some("explorer-old".into());
+        let mut unrelated = sample_managed_record("", "Reviewer");
+        unrelated.slug = Some("reviewer".into());
+        let path = write_temp_store(dir.path(), &[instance, linked, orphan, unrelated]);
+
+        let mut snapshot = valid_snapshot_json();
+        snapshot["definition"]["name"] = json!("Explorer");
+        snapshot["definition"]["systemPrompt"] = json!("focused explorer prompt");
+        snapshot["definition"]["runtime"] = json!("cursor");
+        snapshot["definition"]["parallelism"] = json!(7);
+        snapshot["profile"]["displayName"] = json!("Explorer");
+        let file = write_snapshot(dir.path(), &snapshot);
+
+        import_agent(
+            &offline_client(),
+            &file,
+            Some(dir.path()),
+            "test.id",
+            false,
+            Some(&pubkey),
+            true,
+        )
+        .expect("replacement import");
+
+        let records: Vec<ManagedAgentRecord> =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(records.len(), 3);
+        let updated = records
+            .iter()
+            .find(|record| record.pubkey == pubkey)
+            .unwrap();
+        assert_eq!(updated.private_key_nsec, original_secret);
+        assert_eq!(updated.persona_id.as_deref(), Some("explorer-linked"));
+        assert_eq!(
+            updated.system_prompt.as_deref(),
+            Some("focused explorer prompt")
+        );
+        assert_eq!(updated.parallelism, 7);
+
+        let linked = records
+            .iter()
+            .find(|record| record.slug.as_deref() == Some("explorer-linked"))
+            .unwrap();
+        assert_eq!(
+            linked.system_prompt.as_deref(),
+            Some("focused explorer prompt")
+        );
+        assert!(records
+            .iter()
+            .all(|record| record.slug.as_deref() != Some("explorer-old")));
+        assert!(records
+            .iter()
+            .any(|record| record.slug.as_deref() == Some("reviewer")));
+        assert!(dir
+            .path()
+            .join("agents/managed-agents.json.pre-roster-import.bak")
+            .is_file());
+    }
+
+    #[test]
+    fn replacement_import_refuses_ambiguous_keyed_name_before_pruning() {
+        let dir = tempfile::tempdir().unwrap();
+        let keep = hex64('a');
+        let other = hex64('b');
+        let path = write_temp_store(
+            dir.path(),
+            &[
+                sample_managed_record(&keep, "Explorer"),
+                sample_managed_record(&other, "Explorer"),
+            ],
+        );
+        let before = std::fs::read(&path).unwrap();
+
+        let mut snapshot = valid_snapshot_json();
+        snapshot["definition"]["name"] = json!("Explorer");
+        snapshot["profile"]["displayName"] = json!("Explorer");
+        let file = write_snapshot(dir.path(), &snapshot);
+        let error = import_agent(
+            &offline_client(),
+            &file,
+            Some(dir.path()),
+            "test.id",
+            false,
+            Some(&keep),
+            true,
+        )
+        .expect_err("ambiguous keyed names must not be pruned");
+
+        assert!(error.to_string().contains("refusing to guess"));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 }
