@@ -43,6 +43,22 @@ pub(crate) const AGENTS_MD: &str = include_str!("nest_agents.md");
 /// Written to ~/.buzz/.agents/skills/buzz-cli/SKILL.md on first init.
 const BUZZ_CLI_SKILL_MD: &str = include_str!("nest_skill.md");
 
+/// Workflow skills shared by Buzz-managed agents. The source files stay in
+/// the repository's canonical `.agents/skills` directory and are embedded in
+/// the desktop binary for installation into the nest.
+const MANAGED_WORKFLOW_SKILLS: &[(&str, &str, u32)] = &[
+    (
+        "orchestrate",
+        include_str!("../../../../.agents/skills/orchestrate/SKILL.md"),
+        3,
+    ),
+    (
+        "workflow-step",
+        include_str!("../../../../.agents/skills/workflow-step/SKILL.md"),
+        2,
+    ),
+];
+
 /// Template content version for AGENTS.md static content (above managed markers).
 /// Bump this when changing `nest_agents.md` to trigger refresh on existing installs.
 /// Version 1 is implicitly "before this mechanism existed" (no version file).
@@ -119,9 +135,9 @@ pub fn ensure_nest() -> Result<(), String> {
 ///
 /// - Creates the root directory and all subdirectories.
 /// - Writes `AGENTS.md` only if it doesn't already exist.
-/// - Writes `.agents/skills/buzz-cli/SKILL.md` only if it doesn't already exist.
+/// - Installs the embedded skills under `.agents/skills/`.
 /// - Creates harness-specific symlinks pointing to the canonical
-///   `.agents/skills/buzz-cli` directory for each known provider.
+///   `.agents/skills/<name>` directory for each known provider.
 /// - Sets 700 permissions on the root, all subdirectories, and the skill
 ///   directory tree (Unix).
 ///
@@ -212,11 +228,14 @@ pub fn ensure_nest_at(root: &Path) -> Result<(), String> {
     // Create harness-specific symlinks for all known providers.
     // Migration of the old .claude/skills/buzz-cli real dir is handled in
     // refresh_skill_md_if_stale; ensure_skill_symlinks skips paths that already exist.
-    ensure_skill_symlinks(root)?;
+    ensure_skill_symlinks(root, "buzz-cli")?;
 
     // Refresh static content if the embedded template version is newer.
     refresh_agents_md_if_stale(root)?;
     refresh_skill_md_if_stale(root)?;
+    for (name, content, version) in MANAGED_WORKFLOW_SKILLS {
+        ensure_embedded_skill(root, name, content, *version)?;
+    }
 
     // Set owner-only permissions on root and all subdirectories.
     // Skip any path that is a symlink — chmod would affect the target.
@@ -252,9 +271,10 @@ pub fn ensure_nest_at(root: &Path) -> Result<(), String> {
         // Skill directory trees inside root get 700.
         // Build the list from canonical path + all known provider skill dirs.
         let mut skill_perm_dirs = Vec::new();
-        {
+        for skill_name in ["buzz-cli", "orchestrate", "workflow-step"] {
             let mut accumulated = std::path::PathBuf::new();
-            for component in std::path::Path::new(CANONICAL_SKILL_DIR).components() {
+            let canonical = format!(".agents/skills/{skill_name}");
+            for component in std::path::Path::new(&canonical).components() {
                 accumulated.push(component);
                 skill_perm_dirs.push(root.join(&accumulated));
             }
@@ -286,17 +306,17 @@ pub fn ensure_nest_at(root: &Path) -> Result<(), String> {
 /// Idempotent: skips any path where `symlink_metadata` succeeds — real
 /// directories, valid symlinks, and dangling symlinks are all left alone.
 #[cfg(unix)]
-fn ensure_skill_symlinks(root: &Path) -> Result<(), String> {
+fn ensure_skill_symlinks(root: &Path, skill_name: &str) -> Result<(), String> {
     for skill_dir in known_skill_dirs() {
         let parent = root.join(skill_dir);
         fs::create_dir_all(&parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
-        let link = parent.join("buzz-cli");
+        let link = parent.join(skill_name);
         if link.symlink_metadata().is_ok() {
             continue; // symlink or real path exists — skip
         }
         let depth = std::path::Path::new(skill_dir).components().count();
         let prefix = "../".repeat(depth);
-        let target = format!("{prefix}{CANONICAL_SKILL_DIR}");
+        let target = format!("{prefix}.agents/skills/{skill_name}");
         create_symlink(std::path::Path::new(&target), &link)
             .map_err(|e| format!("symlink {} → {}: {e}", link.display(), target))?;
     }
@@ -304,8 +324,36 @@ fn ensure_skill_symlinks(root: &Path) -> Result<(), String> {
 }
 
 #[cfg(not(unix))]
-fn ensure_skill_symlinks(_root: &Path) -> Result<(), String> {
+fn ensure_skill_symlinks(_root: &Path, _skill_name: &str) -> Result<(), String> {
     Ok(())
+}
+
+fn ensure_embedded_skill(
+    root: &Path,
+    name: &str,
+    content: &str,
+    version: u32,
+) -> Result<(), String> {
+    let skill_dir = root.join(".agents/skills").join(name);
+    fs::create_dir_all(&skill_dir).map_err(|e| format!("create {}: {e}", skill_dir.display()))?;
+
+    let version_path = skill_dir.join(".skill-version");
+    if read_version_file(&version_path) < version {
+        let skill_md = skill_dir.join("SKILL.md");
+        let mut tmp = tempfile::NamedTempFile::new_in(&skill_dir)
+            .map_err(|e| format!("tempfile in {}: {e}", skill_dir.display()))?;
+        {
+            use std::io::Write;
+            tmp.write_all(content.as_bytes())
+                .map_err(|e| format!("write tempfile: {e}"))?;
+        }
+        tmp.persist(&skill_md)
+            .map_err(|e| format!("persist {}: {e}", skill_md.display()))?;
+        fs::write(&version_path, format!("{version}\n"))
+            .map_err(|e| format!("write {}: {e}", version_path.display()))?;
+    }
+
+    ensure_skill_symlinks(root, name)
 }
 
 /// Returns the `~/.local/bin` link name for the bundled CLI.

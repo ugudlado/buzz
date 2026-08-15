@@ -131,19 +131,26 @@ fn ensure_nest_creates_skill_file() {
     let content = fs::read_to_string(&skill).unwrap();
     assert_eq!(content, BUZZ_CLI_SKILL_MD);
 
+    for (name, expected, _) in MANAGED_WORKFLOW_SKILLS {
+        let skill = root.join(".agents/skills").join(name).join("SKILL.md");
+        assert_eq!(fs::read_to_string(skill).unwrap(), *expected);
+    }
+
     // On unix, harness-specific symlinks should resolve to the canonical dir.
     #[cfg(unix)]
     {
-        for dir in [".goose/skills", ".claude/skills", ".codex/skills"] {
-            let link = root.join(dir).join("buzz-cli");
-            assert!(
-                link.symlink_metadata().unwrap().file_type().is_symlink(),
-                "{dir}/buzz-cli should be a symlink"
-            );
-            assert!(
-                link.join("SKILL.md").exists(),
-                "symlink at {dir}/buzz-cli should resolve to dir with SKILL.md"
-            );
+        for skill_name in ["buzz-cli", "orchestrate", "workflow-step"] {
+            for dir in [".goose/skills", ".claude/skills", ".codex/skills"] {
+                let link = root.join(dir).join(skill_name);
+                assert!(
+                    link.symlink_metadata().unwrap().file_type().is_symlink(),
+                    "{dir}/{skill_name} should be a symlink"
+                );
+                assert!(
+                    link.join("SKILL.md").exists(),
+                    "symlink at {dir}/{skill_name} should resolve to SKILL.md"
+                );
+            }
         }
     }
 }
@@ -174,6 +181,8 @@ fn ensure_nest_skill_dir_has_700_permissions() {
         ".agents",
         ".agents/skills",
         ".agents/skills/buzz-cli",
+        ".agents/skills/orchestrate",
+        ".agents/skills/workflow-step",
         ".goose",
         ".goose/skills",
         ".claude",
