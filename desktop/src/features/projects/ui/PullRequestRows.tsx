@@ -1,8 +1,6 @@
 import { Check, GitBranch, MessageSquare, X } from "lucide-react";
 
-import {
-  type ProjectPullRequest,
-} from "@/features/projects/hooks";
+import type { ProjectPullRequest } from "@/features/projects/hooks";
 import {
   formatExactTimestamp,
   relativeTime,
@@ -19,7 +17,10 @@ import {
 } from "./ProjectFeedRow";
 import { CopyCommitHashButton } from "./ProjectCommitCopyButton";
 import { pullRequestStatusClassName } from "./pullRequestPresentation";
-import { ProfileAuthorName, ProfileIdentityButton } from "./ProjectProfileIdentity";
+import {
+  ProfileAuthorName,
+  ProfileIdentityButton,
+} from "./ProjectProfileIdentity";
 
 /** Dedupe/filter key for a pull request author: normalized pubkey for
  * Nostr authors, the raw GitHub login otherwise (normalizing would

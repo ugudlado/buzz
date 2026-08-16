@@ -131,7 +131,10 @@ function PullRequestGridCard({
   repository: Repository;
   onOpen: (project: Project, pullRequest: ProjectPullRequest) => void;
 }) {
-  const authorLabel = resolveUserLabel({ profiles, pubkey: pullRequest.author });
+  const authorLabel = resolveUserLabel({
+    profiles,
+    pubkey: pullRequest.author,
+  });
 
   return (
     <Card
@@ -217,7 +220,10 @@ function PullRequestListRow({
   repository: Repository;
   onOpen: (project: Project, pullRequest: ProjectPullRequest) => void;
 }) {
-  const authorLabel = resolveUserLabel({ profiles, pubkey: pullRequest.author });
+  const authorLabel = resolveUserLabel({
+    profiles,
+    pubkey: pullRequest.author,
+  });
 
   return (
     <div
