@@ -1,6 +1,10 @@
 import { relayClient } from "@/shared/api/relayClient";
 import type { RelayEvent } from "@/shared/api/types";
 import {
+  fetchAssignmentOperationEvents,
+  mergeEventsById,
+} from "./assignmentOperationFetch";
+import {
   KIND_GIT_ISSUE,
   KIND_GIT_PR_UPDATE,
   KIND_GIT_PULL_REQUEST,
@@ -39,6 +43,7 @@ type ProjectRepository<TProject extends ProjectReference> =
 
 /** Optional event groups that can fail without discarding root work items. */
 export type ProjectWorkItemSection =
+  | "assignments"
   | "backlog-issues"
   | "comments"
   | "github-pull-requests"
@@ -129,6 +134,13 @@ export async function fetchProjectsWorkItems<TProject extends ProjectReference>(
   const relayPrRepoAddresses = repoAddresses.filter(
     (address) => !githubRepos.has(address),
   );
+  const issueRootPromise = buzzIssueRepoAddresses.length
+    ? fetchEvents({
+        kinds: [KIND_GIT_ISSUE],
+        "#a": buzzIssueRepoAddresses,
+        limit: 2_000,
+      })
+    : Promise.resolve<RelayEvent[]>([]);
   const [
     issueRootResult,
     prRootResult,
@@ -137,14 +149,9 @@ export async function fetchProjectsWorkItems<TProject extends ProjectReference>(
     statusResult,
     backlogResult,
     githubResult,
+    assignResult,
   ] = await Promise.allSettled([
-    buzzIssueRepoAddresses.length
-      ? fetchEvents({
-          kinds: [KIND_GIT_ISSUE],
-          "#a": buzzIssueRepoAddresses,
-          limit: 2_000,
-        })
-      : Promise.resolve<RelayEvent[]>([]),
+    issueRootPromise,
     relayPrRepoAddresses.length
       ? fetchEvents({
           kinds: [KIND_GIT_PULL_REQUEST],
@@ -174,6 +181,17 @@ export async function fetchProjectsWorkItems<TProject extends ProjectReference>(
     }),
     fetchBacklogIssues(backlogTrackedRepos),
     fetchGithubPullRequests(githubTrackedRepos),
+    // Assignment state must reduce over the complete operation history —
+    // the 2,000-comment window above is shared across every loaded repo
+    // and can evict older assignment operations. Keyed by issue id (`#e`)
+    // because that is the only tag constraint the relay applies before its
+    // SQL LIMIT; see fetchAssignmentOperationEvents.
+    issueRootPromise.then((rootEvents) =>
+      fetchAssignmentOperationEvents(
+        rootEvents.map((event) => event.id),
+        fetchEvents,
+      ),
+    ),
   ]);
 
   for (const rootResult of [issueRootResult, prRootResult]) {
@@ -186,8 +204,10 @@ export async function fetchProjectsWorkItems<TProject extends ProjectReference>(
 
   const updateEvents =
     updateResult.status === "fulfilled" ? updateResult.value : [];
-  const commentEvents =
-    commentResult.status === "fulfilled" ? commentResult.value : [];
+  const commentEvents = mergeEventsById(
+    commentResult.status === "fulfilled" ? commentResult.value : [],
+    assignResult.status === "fulfilled" ? assignResult.value : [],
+  );
   const statusEvents =
     statusResult.status === "fulfilled" ? statusResult.value : [];
   const rootsByRepo = groupByRepoAddress([
@@ -275,6 +295,9 @@ export async function fetchProjectsWorkItems<TProject extends ProjectReference>(
     )
     .sort((left, right) => right.issue.updatedAt - left.issue.updatedAt);
   const sharedFailedSections: ProjectWorkItemSection[] = [];
+  if (assignResult.status === "rejected") {
+    sharedFailedSections.push("assignments");
+  }
   if (commentResult.status === "rejected") {
     sharedFailedSections.push("comments");
   }

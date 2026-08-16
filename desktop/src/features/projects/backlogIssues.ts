@@ -108,6 +108,8 @@ export function backlogTaskToProjectIssue(
     originAgentName: null,
     labels: task.labels ?? [],
     recipients: [],
+    assignees: [],
+    assigneeOperationHeads: {},
     status: backlogStatusToIssueStatus(task.status),
     statusEventId: null,
     updatedAt: isoToUnixSeconds(task.updatedDate, createdAt),

@@ -1393,6 +1393,8 @@ fn format_conversation_context(
 #[derive(Default)]
 pub struct FormatPromptArgs<'a> {
     pub agent_core: Option<&'a str>,
+    /// Owner-signed instructions for an active huddle channel.
+    pub huddle_instructions: Option<&'a str>,
     pub channel_info: Option<&'a PromptChannelInfo>,
     pub conversation_context: Option<&'a ConversationContext>,
     /// True when delivery-delta filtering removed at least one event that this
@@ -1444,6 +1446,7 @@ pub(crate) struct StandingContext<'a> {
     pub team_instructions: Option<&'a str>,
     pub agent_core: Option<&'a str>,
     pub agent_project: Option<&'a str>,
+    pub huddle_instructions: Option<&'a str>,
     pub agent_canvas: Option<&'a str>,
 }
 
@@ -1469,6 +1472,13 @@ impl StandingContext<'_> {
         }
         if let Some(project) = self.agent_project {
             sections.push(project.to_string());
+        }
+        if let Some(instructions) = self
+            .huddle_instructions
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            sections.push(format!("[Huddle Instructions]\n{instructions}"));
         }
         if let Some(canvas) = self.agent_canvas {
             sections.push(canvas.to_string());
@@ -1539,6 +1549,7 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
                 team_instructions: args.team_instructions,
                 agent_core: args.agent_core,
                 agent_project: args.agent_project,
+                huddle_instructions: args.huddle_instructions,
                 agent_canvas: args.agent_canvas,
             }
             .sections(),
@@ -2625,6 +2636,7 @@ mod tests {
             system_prompt: Some("test system prompt"),
             team_instructions: Some("ship small"),
             agent_core: Some(core),
+            huddle_instructions: None,
             agent_canvas: Some(canvas),
             standing_context_sent: sent,
             ..Default::default()

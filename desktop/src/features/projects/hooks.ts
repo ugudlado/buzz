@@ -48,6 +48,10 @@ import type {
   RelayEvent,
 } from "@/shared/api/types";
 import { summarizeProjectActivityEvents } from "./projectActivity.mjs";
+import {
+  fetchAssignmentOperationEvents,
+  mergeEventsById,
+} from "./assignmentOperationFetch";
 import type { ProjectIssue } from "./projectIssues.mjs";
 import {
   nextProjectIssueCommentCreatedAt,
@@ -243,30 +247,43 @@ async function fetchProjectIssues(
     ]);
     return byRepo.get(project.repoAddress) ?? [];
   }
-  const [issueEvents, statusEvents, commentEvents] = await Promise.all([
-    relayClient.fetchEvents({
-      kinds: [KIND_GIT_ISSUE],
-      "#a": [project.repoAddress],
-      limit: 200,
-    }),
-    relayClient.fetchEvents({
-      kinds: [
-        KIND_GIT_STATUS_OPEN,
-        KIND_GIT_STATUS_MERGED,
-        KIND_GIT_STATUS_CLOSED,
-        KIND_GIT_STATUS_DRAFT,
-      ],
-      "#a": [project.repoAddress],
-      limit: 500,
-    }),
-    relayClient.fetchEvents({
-      kinds: [KIND_TEXT_NOTE],
-      "#a": [project.repoAddress],
-      limit: 500,
-    }),
-  ]);
+  const issuePromise = relayClient.fetchEvents({
+    kinds: [KIND_GIT_ISSUE],
+    "#a": [project.repoAddress],
+    limit: 200,
+  });
+  const [issueEvents, statusEvents, commentEvents, assignmentEvents] =
+    await Promise.all([
+      issuePromise,
+      relayClient.fetchEvents({
+        kinds: [
+          KIND_GIT_STATUS_OPEN,
+          KIND_GIT_STATUS_MERGED,
+          KIND_GIT_STATUS_CLOSED,
+          KIND_GIT_STATUS_DRAFT,
+        ],
+        "#a": [project.repoAddress],
+        limit: 500,
+      }),
+      relayClient.fetchEvents({
+        kinds: [KIND_TEXT_NOTE],
+        "#a": [project.repoAddress],
+        limit: 500,
+      }),
+      // Assignment state must reduce over the complete operation history, not
+      // whatever survives the bounded comment window above. Keyed by issue id
+      // (`#e`) because that is the only tag constraint the relay applies
+      // before its SQL LIMIT — see fetchAssignmentOperationEvents.
+      issuePromise.then((events) =>
+        fetchAssignmentOperationEvents(events.map((event) => event.id)),
+      ),
+    ]);
 
-  return projectIssueEventsToIssues(issueEvents, statusEvents, commentEvents);
+  return projectIssueEventsToIssues(
+    issueEvents,
+    statusEvents,
+    mergeEventsById(commentEvents, assignmentEvents),
+  );
 }
 
 async function fetchProjectPullRequests(

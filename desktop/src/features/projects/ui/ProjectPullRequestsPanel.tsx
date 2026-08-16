@@ -3,7 +3,6 @@ import {
   ChevronDown,
   ChevronUp,
   FileCode2,
-  GitBranch,
   GitCommitHorizontal,
   GitMerge,
   GitPullRequest,
@@ -11,12 +10,12 @@ import {
   MessageSquare,
   TriangleAlert,
   UserPlus,
-  X,
 } from "lucide-react";
 import * as React from "react";
 import { toast } from "sonner";
 
 import { useIsManagedAgent } from "@/features/agent-memory/hooks";
+import { DiscussedInChannels } from "./DiscussionChannels";
 import { ProjectOriginReference } from "./ProjectOriginReference";
 import { ForumComposer } from "@/features/forum/ui/ForumComposer";
 import {
@@ -26,6 +25,8 @@ import {
   useCreateProjectPullRequestCommentMutation,
 } from "@/features/projects/hooks";
 import { projectPullRequestCommentTimelineKind } from "@/features/projects/projectPullRequests.mjs";
+import { entityDiscussionQuery } from "@/features/projects/lib/discussionChannels";
+import { pullRequestShareLink } from "@/features/projects/lib/projectShareLinks";
 import {
   formatExactTimestamp,
   relativeTime,
@@ -38,12 +39,6 @@ import {
 import { useIdentityQuery } from "@/shared/api/hooks";
 import { cn } from "@/shared/lib/cn";
 import { normalizePubkey } from "@/shared/lib/pubkey";
-import {
-  ProjectFeedRow,
-  ProjectFeedRowCluster,
-  ProjectFeedRowMonoCell,
-} from "./ProjectFeedRow";
-import { CopyCommitHashButton } from "./ProjectCommitCopyButton";
 import type { OpenMergeRecoveryTerminal } from "./MergePullRequestButton";
 import { OverviewRailSection } from "./ProjectOverviewPanel";
 import {
@@ -54,191 +49,18 @@ import {
   PullRequestAuthorIdentity,
   pullRequestMembers,
   pullRequestStatusBadgeClassName,
-  pullRequestStatusClassName,
 } from "./pullRequestPresentation";
 import { PullRequestsFilterBar } from "./PullRequestsFilterBar";
-import {
-  ProfileAuthorName,
-  ProfileIdentityButton,
-} from "./ProjectProfileIdentity";
+import { ProfileAuthorName } from "./ProjectProfileIdentity";
 import { ProjectRichContent } from "./ProjectRichContent";
 import { PullRequestReviewersRow } from "./PullRequestReviewersRow";
 import { PullRequestReviewCard } from "./PullRequestReviewCard";
-
-/** Dedupe/filter key for a pull request author: normalized pubkey for
- * Nostr authors, the raw GitHub login otherwise (normalizing would
- * lowercase a login and corrupt grouping). */
-function pullRequestAuthorFilterKey(pullRequest: ProjectPullRequest): string {
-  return pullRequest.authorKind === "nostr"
-    ? normalizePubkey(pullRequest.author)
-    : pullRequest.author;
-}
-
-function PullRequestCommitRow({
-  author,
-  authorKind = "nostr",
-  branch,
-  createdAt,
-  hash,
-  message,
-  onOpenCommit,
-  profiles,
-}: {
-  author: string;
-  authorKind?: "nostr" | "github";
-  branch: string | null;
-  createdAt: number;
-  hash: string | null;
-  message: string;
-  onOpenCommit?: (commitHash: string) => void;
-  profiles?: UserProfileLookup;
-}) {
-  const resolvedAuthor = resolveWorkItemAuthor({
-    author,
-    authorKind,
-    profiles,
-  });
-  const authorLabel = resolvedAuthor.label;
-  const openCommit =
-    hash && onOpenCommit ? () => onOpenCommit(hash) : undefined;
-
-  return (
-    <ProjectFeedRow
-      meta={
-        <>
-          <ProfileIdentityButton
-            avatarClassName="shrink-0"
-            avatarSize="xs"
-            avatarUrl={resolvedAuthor.profile?.avatarUrl ?? null}
-            isAgent={resolvedAuthor.profile?.isAgent === true}
-            label={authorLabel}
-            pubkey={resolvedAuthor.pubkey}
-            showLabel={false}
-          />
-          <span className="truncate">
-            <ProfileAuthorName pubkey={resolvedAuthor.pubkey}>
-              {authorLabel}
-            </ProfileAuthorName>{" "}
-            authored{" "}
-            <span title={formatExactTimestamp(createdAt)}>
-              {relativeTime(createdAt)}
-            </span>
-          </span>
-          {branch ? (
-            <span className="inline-flex min-w-0 items-center gap-1 rounded-full border border-border/60 px-1.5 py-0.5 font-mono text-2xs">
-              <GitBranch className="h-3 w-3 shrink-0" />
-              <span className="truncate">{branch}</span>
-            </span>
-          ) : null}
-        </>
-      }
-      onOpen={openCommit}
-      testId="project-pull-request-commit-row"
-      title={message}
-      trailing={
-        hash ? (
-          <ProjectFeedRowCluster>
-            <ProjectFeedRowMonoCell
-              label={hash.slice(0, 7)}
-              onClick={openCommit}
-              title={`View commit ${hash.slice(0, 7)}`}
-            />
-            <CopyCommitHashButton hash={hash} />
-          </ProjectFeedRowCluster>
-        ) : undefined
-      }
-    />
-  );
-}
-
-function PullRequestRow({
-  onOpen,
-  profiles,
-  pullRequest,
-}: {
-  onOpen: () => void;
-  profiles?: UserProfileLookup;
-  pullRequest: ProjectPullRequest;
-}) {
-  const author = resolveWorkItemAuthor({
-    author: pullRequest.author,
-    authorKind: pullRequest.authorKind,
-    profiles,
-  });
-  const authorLabel = author.label;
-  const StatusIcon =
-    pullRequest.status === "Closed" || pullRequest.status === "Draft"
-      ? X
-      : Check;
-  const statusClassName = pullRequestStatusClassName(pullRequest.status);
-
-  return (
-    <ProjectFeedRow
-      eventId={pullRequest.id}
-      meta={
-        <>
-          <ProfileIdentityButton
-            avatarClassName="shrink-0"
-            avatarSize="xs"
-            avatarUrl={author.profile?.avatarUrl ?? null}
-            isAgent={author.profile?.isAgent === true}
-            label={authorLabel}
-            pubkey={author.pubkey}
-            showLabel={false}
-          />
-          <span className="truncate">
-            <ProfileAuthorName pubkey={author.pubkey}>
-              {authorLabel}
-            </ProfileAuthorName>{" "}
-            created this pull request{" "}
-            <span title={formatExactTimestamp(pullRequest.createdAt)}>
-              {relativeTime(pullRequest.createdAt)}
-            </span>
-          </span>
-          {pullRequest.branchName ? (
-            <span className="inline-flex min-w-0 items-center gap-1 rounded-full border border-border/60 px-1.5 py-0.5 font-mono text-2xs">
-              <GitBranch className="h-3 w-3 shrink-0" />
-              <span className="truncate">{pullRequest.branchName}</span>
-            </span>
-          ) : null}
-          <span
-            className={`rounded-full border border-border/60 px-1.5 py-0.5 text-2xs font-medium ${statusClassName}`}
-          >
-            {pullRequest.status}
-          </span>
-        </>
-      }
-      onOpen={onOpen}
-      statusIcon={
-        <StatusIcon className={`h-3.5 w-3.5 shrink-0 ${statusClassName}`} />
-      }
-      testId="project-pull-request-row"
-      title={pullRequest.title}
-      trailing={
-        <>
-          {pullRequest.comments.length > 0 ? (
-            <button
-              aria-label={`View ${pullRequest.comments.length} comments`}
-              className="flex items-center gap-1 rounded-md text-xs text-muted-foreground hover:text-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
-              onClick={onOpen}
-              type="button"
-            >
-              <MessageSquare className="h-3.5 w-3.5" />
-              {pullRequest.comments.length}
-            </button>
-          ) : null}
-          <ProjectFeedRowCluster>
-            <ProjectFeedRowMonoCell
-              label={`#${pullRequest.id.slice(0, 8)}`}
-              onClick={onOpen}
-              title="View pull request"
-            />
-          </ProjectFeedRowCluster>
-        </>
-      }
-    />
-  );
-}
+import { ShareLinkButton } from "./ShareLinkButton";
+import {
+  PullRequestCommitRow,
+  PullRequestRow,
+  pullRequestAuthorFilterKey,
+} from "./PullRequestRows";
 
 export type PullRequestPanelMode = "conversation" | "commits" | "checks";
 
@@ -264,10 +86,22 @@ export function PullRequestDetailHeader({
         <span className="font-normal text-muted-foreground">
           #{pullRequest.id.slice(0, 8)}
         </span>
+        <ShareLinkButton
+          className="ml-1 inline-flex h-7 w-7 align-text-bottom"
+          label="Copy pull request link"
+          link={pullRequestShareLink(pullRequest)}
+          testId="project-pull-request-copy-link"
+        />
       </h3>
-      <p className="flex items-center gap-1 text-xs font-medium text-muted-foreground">
-        <GitPullRequest className="h-3.5 w-3.5" />
-        <span className="flex min-w-0 items-center gap-1">
+      <p
+        className="flex flex-wrap items-center gap-x-1 gap-y-1 text-xs font-medium text-muted-foreground"
+        data-testid="project-pull-request-detail-metadata"
+      >
+        <GitPullRequest className="h-3.5 w-3.5 shrink-0" />
+        <span
+          className="flex min-w-0 items-center gap-1"
+          data-project-metadata-phrase
+        >
           <PullRequestAuthorIdentity
             avatarSize="xs"
             profiles={profiles}
@@ -282,7 +116,11 @@ export function PullRequestDetailHeader({
             {authorLabel}
           </ProfileAuthorName>
         </span>
-        <span title={formatExactTimestamp(pullRequest.createdAt)}>
+        <span
+          className="shrink-0 whitespace-nowrap"
+          data-project-metadata-phrase
+          title={formatExactTimestamp(pullRequest.createdAt)}
+        >
           created {relativeTime(pullRequest.createdAt)}
         </span>
         <ProjectOriginReference
@@ -591,7 +429,12 @@ export function ProjectPullRequestDetail({
       ) : null}
 
       <section className="space-y-3 p-4">
-        <div className="group/timeline -mx-4 overflow-hidden border-border/50 border-b">
+        <DiscussedInChannels
+          entityLabel="this pull request"
+          query={entityDiscussionQuery(pullRequest.id)}
+          testId="pull-request-discussed-in"
+        />
+        <div className="group/timeline -mx-4 overflow-hidden">
           {reviewHistory.length > 0 ? (
             <button
               aria-expanded={!reviewHistoryCollapsed}
@@ -780,10 +623,6 @@ export function ProjectPullRequestDetail({
             />
           </div>
         </div>
-        <h4 className="flex items-center gap-1.5 text-sm font-semibold text-foreground">
-          <MessageSquare className="h-3.5 w-3.5" />
-          Add Your Comment
-        </h4>
         <div data-testid="project-pull-request-comment-composer">
           <ForumComposer
             className="border border-border/60 bg-background/45"

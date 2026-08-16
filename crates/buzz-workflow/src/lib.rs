@@ -297,7 +297,10 @@ impl WorkflowEngine {
                         RunStatus::Failed,
                         progress.step_index as i32,
                         &trace_json,
-                        Some(&e.to_string()),
+                        Some(buzz_db::workflow::WorkflowRunFailure {
+                            code: e.code(),
+                            message: &e.to_string(),
+                        }),
                     )
                     .await
                 {
@@ -520,7 +523,10 @@ impl WorkflowEngine {
                 RunStatus::Failed,
                 step_index,
                 trace_json,
-                Some(reason),
+                Some(buzz_db::workflow::WorkflowRunFailure {
+                    code: "suspend_failed",
+                    message: reason,
+                }),
             )
             .await
         {

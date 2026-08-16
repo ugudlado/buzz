@@ -13,6 +13,7 @@ import {
   projectRepoHostForRepository,
   repositoryDisplayPath,
 } from "@/features/projects/lib/projectRepoHost";
+import { repositoryShareLink } from "@/features/projects/lib/projectShareLinks";
 import {
   formatExactTimestamp,
   relativeTime,
@@ -37,6 +38,7 @@ import {
   ProjectStatsRow,
   REPOSITORY_STAT_KEYS,
 } from "./ProjectCards";
+import { CopyShareLinkMenuItem } from "./CopyShareLinkMenuItem";
 import { GitHubMark } from "./GitHubMark";
 import { ProjectListRowMenu } from "./ProjectListRowMenu";
 import { projectTerminalLabel } from "./useOpenProjectTerminal";
@@ -181,6 +183,10 @@ function RepositoryActionsMenu({
 }: Pick<RepositoryItemProps, "hasLocal" | "onOpenTerminal" | "repository">) {
   return (
     <ProjectListRowMenu label={`More options for ${repository.name}`}>
+      <CopyShareLinkMenuItem
+        link={repositoryShareLink(repository)}
+        testId={`repository-copy-link-${repository.dtag}`}
+      />
       <DropdownMenuItem
         onSelect={(event) => {
           event.preventDefault();

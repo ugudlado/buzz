@@ -50,7 +50,10 @@ pub mod webkit_rendering;
 use app_state::{build_app_state, resolve_persisted_identity, AppState};
 use builderlab::*;
 use commands::*;
-use deep_link::{handle_deep_link_url, PendingCommunityDeepLinks};
+use deep_link::{
+    handle_deep_link_url, PendingCommunityDeepLinks, PendingEntityDeepLinks,
+    PendingNavigationDeepLinks,
+};
 use huddle::HuddlePhase;
 use initial_window::*;
 use managed_agents::{backfill_persona_snapshots, ensure_nest, try_regenerate_nest};
@@ -273,7 +276,6 @@ pub fn run() {
     } else {
         builder.plugin(tauri_plugin_updater::Builder::new().build())
     };
-
     let app = app_menu::install(builder)
         .register_asynchronous_uri_scheme_protocol("buzz-media", |ctx, request, responder| {
             let app = ctx.app_handle().clone();
@@ -285,6 +287,8 @@ pub fn run() {
         .manage(build_app_state())
         .manage(ClipboardState::new())
         .manage(PendingCommunityDeepLinks::default())
+        .manage(PendingNavigationDeepLinks::default())
+        .manage(PendingEntityDeepLinks::default())
         .manage(BuilderlabSession::default())
         .manage(BuilderlabLogin::default())
         .manage(commands::pairing::PairingHandle::new())
@@ -496,15 +500,7 @@ pub fn run() {
             // and on cold start. The single-instance plugin handles forwarding
             // from duplicate launches on Windows/Linux.
             #[cfg(desktop)]
-            {
-                use tauri_plugin_deep_link::DeepLinkExt;
-                let dl_handle = app.handle().clone();
-                app.deep_link().on_open_url(move |event| {
-                    for url in event.urls() {
-                        handle_deep_link_url(&dl_handle, url.as_str());
-                    }
-                });
-            }
+            deep_link::install_deep_link_handlers(app);
 
             // Defer launch-time agent restoration until `apply_workspace` has
             // installed the active workspace relay and identity. Starting here

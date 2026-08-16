@@ -3,8 +3,11 @@ import * as React from "react";
 import { Check, ExternalLink, ShieldCheck } from "lucide-react";
 import { toast } from "sonner";
 
+import { useIsManagedAgent } from "@/features/agent-memory/hooks";
 import { useChannelsQuery } from "@/features/channels/hooks";
 import type { Project, Repository } from "@/features/projects/hooks";
+import { useUsersBatchQuery } from "@/features/profile/hooks";
+import { ownsAuthorAgent } from "@/features/profile/lib/identity";
 import { useAddProjectRepositoryMutation } from "@/features/projects/useAddProjectRepository";
 import { useAttachProjectRepositoryMutation } from "@/features/projects/useAttachProjectRepository";
 import { useBindProjectRepositoryChannelMutation } from "@/features/projects/useBindProjectRepositoryChannel";
@@ -68,9 +71,26 @@ export function ProjectRepositoryManagement({
   const createMutation = useAddProjectRepositoryMutation();
   const attachMutation = useAttachProjectRepositoryMutation();
   const repairMutation = useBindProjectRepositoryChannelMutation();
-  const canEdit = identityPubkey?.toLowerCase() === project.owner.toLowerCase();
   const isRepositoryOwner =
     identityPubkey?.toLowerCase() === repository.owner.toLowerCase();
+  const ownerProfileQuery = useUsersBatchQuery([project.owner], {
+    enabled: Boolean(identityPubkey),
+  });
+  const projectOwnerProfile =
+    ownerProfileQuery.data?.profiles[project.owner.toLowerCase()];
+  const projectOwnerIsManaged = useIsManagedAgent(project.owner) === true;
+  const viewerIsProjectOwner =
+    identityPubkey?.toLowerCase() === project.owner.toLowerCase();
+  const viewerOwnsProjectAgent = ownsAuthorAgent(
+    projectOwnerProfile,
+    identityPubkey,
+  );
+  const canEdit =
+    viewerIsProjectOwner || projectOwnerIsManaged || viewerOwnsProjectAgent;
+  const ownerControlAgentPubkey =
+    viewerOwnsProjectAgent && !projectOwnerIsManaged && !viewerIsProjectOwner
+      ? project.owner
+      : undefined;
   const accessChannels = React.useMemo(
     () =>
       (channelsQuery.data ?? []).filter(
@@ -114,7 +134,10 @@ export function ProjectRepositoryManagement({
         channels={accessChannels}
         isCreating={createMutation.isPending}
         onAdd={async (input) => {
-          const result = await createMutation.mutateAsync(input);
+          const result = await createMutation.mutateAsync({
+            ...input,
+            ownerControlAgentPubkey,
+          });
           onChange(result.repository.id);
           toast.success(`Repository "${result.repository.name}" created.`);
         }}
@@ -126,6 +149,7 @@ export function ProjectRepositoryManagement({
         isAttaching={attachMutation.isPending}
         onAttach={async (candidate) => {
           const result = await attachMutation.mutateAsync({
+            ownerControlAgentPubkey,
             project,
             repository: candidate,
           });
@@ -173,7 +197,7 @@ export function ProjectRepositoryManagement({
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
             <Button
-              className="h-8 shrink-0 gap-1.5"
+              className="h-7 shrink-0 gap-1.5 rounded-md"
               disabled={repairMutation.isPending}
               size="sm"
               type="button"

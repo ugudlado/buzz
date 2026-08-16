@@ -1097,7 +1097,10 @@ async fn main() -> anyhow::Result<()> {
                                     buzz_db::workflow::RunStatus::Failed,
                                     approval.step_index,
                                     &run.execution_trace,
-                                    Some(reason),
+                                    Some(buzz_db::workflow::WorkflowRunFailure {
+                                        code: "approval_expired",
+                                        message: reason,
+                                    }),
                                 )
                                 .await
                             {
