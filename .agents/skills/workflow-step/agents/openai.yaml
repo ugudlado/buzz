@@ -1,4 +1,0 @@
-interface:
-  display_name: "Workflow Step"
-  short_description: "Complete a workflow step without protocol noise"
-  default_prompt: "Use $workflow-step to complete the assigned workflow step and reply like a teammate."

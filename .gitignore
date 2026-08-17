@@ -82,3 +82,8 @@ identity.key
 deploy/charts/*/charts/*.tgz
 
 .tmp
+
+# Per-agent skill/config fan-out (source of truth: .claude/skills + global ~/.claude/skills)
+.goose/
+.cursor/
+skills-lock.json
