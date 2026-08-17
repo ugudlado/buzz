@@ -290,6 +290,23 @@ steps:
   await expect(assignments.nth(1)).toContainText(
     "Usage diagnostics: unavailable",
   );
+
+  const reportedUsage = assignments.nth(0).getByTestId("reported-usage");
+  await expect(reportedUsage).toContainText("Reported usage");
+  await expect(reportedUsage.getByTestId("reported-usage-model")).toHaveText(
+    "claude-sonnet-5",
+  );
+  await expect(reportedUsage.getByTestId("reported-usage-tokens")).toHaveText(
+    "15,500 in / 2,000 out",
+  );
+  await expect(reportedUsage.getByTestId("reported-usage-cost")).toHaveText(
+    "USD 0.042",
+  );
+  await expect(reportedUsage).toContainText("self-reported");
+
+  await expect(assignments.nth(1).getByTestId("reported-usage")).toHaveText(
+    /Reported usage\s*None/,
+  );
 });
 
 test("creates a workflow via the form builder", async ({ page }) => {

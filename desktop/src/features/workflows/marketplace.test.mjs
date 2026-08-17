@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  formatReportedTokens,
   getWorkflowAgentDependencies,
   getWorkflowMarketplace,
   installMarketplaceWorkflowSnapshot,
@@ -241,4 +242,12 @@ test("contributor estimates total one currency and refuse mixed currencies", () 
     ]),
     { kind: "none", unpriced: 0, pending: 1 },
   );
+});
+
+test("reported token counts render as a grouped in/out pair", () => {
+  assert.equal(formatReportedTokens(15_500, 2_000), "15,500 in / 2,000 out");
+  assert.equal(formatReportedTokens(15_500, null), "15,500 in");
+  assert.equal(formatReportedTokens(null, 2_000), "2,000 out");
+  assert.equal(formatReportedTokens(null, null), null);
+  assert.equal(formatReportedTokens(0, 0), "0 in / 0 out");
 });

@@ -11,6 +11,7 @@ import { AssignmentTelemetry } from "@/features/workflows/ui/AssignmentTelemetry
 import {
   formatDurationMs,
   formatMicrounits,
+  formatReportedTokens,
   summarizeContributorEstimates,
 } from "@/features/workflows/marketplace";
 
@@ -101,6 +102,13 @@ function AssignmentReceiptPanel({
   const hasRate =
     receipt.rateCurrency !== null && receipt.rateMicrounitsPerHour !== null;
   const hasEstimate = hasRate && receipt.estimatedMicrounits !== null;
+  const reportedUsage = receipt.reportedUsage;
+  const reportedTokens = reportedUsage
+    ? formatReportedTokens(
+        reportedUsage.inputTokens,
+        reportedUsage.outputTokens,
+      )
+    : null;
 
   return (
     <div
@@ -177,6 +185,38 @@ function AssignmentReceiptPanel({
             </>
           ) : (
             <p>Incomplete</p>
+          )}
+        </div>
+        <div className="col-span-2" data-testid="reported-usage">
+          <p className="text-2xs text-muted-foreground">Reported usage</p>
+          {reportedUsage ? (
+            <p className="flex flex-wrap items-baseline gap-x-1.5">
+              <span data-testid="reported-usage-model">
+                {reportedUsage.model ?? reportedUsage.harness}
+              </span>
+              {reportedTokens ? (
+                <span
+                  className="text-muted-foreground"
+                  data-testid="reported-usage-tokens"
+                >
+                  {reportedTokens}
+                </span>
+              ) : null}
+              {reportedUsage.currency !== null &&
+              reportedUsage.costMicrounits !== null ? (
+                <span data-testid="reported-usage-cost">
+                  {formatMicrounits(
+                    reportedUsage.currency,
+                    reportedUsage.costMicrounits,
+                  )}
+                </span>
+              ) : null}
+              <span className="text-2xs text-muted-foreground">
+                self-reported
+              </span>
+            </p>
+          ) : (
+            <p>None</p>
           )}
         </div>
       </div>

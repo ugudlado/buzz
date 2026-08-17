@@ -8,7 +8,12 @@ import type {
   WorkflowSaveResult,
   TraceEntry,
 } from "@/shared/api/types";
-import type { AssignmentReceipt } from "@/shared/api/workflowTypes";
+import type {
+  AssignmentReceipt,
+  ReportedUsage,
+} from "@/shared/api/workflowTypes";
+
+const CURRENCY = /^[A-Z]{3}$/;
 
 // ── Raw types (snake_case from backend) ───────────────────────────────────
 
@@ -54,6 +59,7 @@ type RawAssignmentReceipt = {
   estimated_microunits: number | null;
   outcome: AssignmentReceipt["outcome"];
   review_state: AssignmentReceipt["reviewState"];
+  reported_usage?: unknown;
 };
 
 type RawWorkflowRun = {
@@ -120,6 +126,48 @@ function fromRawWorkflowSave(raw: RawWorkflowSaveResponse): WorkflowSaveResult {
   };
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+/** Non-negative safe integer, or null for anything else (including undefined). */
+function safeCount(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : null;
+}
+
+/**
+ * Parse an agent's self-reported usage. Anything malformed degrades to `null`
+ * rather than throwing: the receipt itself is still worth showing. `harness` is
+ * required for the object to count, and cost is only kept when it comes with a
+ * well-formed currency.
+ */
+function fromRawReportedUsage(raw: unknown): ReportedUsage | null {
+  if (!isRecord(raw)) return null;
+  const harness = raw.harness;
+  if (typeof harness !== "string" || harness.trim().length === 0) return null;
+
+  const currency =
+    typeof raw.currency === "string" && CURRENCY.test(raw.currency)
+      ? raw.currency
+      : null;
+  const cost = safeCount(raw.cost_microunits);
+  const hasCost = currency !== null && cost !== null;
+
+  return {
+    harness: harness.trim(),
+    model:
+      typeof raw.model === "string" && raw.model.trim().length > 0
+        ? raw.model.trim()
+        : null,
+    inputTokens: safeCount(raw.input_tokens),
+    outputTokens: safeCount(raw.output_tokens),
+    costMicrounits: hasCost ? cost : null,
+    currency: hasCost ? currency : null,
+  };
+}
+
 function fromRawAssignmentReceipt(
   raw: RawAssignmentReceipt,
 ): AssignmentReceipt {
@@ -140,6 +188,7 @@ function fromRawAssignmentReceipt(
     estimatedMicrounits: raw.estimated_microunits,
     outcome: raw.outcome,
     reviewState: raw.review_state,
+    reportedUsage: fromRawReportedUsage(raw.reported_usage),
   };
 }
 

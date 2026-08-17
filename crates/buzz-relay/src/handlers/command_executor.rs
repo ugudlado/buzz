@@ -1497,6 +1497,33 @@ async fn resume_workflow_after_approval(
         .await;
 }
 
+/// Read the agent's self-reported usage estimate from a completion reply's
+/// `buzz:usage` tag.
+///
+/// Unverified agent input: a missing, malformed, or invalid tag yields `None`
+/// (logged at WARN) so the step still resumes with no usage persisted. Usage
+/// is advisory receipt metadata and must never fail a resume.
+fn parse_reported_usage_tag(event: &Event) -> Option<buzz_core::marketplace::ReportedUsage> {
+    let raw = event.tags.iter().find_map(|tag| {
+        let parts = tag.as_slice();
+        (parts.len() >= 2 && parts[0] == buzz_core::thread::TAG_USAGE).then(|| parts[1].clone())
+    })?;
+    match serde_json::from_str::<buzz_core::marketplace::ReportedUsage>(&raw)
+        .map_err(|error| error.to_string())
+        .and_then(|usage| usage.normalized())
+    {
+        Ok(usage) => Some(usage),
+        Err(error) => {
+            tracing::warn!(
+                event_id = %event.id,
+                %error,
+                "Agent-step resume: ignoring invalid self-reported usage tag"
+            );
+            None
+        }
+    }
+}
+
 /// Check whether an incoming kind:9 event is a reply to a pending
 /// `workflow_agent_steps` row, and if so, resume the suspended run.
 ///
@@ -1627,6 +1654,7 @@ pub async fn try_resume_agent_step(
         buzz_workflow::CompletionStatus::Success => "completed",
         buzz_workflow::CompletionStatus::Failed => "failed",
     };
+    let usage = parse_reported_usage_tag(event);
 
     let updated = match state
         .db
@@ -1638,6 +1666,7 @@ pub async fn try_resume_agent_step(
             completion_event_id: Some(&event.id.to_hex()),
             terminal_at: received_at,
             outcome,
+            usage: usage.as_ref(),
         })
         .await
     {
@@ -1707,6 +1736,8 @@ pub async fn try_resume_remote_agent_step(
             // time rather than an agent-controlled encrypted timestamp.
             terminal_at: received_at,
             outcome: &validated.payload.outcome,
+            // Already validated by `validate_result_payload` during decryption.
+            usage: validated.payload.usage.as_ref(),
         })
         .await;
     match updated {
@@ -1993,4 +2024,62 @@ pub async fn retry_stuck_agent_step_resume(
 
     let output = step.output.clone().unwrap_or_else(|| serde_json::json!({}));
     resume_from_done_agent_step(state, community_id, &step, output, None).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nostr::{EventBuilder, Keys, Kind};
+
+    fn completion_with_tags(tags: Vec<Vec<&str>>) -> Event {
+        let keys = Keys::generate();
+        EventBuilder::new(Kind::Custom(9), "Done.")
+            .tags(tags.into_iter().map(|t| nostr::Tag::parse(t).unwrap()))
+            .sign_with_keys(&keys)
+            .unwrap()
+    }
+
+    #[test]
+    fn reported_usage_tag_parses_a_valid_estimate() {
+        let json = r#"{"harness":"goose","model":"claude-fable-5","inputTokens":1200,"outputTokens":340,"costMicrounits":15000,"currency":"USD"}"#;
+        let usage = parse_reported_usage_tag(&completion_with_tags(vec![vec![
+            buzz_core::thread::TAG_USAGE,
+            json,
+        ]]))
+        .expect("usage parses");
+        assert_eq!(usage.harness, "goose");
+        assert_eq!(usage.input_tokens, Some(1_200));
+        assert_eq!(usage.cost_microunits, Some(15_000));
+        assert_eq!(usage.currency.as_deref(), Some("USD"));
+    }
+
+    /// A missing, malformed, or contract-violating tag must never fail the
+    /// resume — it just yields no persisted usage.
+    #[test]
+    fn reported_usage_tag_ignores_absent_and_invalid_values() {
+        assert!(parse_reported_usage_tag(&completion_with_tags(vec![])).is_none());
+        assert!(parse_reported_usage_tag(&completion_with_tags(vec![vec![
+            buzz_core::thread::TAG_USAGE,
+            "not json",
+        ]]))
+        .is_none());
+        // Unknown fields are rejected by `deny_unknown_fields`.
+        assert!(parse_reported_usage_tag(&completion_with_tags(vec![vec![
+            buzz_core::thread::TAG_USAGE,
+            r#"{"harness":"goose","apiKey":"secret"}"#,
+        ]]))
+        .is_none());
+        // A cost without a currency violates the pair rule.
+        assert!(parse_reported_usage_tag(&completion_with_tags(vec![vec![
+            buzz_core::thread::TAG_USAGE,
+            r#"{"harness":"goose","costMicrounits":10}"#,
+        ]]))
+        .is_none());
+        // An empty harness is not a usable self-report.
+        assert!(parse_reported_usage_tag(&completion_with_tags(vec![vec![
+            buzz_core::thread::TAG_USAGE,
+            r#"{"harness":"  "}"#,
+        ]]))
+        .is_none());
+    }
 }

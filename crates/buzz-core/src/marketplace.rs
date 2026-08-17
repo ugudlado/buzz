@@ -205,6 +205,68 @@ impl WorkflowMarketplace {
     }
 }
 
+/// An agent's own account of what a completed turn consumed.
+///
+/// Self-reported and unverified: the agent's harness is the only party that
+/// observes model usage, so this travels beside — never replaces — the
+/// relay-observed elapsed-time estimate on a receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReportedUsage {
+    /// Harness that executed the turn (e.g. `goose`, `buzz-agent`).
+    pub harness: String,
+    /// Effective model id for the turn, when the harness reported one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Turn-level input tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    /// Turn-level output tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+    /// Turn-level cost in integer micro-units of [`Self::currency`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_microunits: Option<u64>,
+    /// Three-letter uppercase ASCII currency code. Present iff
+    /// [`Self::cost_microunits`] is present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub currency: Option<String>,
+}
+
+impl ReportedUsage {
+    /// Validate and normalize a self-reported usage estimate.
+    pub fn normalized(mut self) -> Result<Self, String> {
+        self.harness = self.harness.trim().to_string();
+        if self.harness.is_empty() || self.harness.chars().count() > 64 {
+            return Err("reported usage harness must contain 1–64 characters".into());
+        }
+        self.model = match self.model {
+            Some(model) => {
+                let model = model.trim().to_string();
+                if model.chars().count() > 128 {
+                    return Err("reported usage model must be at most 128 characters".into());
+                }
+                (!model.is_empty()).then_some(model)
+            }
+            None => None,
+        };
+        if let Some(cost) = self.cost_microunits {
+            validate_microunits(cost)?;
+        }
+        self.currency = match (self.cost_microunits, self.currency) {
+            (Some(_), Some(currency)) => Some(normalize_currency(&currency)?),
+            (None, None) => None,
+            _ => {
+                return Err(
+                    "reported usage cost_microunits and currency must both be present or absent"
+                        .into(),
+                );
+            }
+        };
+        Ok(self)
+    }
+}
+
 /// Calculate floor(rate × duration / one hour) with checked integer arithmetic.
 pub fn estimated_microunits(rate: u64, duration_ms: u64) -> Result<u64, String> {
     validate_microunits(rate)?;
@@ -280,6 +342,107 @@ mod tests {
         .expect_err("unknown marketplace fields must not enter a public event");
 
         assert!(error.to_string().contains("unknown field"));
+    }
+
+    fn usage() -> ReportedUsage {
+        ReportedUsage {
+            harness: "goose".into(),
+            model: Some("claude-fable-5".into()),
+            input_tokens: Some(1_200),
+            output_tokens: Some(340),
+            cost_microunits: Some(15_000),
+            currency: Some("USD".into()),
+        }
+    }
+
+    #[test]
+    fn reported_usage_normalizes_text_and_requires_a_currency_pair() {
+        let normalized = ReportedUsage {
+            harness: "  goose  ".into(),
+            model: Some("  ".into()),
+            ..usage()
+        }
+        .normalized()
+        .expect("normalize usage");
+        assert_eq!(normalized.harness, "goose");
+        assert_eq!(normalized.model, None);
+        assert_eq!(normalized.currency.as_deref(), Some("USD"));
+
+        assert!(ReportedUsage {
+            harness: String::new(),
+            ..usage()
+        }
+        .normalized()
+        .is_err());
+        assert!(ReportedUsage {
+            currency: None,
+            ..usage()
+        }
+        .normalized()
+        .is_err());
+        assert!(ReportedUsage {
+            cost_microunits: None,
+            ..usage()
+        }
+        .normalized()
+        .is_err());
+        assert!(ReportedUsage {
+            currency: Some("usd".into()),
+            ..usage()
+        }
+        .normalized()
+        .is_err());
+        assert!(ReportedUsage {
+            cost_microunits: Some(MAX_MICROUNITS + 1),
+            ..usage()
+        }
+        .normalized()
+        .is_err());
+        assert!(ReportedUsage {
+            model: Some("m".repeat(129)),
+            ..usage()
+        }
+        .normalized()
+        .is_err());
+        assert!(ReportedUsage {
+            cost_microunits: None,
+            currency: None,
+            ..usage()
+        }
+        .normalized()
+        .is_ok());
+    }
+
+    #[test]
+    fn reported_usage_round_trips_camel_case_and_rejects_unknown_fields() {
+        let json = serde_json::to_value(usage()).expect("serialize usage");
+        assert_eq!(json["inputTokens"], 1_200);
+        assert_eq!(json["costMicrounits"], 15_000);
+        assert_eq!(
+            serde_json::from_value::<ReportedUsage>(json).expect("round trip"),
+            usage()
+        );
+
+        let error = serde_json::from_value::<ReportedUsage>(serde_json::json!({
+            "harness": "goose",
+            "apiKey": "secret"
+        }))
+        .expect_err("unknown usage fields must be rejected");
+        assert!(error.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn reported_usage_omits_absent_optional_fields() {
+        let json = serde_json::to_value(ReportedUsage {
+            harness: "buzz-agent".into(),
+            model: None,
+            input_tokens: None,
+            output_tokens: None,
+            cost_microunits: None,
+            currency: None,
+        })
+        .expect("serialize minimal usage");
+        assert_eq!(json, serde_json::json!({ "harness": "buzz-agent" }));
     }
 
     #[test]

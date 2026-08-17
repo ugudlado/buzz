@@ -3363,6 +3363,14 @@ type RawWorkflowTraceEntry = {
     estimated_microunits: number | null;
     outcome: "completed" | "failed" | "timed_out" | "cancelled";
     review_state: "not_required" | "human_review_required";
+    reported_usage?: {
+      harness: string;
+      model: string | null;
+      input_tokens: number | null;
+      output_tokens: number | null;
+      cost_microunits: number | null;
+      currency: string | null;
+    } | null;
   } | null;
 };
 
@@ -3544,6 +3552,16 @@ function buildMockWorkflowRun(workflow: MockWorkflow): RawWorkflowRun {
                 estimated_microunits: 3_333,
                 outcome: failed ? "failed" : "completed",
                 review_state: failed ? "human_review_required" : "not_required",
+                reported_usage: failed
+                  ? null
+                  : {
+                      harness: "goose",
+                      model: "claude-sonnet-5",
+                      input_tokens: 15_500,
+                      output_tokens: 2_000,
+                      cost_microunits: 42_000,
+                      currency: "USD",
+                    },
               }
             : null,
       };

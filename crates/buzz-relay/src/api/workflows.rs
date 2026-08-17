@@ -191,6 +191,23 @@ fn run_json(run: &WorkflowRunRecord) -> Value {
     })
 }
 
+/// Serialize an assignment's agent self-report, or `null` when the completion
+/// carried none. `usage_harness` is the presence witness — it is the only
+/// required field of a `ReportedUsage`.
+fn reported_usage_json(step: &buzz_db::workflow::AgentStepRecord) -> Value {
+    let Some(harness) = step.usage_harness.as_ref() else {
+        return Value::Null;
+    };
+    serde_json::json!({
+        "harness": harness,
+        "model": step.usage_model,
+        "input_tokens": step.usage_input_tokens,
+        "output_tokens": step.usage_output_tokens,
+        "cost_microunits": step.usage_cost_microunits,
+        "currency": step.usage_cost_currency,
+    })
+}
+
 fn run_json_with_receipts(
     run: &WorkflowRunRecord,
     agent_steps: &[buzz_db::workflow::AgentStepRecord],
@@ -236,6 +253,7 @@ fn run_json_with_receipts(
             "rate_currency": step.rate_currency,
             "rate_microunits_per_hour": step.rate_microunits_per_hour,
             "estimated_microunits": estimated,
+            "reported_usage": reported_usage_json(step),
             "outcome": outcome,
             "review_state": if matches!(outcome, "completed" | "pending") {
                 "not_required"
@@ -344,6 +362,12 @@ mod tests {
             agent_relay_url: Some("wss://agents.example".into()),
             listing_event_id: Some("66".repeat(32)),
             delivered_at: None,
+            usage_harness: Some("goose".into()),
+            usage_model: Some("claude-fable-5".into()),
+            usage_input_tokens: Some(1_200),
+            usage_output_tokens: Some(340),
+            usage_cost_microunits: Some(15_000),
+            usage_cost_currency: Some("USD".into()),
         };
 
         let value = run_json_with_receipts(&run, &[step]);
@@ -355,6 +379,17 @@ mod tests {
         assert_eq!(receipt["agent_relay_pubkey"], "55".repeat(32));
         assert_eq!(receipt["listing_event_id"], "66".repeat(32));
         assert_eq!(value["execution_trace"][0]["status"], "failed");
+        assert_eq!(
+            receipt["reported_usage"],
+            serde_json::json!({
+                "harness": "goose",
+                "model": "claude-fable-5",
+                "input_tokens": 1_200,
+                "output_tokens": 340,
+                "cost_microunits": 15_000,
+                "currency": "USD",
+            })
+        );
     }
 
     #[test]
@@ -388,6 +423,12 @@ mod tests {
             agent_relay_url: None,
             listing_event_id: None,
             delivered_at: None,
+            usage_harness: None,
+            usage_model: None,
+            usage_input_tokens: None,
+            usage_output_tokens: None,
+            usage_cost_microunits: None,
+            usage_cost_currency: None,
         };
 
         let value = run_json_with_receipts(&run, &[step]);
@@ -395,6 +436,7 @@ mod tests {
         assert_eq!(receipt["outcome"], "pending");
         assert_eq!(receipt["rate_microunits_per_hour"], 12_000_000);
         assert_eq!(receipt["estimated_microunits"], Value::Null);
+        assert_eq!(receipt["reported_usage"], Value::Null);
     }
 
     /// `run_json` must produce every field `RawWorkflowRun`

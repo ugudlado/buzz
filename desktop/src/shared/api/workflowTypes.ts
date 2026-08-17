@@ -46,6 +46,19 @@ export type AssignmentOutcome =
 
 export type AssignmentReviewState = "not_required" | "human_review_required";
 
+/**
+ * Usage an agent reported for itself on a step assignment. Self-reported and
+ * unverified — never fold `costMicrounits` into a relay-computed total.
+ */
+export type ReportedUsage = {
+  harness: string;
+  model: string | null;
+  inputTokens: number | null;
+  outputTokens: number | null;
+  costMicrounits: number | null;
+  currency: string | null;
+};
+
 export type AssignmentReceipt = {
   agentPubkey: string;
   agentOwnerPubkey: string | null;
@@ -63,6 +76,7 @@ export type AssignmentReceipt = {
   estimatedMicrounits: number | null;
   outcome: AssignmentOutcome;
   reviewState: AssignmentReviewState;
+  reportedUsage: ReportedUsage | null;
 };
 
 export type WorkflowRun = {

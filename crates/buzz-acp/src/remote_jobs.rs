@@ -12,7 +12,7 @@ use buzz_core::kind::{
     KIND_JOB_ACCEPTED, KIND_JOB_CANCEL, KIND_JOB_ERROR, KIND_JOB_PROGRESS, KIND_JOB_REQUEST,
     KIND_JOB_RESULT, KIND_MANAGED_AGENT, KIND_STREAM_MESSAGE,
 };
-use buzz_core::marketplace::AgentMarketplace;
+use buzz_core::marketplace::{AgentMarketplace, ReportedUsage};
 use nostr::{
     Alphabet, Event, EventBuilder, EventId, Filter, Keys, Kind, PublicKey, SingleLetterTag, Tag,
 };
@@ -332,8 +332,9 @@ pub async fn post_result(
     rest: &RestClient,
     synthetic: &Event,
     output: String,
+    usage: Option<ReportedUsage>,
 ) -> Result<(), String> {
-    post_terminal(rest, synthetic, "completed", Some(output), None).await
+    post_terminal(rest, synthetic, "completed", Some(output), None, usage).await
 }
 
 /// Persist and deliver a terminal failure without re-executing the accepted job.
@@ -343,7 +344,7 @@ pub async fn post_error(
     outcome: &str,
     error: String,
 ) -> Result<(), String> {
-    post_terminal(rest, synthetic, outcome, None, Some(error)).await
+    post_terminal(rest, synthetic, outcome, None, Some(error), None).await
 }
 
 async fn post_terminal(
@@ -352,6 +353,7 @@ async fn post_terminal(
     outcome: &str,
     output: Option<String>,
     error: Option<String>,
+    usage: Option<ReportedUsage>,
 ) -> Result<(), String> {
     let context = context(synthetic).ok_or_else(|| "missing remote job context".to_string())?;
     let payload = fit_result_payload(JobResultPayload {
@@ -368,6 +370,15 @@ async fn post_terminal(
             value
         }),
         completed_at: chrono::Utc::now().timestamp() as u64,
+        // Advisory: an invalid self-report is dropped rather than failing an
+        // otherwise-deliverable terminal result.
+        usage: usage.and_then(|usage| match usage.normalized() {
+            Ok(usage) => Some(usage),
+            Err(error) => {
+                tracing::warn!(%error, "dropping invalid self-reported usage from remote job result");
+                None
+            }
+        }),
     })?;
     let terminal = build_terminal_event(
         &rest.keys,
@@ -594,6 +605,7 @@ mod tests {
             output: Some("🐝\n".repeat(MAX_JOB_PLAINTEXT_BYTES)),
             error: None,
             completed_at: 1,
+            usage: None,
         })
         .expect("fit result");
         assert!(serde_json::to_vec(&payload).expect("serialize").len() <= MAX_JOB_PLAINTEXT_BYTES);

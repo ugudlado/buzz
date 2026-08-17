@@ -209,6 +209,24 @@ export function formatMicrounits(currency: string, microunits: number) {
   })}`;
 }
 
+/**
+ * "15,500 in / 2,000 out", dropping either side the agent left out. Returns
+ * null when it reported no token counts at all.
+ */
+export function formatReportedTokens(
+  inputTokens: number | null,
+  outputTokens: number | null,
+) {
+  const parts: string[] = [];
+  if (inputTokens !== null) {
+    parts.push(`${inputTokens.toLocaleString()} in`);
+  }
+  if (outputTokens !== null) {
+    parts.push(`${outputTokens.toLocaleString()} out`);
+  }
+  return parts.length > 0 ? parts.join(" / ") : null;
+}
+
 export function formatDurationMs(durationMs: number) {
   if (durationMs < 1_000) return `${durationMs}ms`;
   return `${(durationMs / 1_000).toFixed(durationMs % 1_000 === 0 ? 0 : 1)}s`;

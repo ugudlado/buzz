@@ -17,6 +17,12 @@ pub const TAG_WORKFLOW: &str = "buzz:workflow";
 /// NIP-10 parent (completions reply to the thread root, not the prompt).
 pub const TAG_COMPLETION_OF: &str = "buzz:completion-of";
 
+/// Tag carrying the agent's own JSON-encoded usage estimate for the turn
+/// (a `buzz_core::marketplace::ReportedUsage`) on a harness-posted workflow
+/// completion reply. Self-reported and unverified — the relay persists it
+/// beside, never in place of, its own elapsed-time accounting.
+pub const TAG_USAGE: &str = "buzz:usage";
+
 /// Parsed thread relationship from NIP-10 `e` tags.
 #[derive(Debug, Clone, Default)]
 pub struct ThreadTags {

@@ -1392,6 +1392,18 @@ pub struct AgentStepRecord {
     pub listing_event_id: Option<String>,
     /// When the target relay first accepted the request.
     pub delivered_at: Option<DateTime<Utc>>,
+    /// Self-reported harness that executed the terminal turn.
+    pub usage_harness: Option<String>,
+    /// Self-reported model for the terminal turn.
+    pub usage_model: Option<String>,
+    /// Self-reported turn-level input tokens.
+    pub usage_input_tokens: Option<i64>,
+    /// Self-reported turn-level output tokens.
+    pub usage_output_tokens: Option<i64>,
+    /// Self-reported turn-level cost in integer micro-units.
+    pub usage_cost_microunits: Option<i64>,
+    /// Currency of the self-reported cost.
+    pub usage_cost_currency: Option<String>,
 }
 
 /// Parameters for creating a new agent-assignment step.
@@ -1640,7 +1652,9 @@ pub async fn get_agent_step(
                agent_owner_pubkey, rate_currency, rate_microunits_per_hour,
                prompt_published_at, completion_event_id, terminal_at, duration_ms, outcome,
                request_id, origin_relay_pubkey, agent_relay_pubkey, agent_relay_url,
-               listing_event_id, delivered_at
+               listing_event_id, delivered_at,
+               usage_harness, usage_model, usage_input_tokens, usage_output_tokens,
+               usage_cost_microunits, usage_cost_currency
         FROM workflow_agent_steps
         WHERE community_id = $1 AND prompt_event_id = $2
         "#,
@@ -1667,7 +1681,9 @@ pub async fn list_agent_steps_for_run(
                agent_owner_pubkey, rate_currency, rate_microunits_per_hour,
                prompt_published_at, completion_event_id, terminal_at, duration_ms, outcome,
                request_id, origin_relay_pubkey, agent_relay_pubkey, agent_relay_url,
-               listing_event_id, delivered_at
+               listing_event_id, delivered_at,
+               usage_harness, usage_model, usage_input_tokens, usage_output_tokens,
+               usage_cost_microunits, usage_cost_currency
         FROM workflow_agent_steps
         WHERE community_id = $1 AND run_id = $2
         ORDER BY step_index ASC
@@ -1696,6 +1712,8 @@ pub struct CompleteAgentStepParams<'a> {
     pub terminal_at: DateTime<Utc>,
     /// Marketplace receipt outcome.
     pub outcome: &'a str,
+    /// Validated agent self-report, when the completion carried one.
+    pub usage: Option<&'a buzz_core::marketplace::ReportedUsage>,
 }
 
 /// Atomically complete an agent step and persist its receipt.
@@ -1707,6 +1725,13 @@ pub async fn complete_agent_step_by_prompt_event_id(
     params: CompleteAgentStepParams<'_>,
 ) -> Result<bool> {
     let status_str = params.status.to_string();
+    // Bounds are enforced by the column CHECKs; a self-report that cannot fit
+    // an i64 is dropped rather than allowed to abort the terminal transition.
+    let usage_tokens = |value: Option<u64>| value.and_then(|value| i64::try_from(value).ok());
+    let usage_cost: Option<(i64, &str)> = params.usage.and_then(|usage| {
+        let cost = usage_tokens(usage.cost_microunits)?;
+        Some((cost, usage.currency.as_deref()?))
+    });
     let affected = sqlx::query(
         r#"
         UPDATE workflow_agent_steps
@@ -1718,7 +1743,13 @@ pub async fn complete_agent_step_by_prompt_event_id(
             duration_ms = GREATEST(0, FLOOR(EXTRACT(EPOCH FROM
                 (GREATEST(prompt_published_at, LEAST($4, expires_at)) - prompt_published_at)
             ) * 1000)::BIGINT),
-            outcome = $5
+            outcome = $5,
+            usage_harness = $8,
+            usage_model = $9,
+            usage_input_tokens = $10,
+            usage_output_tokens = $11,
+            usage_cost_microunits = $12,
+            usage_cost_currency = $13
         WHERE community_id = $6 AND prompt_event_id = $7 AND status = 'pending'
         "#,
     )
@@ -1729,6 +1760,21 @@ pub async fn complete_agent_step_by_prompt_event_id(
     .bind(params.outcome)
     .bind(params.community_id.as_uuid())
     .bind(params.prompt_event_id)
+    .bind(params.usage.map(|usage| usage.harness.as_str()))
+    .bind(params.usage.and_then(|usage| usage.model.as_deref()))
+    .bind(
+        params
+            .usage
+            .and_then(|usage| usage_tokens(usage.input_tokens)),
+    )
+    .bind(
+        params
+            .usage
+            .and_then(|usage| usage_tokens(usage.output_tokens)),
+    )
+    // Cost and currency move together so the column pair CHECK always holds.
+    .bind(usage_cost.map(|(cost, _)| cost))
+    .bind(usage_cost.map(|(_, currency)| currency))
     .execute(pool)
     .await?
     .rows_affected();
@@ -1755,6 +1801,7 @@ pub async fn update_agent_step_by_prompt_event_id(
             completion_event_id: None,
             terminal_at: Utc::now(),
             outcome: "completed",
+            usage: None,
         },
     )
     .await
@@ -2021,6 +2068,12 @@ fn row_to_agent_step_record(row: sqlx::postgres::PgRow) -> Result<AgentStepRecor
         agent_relay_url: row.try_get("agent_relay_url")?,
         listing_event_id: row.try_get("listing_event_id")?,
         delivered_at: row.try_get("delivered_at")?,
+        usage_harness: row.try_get("usage_harness")?,
+        usage_model: row.try_get("usage_model")?,
+        usage_input_tokens: row.try_get("usage_input_tokens")?,
+        usage_output_tokens: row.try_get("usage_output_tokens")?,
+        usage_cost_microunits: row.try_get("usage_cost_microunits")?,
+        usage_cost_currency: row.try_get("usage_cost_currency")?,
     })
 }
 
@@ -3329,6 +3382,101 @@ mod tests {
         assert!(record.prompt_published_at.is_some());
         assert_eq!(record.status, AgentStepStatus::Pending);
         assert!(record.output.is_none());
+    }
+
+    /// The terminal transition persists the agent's self-reported usage
+    /// alongside the relay-observed elapsed-time receipt, and a completion
+    /// with no self-report leaves every usage column null.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn agent_step_completion_persists_reported_usage() {
+        let pool = setup_pool().await;
+        let community = make_community(&pool).await;
+        let (workflow_id, _) = make_workflow_in(&pool, community).await;
+        let expires_at = Utc::now() + chrono::Duration::minutes(30);
+
+        let reported = buzz_core::marketplace::ReportedUsage {
+            harness: "goose".into(),
+            model: Some("claude-fable-5".into()),
+            input_tokens: Some(1_200),
+            output_tokens: Some(340),
+            cost_microunits: Some(15_000),
+            currency: Some("USD".into()),
+        };
+        let with_usage = format!("evt-{}", Uuid::new_v4().simple());
+        make_pending_agent_step(
+            &pool,
+            community,
+            workflow_id,
+            &with_usage,
+            &[0x51; 32],
+            expires_at,
+        )
+        .await;
+        assert!(complete_agent_step_by_prompt_event_id(
+            &pool,
+            CompleteAgentStepParams {
+                community_id: community,
+                prompt_event_id: &with_usage,
+                status: AgentStepStatus::Done,
+                output: None,
+                completion_event_id: Some("completion-id"),
+                terminal_at: Utc::now(),
+                outcome: "completed",
+                usage: Some(&reported),
+            },
+        )
+        .await
+        .expect("complete with usage"));
+
+        let record = get_agent_step(&pool, community, &with_usage)
+            .await
+            .expect("get step with usage");
+        assert_eq!(record.usage_harness.as_deref(), Some("goose"));
+        assert_eq!(record.usage_model.as_deref(), Some("claude-fable-5"));
+        assert_eq!(record.usage_input_tokens, Some(1_200));
+        assert_eq!(record.usage_output_tokens, Some(340));
+        assert_eq!(record.usage_cost_microunits, Some(15_000));
+        assert_eq!(record.usage_cost_currency.as_deref(), Some("USD"));
+        // The elapsed-time receipt is unaffected by the self-report.
+        assert_eq!(record.rate_microunits_per_hour, Some(12_000_000));
+        assert_eq!(record.outcome.as_deref(), Some("completed"));
+
+        let without_usage = format!("evt-{}", Uuid::new_v4().simple());
+        make_pending_agent_step(
+            &pool,
+            community,
+            workflow_id,
+            &without_usage,
+            &[0x52; 32],
+            expires_at,
+        )
+        .await;
+        assert!(complete_agent_step_by_prompt_event_id(
+            &pool,
+            CompleteAgentStepParams {
+                community_id: community,
+                prompt_event_id: &without_usage,
+                status: AgentStepStatus::Done,
+                output: None,
+                completion_event_id: Some("completion-id"),
+                terminal_at: Utc::now(),
+                outcome: "completed",
+                usage: None,
+            },
+        )
+        .await
+        .expect("complete without usage"));
+
+        let record = get_agent_step(&pool, community, &without_usage)
+            .await
+            .expect("get step without usage");
+        assert_eq!(record.usage_harness, None);
+        assert_eq!(record.usage_model, None);
+        assert_eq!(record.usage_input_tokens, None);
+        assert_eq!(record.usage_output_tokens, None);
+        assert_eq!(record.usage_cost_microunits, None);
+        assert_eq!(record.usage_cost_currency, None);
     }
 
     /// A single successful CAS transition writes both the new status and the

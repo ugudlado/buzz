@@ -8,6 +8,7 @@ use crate::kind::{
     event_kind_u32, KIND_JOB_ACCEPTED, KIND_JOB_CANCEL, KIND_JOB_ERROR, KIND_JOB_PROGRESS,
     KIND_JOB_REQUEST, KIND_JOB_RESULT,
 };
+use crate::marketplace::ReportedUsage;
 use crate::observer::{
     content_looks_like_nip44, decrypt_observer_payload, encrypt_observer_payload,
     ObserverPayloadError, OBSERVER_MAX_PLAINTEXT_LEN,
@@ -91,6 +92,9 @@ pub struct JobResultPayload {
     pub error: Option<String>,
     /// Unix-second completion time.
     pub completed_at: u64,
+    /// Agent's self-reported usage estimate for the turn, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<ReportedUsage>,
 }
 
 /// Errors returned by job event helpers.
@@ -411,6 +415,9 @@ fn validate_result_payload(payload: &JobResultPayload) -> Result<(), JobError> {
             "error exceeds {MAX_JOB_ERROR_BYTES} bytes"
         )));
     }
+    if let Some(usage) = payload.usage.clone() {
+        usage.normalized().map_err(JobError::InvalidPayload)?;
+    }
     validate_serialized_size(payload)
 }
 
@@ -543,11 +550,59 @@ mod tests {
                 output: Some("Looks good".into()),
                 error: None,
                 completed_at: now + 1,
+                usage: Some(ReportedUsage {
+                    harness: "goose".into(),
+                    model: Some("claude-fable-5".into()),
+                    input_tokens: Some(1_200),
+                    output_tokens: Some(340),
+                    cost_microunits: Some(15_000),
+                    currency: Some("USD".into()),
+                }),
             },
         )
         .expect("build result");
         let (_, decoded) = decrypt_terminal_event(&result, &relay).expect("decrypt result");
         assert_eq!(decoded.output.as_deref(), Some("Looks good"));
+        assert_eq!(
+            decoded.usage.as_ref().map(|usage| usage.harness.as_str()),
+            Some("goose")
+        );
+        assert_eq!(
+            decoded.usage.and_then(|usage| usage.cost_microunits),
+            Some(15_000)
+        );
+    }
+
+    #[test]
+    fn result_payload_usage_is_optional_and_validated() {
+        let without_usage = JobResultPayload {
+            outcome: "completed".into(),
+            output: Some("Done.".into()),
+            error: None,
+            completed_at: 1,
+            usage: None,
+        };
+        let json = serde_json::to_value(&without_usage).expect("serialize payload");
+        assert!(json.get("usage").is_none());
+        assert_eq!(
+            serde_json::from_value::<JobResultPayload>(json).expect("round trip"),
+            without_usage
+        );
+        assert!(validate_result_payload(&without_usage).is_ok());
+
+        // A currency without a cost violates the ReportedUsage pair rule.
+        let invalid = JobResultPayload {
+            usage: Some(ReportedUsage {
+                harness: "goose".into(),
+                model: None,
+                input_tokens: None,
+                output_tokens: None,
+                cost_microunits: None,
+                currency: Some("USD".into()),
+            }),
+            ..without_usage
+        };
+        assert!(validate_result_payload(&invalid).is_err());
     }
 
     #[test]
