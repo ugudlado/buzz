@@ -57,6 +57,8 @@ export type StepFormState = {
   timeout?: string;
   agent?: string;
   agentPubkey?: string;
+  agentRelayPubkey?: string;
+  agentRelayUrl?: string;
   instruction?: string;
 };
 
@@ -176,6 +178,9 @@ function actionFieldsForStep(step: StepFormState): Record<string, unknown> {
     case "assign_to_agent":
       if (step.agent) fields.agent = step.agent;
       if (step.agentPubkey) fields.agent_pubkey = step.agentPubkey;
+      if (step.agentRelayPubkey)
+        fields.agent_relay_pubkey = step.agentRelayPubkey;
+      if (step.agentRelayUrl) fields.agent_relay_url = step.agentRelayUrl;
       if (step.instruction) fields.instruction = step.instruction;
       if (step.timeout) fields.timeout = step.timeout;
       break;
@@ -308,6 +313,8 @@ export function yamlToFormState(
         timeout: step.timeout as string | undefined,
         agent: step.agent as string | undefined,
         agentPubkey: step.agent_pubkey as string | undefined,
+        agentRelayPubkey: step.agent_relay_pubkey as string | undefined,
+        agentRelayUrl: step.agent_relay_url as string | undefined,
         instruction: step.instruction as string | undefined,
       }),
     );

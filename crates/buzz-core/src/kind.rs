@@ -139,7 +139,16 @@ pub const AUTHOR_ONLY_KINDS: &[u32] = &[
 ///
 /// Used by `filter_can_match_result_gated_kinds` to force the per-event
 /// fallback path in COUNT rather than the fast SQL `count_events()`.
-pub const RESULT_GATED_KINDS: &[u32] = &[KIND_DM_VISIBILITY, KIND_AGENT_TURN_METRIC];
+pub const RESULT_GATED_KINDS: &[u32] = &[
+    KIND_DM_VISIBILITY,
+    KIND_JOB_REQUEST,
+    KIND_JOB_ACCEPTED,
+    KIND_JOB_PROGRESS,
+    KIND_JOB_RESULT,
+    KIND_JOB_CANCEL,
+    KIND_JOB_ERROR,
+    KIND_AGENT_TURN_METRIC,
+];
 
 /// Kinds whose stored events have `#p`-bound read access — readable only by
 /// subscribers whose pubkey appears in the event's `#p` tag.
@@ -162,6 +171,12 @@ pub const P_GATED_KINDS: &[u32] = &[
     KIND_MEMBER_REMOVED_NOTIFICATION,
     KIND_GIFT_WRAP,
     KIND_DM_VISIBILITY,
+    KIND_JOB_REQUEST,
+    KIND_JOB_ACCEPTED,
+    KIND_JOB_PROGRESS,
+    KIND_JOB_RESULT,
+    KIND_JOB_CANCEL,
+    KIND_JOB_ERROR,
     // NIP-AM: agent turn metrics are encrypted to the owner and must not be
     // readable by any unauthenticated or non-owner party, including via `ids`
     // filters — see NIP-AM §Relay Behavior.

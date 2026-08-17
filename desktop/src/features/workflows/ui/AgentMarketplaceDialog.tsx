@@ -34,6 +34,10 @@ export function AgentMarketplaceDialog({
     React.useState<ManagedAgentMarketplace["deployment"]>("local");
   const [currency, setCurrency] = React.useState("");
   const [rate, setRate] = React.useState("");
+  const [remoteMode, setRemoteMode] = React.useState<
+    "off" | "any" | "allowlist"
+  >("off");
+  const [remoteRelays, setRemoteRelays] = React.useState("");
 
   React.useEffect(() => {
     if (!open) return;
@@ -42,6 +46,18 @@ export function AgentMarketplaceDialog({
     setDeployment(current?.deployment ?? "local");
     setCurrency(current?.pricing?.currency ?? "");
     setRate(current?.pricing?.microunits_per_hour.toString() ?? "");
+    setRemoteMode(
+      current?.remote_invocation?.policy === "any_community"
+        ? "any"
+        : current?.remote_invocation?.policy === "allowlist"
+          ? "allowlist"
+          : "off",
+    );
+    setRemoteRelays(
+      current?.remote_invocation?.policy === "allowlist"
+        ? current.remote_invocation.relay_pubkeys.join(", ")
+        : "",
+    );
   }, [current, open]);
 
   const parsedRate = rate === "" ? null : Number(rate);
@@ -50,6 +66,15 @@ export function AgentMarketplaceDialog({
     (/^[A-Z]{3}$/.test(currency) &&
       Number.isSafeInteger(parsedRate) &&
       (parsedRate as number) >= 0);
+  const parsedRemoteRelays = remoteRelays
+    .split(",")
+    .map((value) => value.trim().toLowerCase())
+    .filter(Boolean);
+  const remoteValid =
+    remoteMode !== "allowlist" ||
+    (parsedRemoteRelays.length > 0 &&
+      parsedRemoteRelays.length <= 100 &&
+      parsedRemoteRelays.every((value) => /^[0-9a-f]{64}$/.test(value)));
 
   return (
     <Dialog onOpenChange={onOpenChange} open={open}>
@@ -137,13 +162,45 @@ export function AgentMarketplaceDialog({
               />
             </label>
           </div>
+          <label
+            className="block space-y-1 text-xs"
+            htmlFor="agent-listing-remote-policy"
+          >
+            <span>Other communities</span>
+            <select
+              className="h-9 w-full rounded-md border bg-background px-3"
+              id="agent-listing-remote-policy"
+              onChange={(event) =>
+                setRemoteMode(event.target.value as "off" | "any" | "allowlist")
+              }
+              value={remoteMode}
+            >
+              <option value="off">Discovery only</option>
+              <option value="any">Allow invocation from any community</option>
+              <option value="allowlist">Allow specific relay identities</option>
+            </select>
+          </label>
+          {remoteMode === "allowlist" ? (
+            <label
+              className="block space-y-1 text-xs"
+              htmlFor="agent-listing-remote-relays"
+            >
+              <span>Allowed relay pubkeys (comma-separated)</span>
+              <Textarea
+                id="agent-listing-remote-relays"
+                onChange={(event) => setRemoteRelays(event.target.value)}
+                placeholder="64-character NIP-11 relay pubkeys"
+                value={remoteRelays}
+              />
+            </label>
+          ) : null}
         </div>
         <DialogFooter>
           <Button onClick={() => onOpenChange(false)} variant="ghost">
             Cancel
           </Button>
           <Button
-            disabled={!agent || !priceValid || pending}
+            disabled={!agent || !priceValid || !remoteValid || pending}
             onClick={() =>
               onSave({
                 listed: true,
@@ -160,6 +217,15 @@ export function AgentMarketplaceDialog({
                         currency,
                         microunits_per_hour: parsedRate,
                       },
+                remote_invocation:
+                  remoteMode === "any"
+                    ? { policy: "any_community" }
+                    : remoteMode === "allowlist"
+                      ? {
+                          policy: "allowlist",
+                          relay_pubkeys: parsedRemoteRelays,
+                        }
+                      : null,
               })
             }
           >

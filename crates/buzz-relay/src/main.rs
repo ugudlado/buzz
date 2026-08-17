@@ -1148,6 +1148,29 @@ async fn main() -> anyhow::Result<()> {
 
                 match sweep_state.db.sweep_expired_agent_steps(100).await {
                     Ok(expired) => {
+                        for item in &expired {
+                            match sweep_state
+                                .db
+                                .get_agent_step(item.community_id, &item.prompt_event_id)
+                                .await
+                            {
+                                Ok(step) => {
+                                    if let Err(error) =
+                                        buzz_relay::remote_jobs::publish_cancellation(
+                                            &sweep_state,
+                                            item.community_id,
+                                            &step,
+                                        )
+                                        .await
+                                    {
+                                        tracing::warn!(run_id = %item.run_id, %error, "expired remote assignment cancellation delivery failed");
+                                    }
+                                }
+                                Err(error) => {
+                                    tracing::warn!(run_id = %item.run_id, %error, "expired assignment receipt reload failed")
+                                }
+                            }
+                        }
                         if !expired.is_empty() {
                             tracing::info!(
                                 count = expired.len(),
@@ -1157,6 +1180,16 @@ async fn main() -> anyhow::Result<()> {
                     }
                     Err(e) => {
                         tracing::error!("Agent-step expiry sweep tick failed: {e}");
+                    }
+                }
+
+                match buzz_relay::remote_jobs::retry_due_deliveries(&sweep_state).await {
+                    Ok(count) if count > 0 => {
+                        tracing::info!(count, "Retried cross-community agent-job deliveries");
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::error!("Remote agent-job delivery tick failed: {e}");
                     }
                 }
 

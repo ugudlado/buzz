@@ -5,6 +5,63 @@ use serde::{Deserialize, Serialize};
 /// Largest exact integer shared by Rust's JSON values and JavaScript clients.
 pub const MAX_MICROUNITS: u64 = 9_007_199_254_740_991;
 
+/// Maximum number of relay identities in a remote-invocation allowlist.
+pub const MAX_REMOTE_RELAY_ALLOWLIST: usize = 100;
+
+/// Which external Buzz communities may invoke a listed agent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "policy", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RemoteInvocationPolicy {
+    /// Any authenticated Buzz community relay may submit work.
+    AnyCommunity,
+    /// Only the listed relay identities may submit work.
+    Allowlist {
+        /// NIP-11 `self` pubkeys of allowed communities.
+        relay_pubkeys: Vec<String>,
+    },
+}
+
+impl RemoteInvocationPolicy {
+    /// Validate and normalize relay identities.
+    pub fn normalized(self) -> Result<Self, String> {
+        let Self::Allowlist { relay_pubkeys } = self else {
+            return Ok(self);
+        };
+        if relay_pubkeys.is_empty() || relay_pubkeys.len() > MAX_REMOTE_RELAY_ALLOWLIST {
+            return Err(format!(
+                "remote invocation allowlist must contain 1–{MAX_REMOTE_RELAY_ALLOWLIST} relay pubkeys"
+            ));
+        }
+        let mut normalized = Vec::with_capacity(relay_pubkeys.len());
+        for relay_pubkey in relay_pubkeys {
+            let relay_pubkey = relay_pubkey.trim().to_lowercase();
+            if relay_pubkey.len() != 64
+                || !relay_pubkey.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err(
+                    "remote invocation relay pubkeys must be 64 lowercase hex characters".into(),
+                );
+            }
+            if !normalized.contains(&relay_pubkey) {
+                normalized.push(relay_pubkey);
+            }
+        }
+        Ok(Self::Allowlist {
+            relay_pubkeys: normalized,
+        })
+    }
+
+    /// Return whether `relay_pubkey` is permitted by this policy.
+    pub fn allows(&self, relay_pubkey: &str) -> bool {
+        match self {
+            Self::AnyCommunity => true,
+            Self::Allowlist { relay_pubkeys } => {
+                relay_pubkeys.iter().any(|allowed| allowed == relay_pubkey)
+            }
+        }
+    }
+}
+
 /// Deployment label shown in the community agent catalog.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -73,6 +130,9 @@ pub struct AgentMarketplace {
     /// Optional duration-based rate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pricing: Option<HourlyRate>,
+    /// Explicit opt-in policy for work originating in another community.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_invocation: Option<RemoteInvocationPolicy>,
 }
 
 impl AgentMarketplace {
@@ -101,6 +161,10 @@ impl AgentMarketplace {
         }
         self.capabilities = normalized;
         self.pricing = self.pricing.map(HourlyRate::normalized).transpose()?;
+        self.remote_invocation = self
+            .remote_invocation
+            .map(RemoteInvocationPolicy::normalized)
+            .transpose()?;
         Ok(self)
     }
 }
@@ -118,6 +182,9 @@ pub struct WorkflowMarketplace {
     /// Optional fixed customer-facing display price.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fixed_price: Option<FixedPrice>,
+    /// Source kind:30620 event for an installed marketplace snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_event_id: Option<String>,
 }
 
 impl WorkflowMarketplace {
@@ -127,6 +194,12 @@ impl WorkflowMarketplace {
         if self.summary.chars().count() > 500 {
             return Err("marketplace workflow summary must be at most 500 characters".into());
         }
+        if self.origin_event_id.as_ref().is_some_and(|event_id| {
+            event_id.len() != 64 || !event_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+        }) {
+            return Err("marketplace workflow origin event id must be 64 hex characters".into());
+        }
+        self.origin_event_id = self.origin_event_id.map(|value| value.to_lowercase());
         self.fixed_price = self.fixed_price.map(FixedPrice::normalized).transpose()?;
         Ok(self)
     }
@@ -172,12 +245,21 @@ mod tests {
                 currency: "USD".into(),
                 microunits_per_hour: 12_000_000,
             }),
+            remote_invocation: Some(RemoteInvocationPolicy::Allowlist {
+                relay_pubkeys: vec!["A".repeat(64), "a".repeat(64)],
+            }),
         }
         .normalized()
         .unwrap();
 
         assert_eq!(listing.description, "Rust review");
         assert_eq!(listing.capabilities, ["rust", "review"]);
+        assert_eq!(
+            listing.remote_invocation,
+            Some(RemoteInvocationPolicy::Allowlist {
+                relay_pubkeys: vec!["a".repeat(64)]
+            })
+        );
         assert!(HourlyRate {
             currency: "usd".into(),
             microunits_per_hour: 1,

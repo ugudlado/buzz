@@ -1,4 +1,7 @@
-import type { MarketplaceAgent } from "@/shared/api/marketplace";
+import type {
+  MarketplaceAgent,
+  MarketplaceWorkflow,
+} from "@/shared/api/marketplace";
 import type { PresenceLookup } from "@/shared/api/types";
 import type { AssignmentReceipt } from "@/shared/api/workflowTypes";
 
@@ -11,6 +14,7 @@ export type WorkflowMarketplaceMetadata = {
 export type WorkflowAgentDependency = {
   name: string;
   pubkey: string | null;
+  relayPubkey: string | null;
   state: "online" | "away" | "offline" | "unknown" | "missing";
 };
 
@@ -75,13 +79,35 @@ export function getWorkflowMarketplace(
   return { listed: true, summary, fixedPrice };
 }
 
+export function installMarketplaceWorkflowSnapshot(
+  workflow: MarketplaceWorkflow,
+): Record<string, unknown> | null {
+  const relayPubkey = workflow.sourceCommunity.relayPubkey;
+  if (!relayPubkey) return null;
+
+  const definition = structuredClone(workflow.definition);
+  const steps = Array.isArray(definition.steps) ? definition.steps : [];
+  for (const candidate of steps) {
+    const step = asRecord(candidate);
+    if (step?.action !== "assign_to_agent" || step.agent_relay_pubkey) continue;
+    if (typeof step.agent_pubkey !== "string") return null;
+    step.agent_relay_pubkey = relayPubkey;
+    step.agent_relay_url = workflow.sourceCommunity.relayUrl;
+  }
+  definition.marketplace = {
+    ...(asRecord(definition.marketplace) ?? {}),
+    listed: false,
+    origin_event_id: workflow.eventId,
+  };
+  return definition;
+}
+
 export function getWorkflowAgentDependencies(
   definition: Record<string, unknown>,
   agents: readonly MarketplaceAgent[],
   presence: PresenceLookup | undefined,
   presenceLoaded: boolean,
 ): WorkflowAgentDependency[] {
-  const listedPubkeys = new Set(agents.map((agent) => agent.pubkey));
   const dependencies = new Map<string, WorkflowAgentDependency>();
   const steps = Array.isArray(definition.steps) ? definition.steps : [];
 
@@ -93,14 +119,34 @@ export function getWorkflowAgentDependencies(
       typeof step.agent_pubkey === "string"
         ? step.agent_pubkey.trim().toLowerCase()
         : null;
-    const key = pubkey || `name:${name}`;
+    const relayPubkey =
+      typeof step.agent_relay_pubkey === "string"
+        ? step.agent_relay_pubkey.trim().toLowerCase()
+        : null;
+    const key = pubkey ? `${relayPubkey ?? "local"}:${pubkey}` : `name:${name}`;
     if (dependencies.has(key)) continue;
 
     let state: WorkflowAgentDependency["state"] = "missing";
-    if (pubkey && listedPubkeys.has(pubkey)) {
-      state = presenceLoaded ? (presence?.[pubkey] ?? "offline") : "unknown";
+    if (
+      pubkey &&
+      agents.some(
+        (agent) =>
+          agent.pubkey === pubkey &&
+          (!relayPubkey || agent.sourceCommunity?.relayPubkey === relayPubkey),
+      )
+    ) {
+      state = relayPubkey
+        ? "unknown"
+        : presenceLoaded
+          ? (presence?.[pubkey] ?? "offline")
+          : "unknown";
     }
-    dependencies.set(key, { name: name || "Agent", pubkey, state });
+    dependencies.set(key, {
+      name: name || "Agent",
+      pubkey,
+      relayPubkey,
+      state,
+    });
   }
 
   return [...dependencies.values()];

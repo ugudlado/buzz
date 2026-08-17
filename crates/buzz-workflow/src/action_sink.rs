@@ -52,6 +52,28 @@ pub struct AgentMarketplaceSnapshot {
     pub rate_currency: Option<String>,
     /// Integer micro-units per hour, absent for an unpriced listing.
     pub rate_microunits_per_hour: Option<u64>,
+    /// Exact managed-agent listing used for a remote dispatch.
+    pub listing_event_id: Option<String>,
+}
+
+/// Immutable home-relay coordinate for a remote managed agent.
+#[derive(Debug, Clone)]
+pub struct AgentRelayCoordinate {
+    /// NIP-11 `self` pubkey of the agent's home relay.
+    pub relay_pubkey: Vec<u8>,
+    /// Verified absolute `wss://` URL of the agent's home relay.
+    pub relay_url: String,
+}
+
+/// Extra wire data needed when an assignment leaves this community.
+#[derive(Debug, Clone)]
+pub struct RemoteAgentAssignment {
+    /// Agent home-relay coordinate.
+    pub coordinate: AgentRelayCoordinate,
+    /// Exact listing accepted at dispatch.
+    pub listing_event_id: String,
+    /// Plaintext instruction that will be encrypted for the target agent.
+    pub instruction: String,
 }
 
 /// Durable assignment data armed immediately before its prompt is published.
@@ -79,6 +101,8 @@ pub struct AgentAssignmentArm {
     pub trace_prefix: Vec<serde_json::Value>,
     /// Unix-second timestamp captured when this step began.
     pub step_started_at: i64,
+    /// Present only for a cross-community job request.
+    pub remote: Option<RemoteAgentAssignment>,
 }
 
 /// The NIP-10 thread root a new `assign_to_agent` prompt should reply to, so
@@ -178,6 +202,7 @@ pub trait ActionSink: Send + Sync {
         &'a self,
         community_id: CommunityId,
         agent_pubkey: &'a [u8],
+        coordinate: Option<&'a AgentRelayCoordinate>,
     ) -> Pin<
         Box<
             dyn Future<Output = Result<Option<AgentMarketplaceSnapshot>, ActionSinkError>>

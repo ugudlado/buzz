@@ -1,9 +1,19 @@
 import { relayClient } from "@/shared/api/relayClient";
 import { withReadOnlyRelayClient } from "@/shared/api/readOnlyRelayClient";
+import { fetchCommunityRelaySelf } from "@/shared/api/communityProfile";
 import type { RelayEvent } from "@/shared/api/types";
-import { KIND_MANAGED_AGENT } from "@/shared/constants/kinds";
+import {
+  KIND_MANAGED_AGENT,
+  KIND_WORKFLOW_DEF,
+} from "@/shared/constants/kinds";
+import { parse as parseYaml } from "yaml";
 
 const MAX_MICROUNITS = Number.MAX_SAFE_INTEGER;
+const HEX_PUBKEY = /^[0-9a-f]{64}$/;
+
+export type RemoteInvocationPolicy =
+  | { policy: "any_community" }
+  | { policy: "allowlist"; relay_pubkeys: string[] };
 
 export type MarketplaceAgent = {
   pubkey: string;
@@ -17,6 +27,7 @@ export type MarketplaceAgent = {
     microunitsPerHour: number;
   } | null;
   directUse: "community" | "restricted" | "owner";
+  remoteInvocation: RemoteInvocationPolicy | null;
   sourceCommunity?: MarketplaceCommunity;
 };
 
@@ -24,6 +35,17 @@ export type MarketplaceCommunity = {
   id: string;
   name: string;
   relayUrl: string;
+  relayPubkey?: string;
+};
+
+export type MarketplaceWorkflow = {
+  eventId: string;
+  workflowId: string;
+  name: string;
+  ownerPubkey: string;
+  definition: Record<string, unknown>;
+  createdAt: number;
+  sourceCommunity: MarketplaceCommunity;
 };
 
 export type ManagedAgentMarketplace = {
@@ -32,6 +54,7 @@ export type ManagedAgentMarketplace = {
   capabilities: string[];
   deployment: "local" | "remote" | "kubernetes";
   pricing?: { currency: string; microunits_per_hour: number } | null;
+  remote_invocation?: RemoteInvocationPolicy | null;
 };
 
 export const MARKETPLACE_AGENT_FILTER = {
@@ -39,10 +62,24 @@ export const MARKETPLACE_AGENT_FILTER = {
   limit: 500,
 };
 
+export const MARKETPLACE_WORKFLOW_FILTER = {
+  kinds: [KIND_WORKFLOW_DEF],
+  limit: 500,
+};
+
 export const marketplaceAgentQueryKey = (
   communities: readonly MarketplaceCommunity[],
 ) => [
   "marketplace-agents",
+  ...communities
+    .map(({ id, name, relayUrl }) => `${id}:${name}:${relayUrl}`)
+    .sort(),
+];
+
+export const marketplaceWorkflowQueryKey = (
+  communities: readonly MarketplaceCommunity[],
+) => [
+  "marketplace-workflows",
   ...communities
     .map(({ id, name, relayUrl }) => `${id}:${name}:${relayUrl}`)
     .sort(),
@@ -80,7 +117,7 @@ function isSafeMicrounits(value: unknown): value is number {
 
 function parseMarketplaceAgent(event: RelayEvent): MarketplaceAgent | null {
   const pubkey = event.tags.find((tag) => tag[0] === "d")?.[1]?.toLowerCase();
-  if (!pubkey || !/^[0-9a-f]{64}$/.test(pubkey)) return null;
+  if (!pubkey || !HEX_PUBKEY.test(pubkey)) return null;
 
   let content: unknown;
   try {
@@ -130,6 +167,30 @@ function parseMarketplaceAgent(event: RelayEvent): MarketplaceAgent | null {
     };
   }
 
+  const rawRemoteInvocation = marketplace.remote_invocation;
+  let remoteInvocation: RemoteInvocationPolicy | null = null;
+  if (rawRemoteInvocation !== undefined && rawRemoteInvocation !== null) {
+    if (!isRecord(rawRemoteInvocation)) return null;
+    if (rawRemoteInvocation.policy === "any_community") {
+      remoteInvocation = { policy: "any_community" };
+    } else if (
+      rawRemoteInvocation.policy === "allowlist" &&
+      Array.isArray(rawRemoteInvocation.relay_pubkeys) &&
+      rawRemoteInvocation.relay_pubkeys.length > 0 &&
+      rawRemoteInvocation.relay_pubkeys.length <= 100 &&
+      rawRemoteInvocation.relay_pubkeys.every(
+        (pubkey) => typeof pubkey === "string" && HEX_PUBKEY.test(pubkey),
+      )
+    ) {
+      remoteInvocation = {
+        policy: "allowlist",
+        relay_pubkeys: rawRemoteInvocation.relay_pubkeys as string[],
+      };
+    } else {
+      return null;
+    }
+  }
+
   const respondTo = content.respond_to;
   return {
     pubkey,
@@ -141,6 +202,7 @@ function parseMarketplaceAgent(event: RelayEvent): MarketplaceAgent | null {
     ),
     deployment,
     pricing,
+    remoteInvocation,
     directUse:
       respondTo === "anyone"
         ? "community"
@@ -159,7 +221,7 @@ export function parseMarketplaceAgents(
   for (const event of events) {
     if (event.kind !== KIND_MANAGED_AGENT) continue;
     const pubkey = event.tags.find((tag) => tag[0] === "d")?.[1]?.toLowerCase();
-    if (!pubkey || !/^[0-9a-f]{64}$/.test(pubkey)) continue;
+    if (!pubkey || !HEX_PUBKEY.test(pubkey)) continue;
     const coordinate = `${event.pubkey.toLowerCase()}:${pubkey}`;
     const previous = latestByCoordinate.get(coordinate);
     if (
@@ -182,19 +244,110 @@ export function parseMarketplaceAgents(
     .sort((left, right) => left.name.localeCompare(right.name));
 }
 
+export function parseMarketplaceWorkflows(
+  events: readonly RelayEvent[],
+  sourceCommunity: MarketplaceCommunity,
+): MarketplaceWorkflow[] {
+  const latestByCoordinate = new Map<string, RelayEvent>();
+  for (const event of events) {
+    if (event.kind !== KIND_WORKFLOW_DEF) continue;
+    const workflowId = event.tags.find((tag) => tag[0] === "d")?.[1];
+    if (!workflowId) continue;
+    const coordinate = `${event.pubkey.toLowerCase()}:${workflowId}`;
+    const previous = latestByCoordinate.get(coordinate);
+    if (
+      previous &&
+      (previous.created_at > event.created_at ||
+        (previous.created_at === event.created_at &&
+          previous.id.localeCompare(event.id) >= 0))
+    ) {
+      continue;
+    }
+    latestByCoordinate.set(coordinate, event);
+  }
+
+  return [...latestByCoordinate.values()]
+    .map((event): MarketplaceWorkflow | null => {
+      let definition: unknown;
+      try {
+        definition = parseYaml(event.content);
+      } catch {
+        return null;
+      }
+      if (!isRecord(definition) || typeof definition.name !== "string") {
+        return null;
+      }
+      const listing = isRecord(definition.marketplace)
+        ? definition.marketplace
+        : null;
+      if (listing?.listed !== true || typeof listing.summary !== "string") {
+        return null;
+      }
+      const workflowId = event.tags.find((tag) => tag[0] === "d")?.[1];
+      if (!workflowId) return null;
+      return {
+        eventId: event.id.toLowerCase(),
+        workflowId,
+        name: definition.name.trim() || workflowId,
+        ownerPubkey: event.pubkey.toLowerCase(),
+        definition,
+        createdAt: event.created_at,
+        sourceCommunity,
+      };
+    })
+    .filter((workflow): workflow is MarketplaceWorkflow => workflow !== null)
+    .sort((left, right) => left.name.localeCompare(right.name));
+}
+
 export async function getMarketplaceAgents(
   communities: readonly MarketplaceCommunity[],
   activeRelayUrl: string,
 ): Promise<MarketplaceAgent[]> {
   const results = await Promise.allSettled(
     communities.map(async (community) => {
-      const events =
+      const [events, relayPubkey] = await Promise.all([
         community.relayUrl === activeRelayUrl
-          ? await relayClient.fetchEvents(MARKETPLACE_AGENT_FILTER)
-          : await withReadOnlyRelayClient(community.relayUrl, (client) =>
+          ? relayClient.fetchEvents(MARKETPLACE_AGENT_FILTER)
+          : withReadOnlyRelayClient(community.relayUrl, (client) =>
               client.fetchEvents(MARKETPLACE_AGENT_FILTER),
-            );
-      return parseMarketplaceAgents(events, community);
+            ),
+        fetchCommunityRelaySelf(community.relayUrl).catch(() => null),
+      ]);
+      return parseMarketplaceAgents(events, {
+        ...community,
+        relayPubkey: relayPubkey ?? undefined,
+      });
+    }),
+  );
+  if (
+    results.length > 0 &&
+    results.every((result) => result.status === "rejected")
+  ) {
+    throw results[0].reason;
+  }
+  return results
+    .flatMap((result) => (result.status === "fulfilled" ? result.value : []))
+    .sort((left, right) => left.name.localeCompare(right.name));
+}
+
+export async function getMarketplaceWorkflows(
+  communities: readonly MarketplaceCommunity[],
+  activeRelayUrl: string,
+): Promise<MarketplaceWorkflow[]> {
+  const results = await Promise.allSettled(
+    communities.map(async (community) => {
+      const [events, relayPubkey] = await Promise.all([
+        community.relayUrl === activeRelayUrl
+          ? relayClient.fetchEvents(MARKETPLACE_WORKFLOW_FILTER)
+          : withReadOnlyRelayClient(community.relayUrl, (client) =>
+              client.fetchEvents(MARKETPLACE_WORKFLOW_FILTER),
+            ),
+        fetchCommunityRelaySelf(community.relayUrl).catch(() => null),
+      ]);
+      return parseMarketplaceWorkflows(events, {
+        ...community,
+        relayPubkey: relayPubkey ?? undefined,
+      });
     }),
   );
   if (

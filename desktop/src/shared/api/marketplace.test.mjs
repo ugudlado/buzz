@@ -3,9 +3,12 @@ import test from "node:test";
 
 import {
   MARKETPLACE_AGENT_FILTER,
+  MARKETPLACE_WORKFLOW_FILTER,
   marketplaceAgentQueryKey,
+  marketplaceWorkflowQueryKey,
   marketplacePresenceTargets,
   parseMarketplaceAgents,
+  parseMarketplaceWorkflows,
 } from "./marketplace.ts";
 
 const AGENT = "11".repeat(32);
@@ -25,6 +28,10 @@ function event(content, createdAt = 1, id = "a") {
 
 test("catalog query is explicitly scoped to managed-agent events", () => {
   assert.deepEqual(MARKETPLACE_AGENT_FILTER, { kinds: [30177], limit: 500 });
+  assert.deepEqual(MARKETPLACE_WORKFLOW_FILTER, {
+    kinds: [30620],
+    limit: 500,
+  });
 });
 
 test("catalog cache key includes the joined communities", () => {
@@ -35,6 +42,53 @@ test("catalog cache key includes the joined communities", () => {
     marketplaceAgentQueryKey([
       { id: "b", name: "B", relayUrl: "wss://community-b.example" },
     ]),
+  );
+});
+
+test("workflow catalog cache key includes the joined communities", () => {
+  assert.notDeepEqual(
+    marketplaceWorkflowQueryKey([
+      { id: "a", name: "A", relayUrl: "wss://community-a.example" },
+    ]),
+    marketplaceWorkflowQueryKey([
+      { id: "b", name: "B", relayUrl: "wss://community-b.example" },
+    ]),
+  );
+});
+
+test("workflow parser keeps only the newest listed snapshot", () => {
+  const community = {
+    id: "community-a",
+    name: "Community A",
+    relayUrl: "wss://community-a.example",
+    relayPubkey: "44".repeat(32),
+  };
+  const workflowEvent = (name, listed, createdAt, id) => ({
+    id,
+    pubkey: OWNER,
+    created_at: createdAt,
+    kind: 30620,
+    tags: [["d", "workflow-id"]],
+    content: `name: ${name}\ntrigger: { on: manual }\nmarketplace:\n  listed: ${listed}\n  summary: Review changes\nsteps: []\n`,
+    sig: "",
+  });
+
+  assert.deepEqual(
+    parseMarketplaceWorkflows(
+      [
+        workflowEvent("Old", true, 1, "11".repeat(32)),
+        workflowEvent("Hidden", false, 2, "22".repeat(32)),
+      ],
+      community,
+    ),
+    [],
+  );
+  assert.equal(
+    parseMarketplaceWorkflows(
+      [workflowEvent("Review", true, 3, "33".repeat(32))],
+      community,
+    )[0].sourceCommunity,
+    community,
   );
 });
 
@@ -105,10 +159,35 @@ test("parser returns only sanitized listed metadata", () => {
     capabilities: ["rust", "review"],
     deployment: "remote",
     pricing: { currency: "USD", microunitsPerHour: 12_000_000 },
+    remoteInvocation: null,
     directUse: "community",
   });
   assert.equal("systemPrompt" in listing, false);
   assert.equal("envVars" in listing, false);
+});
+
+test("parser retains an explicit remote invocation policy", () => {
+  const relay = "44".repeat(32);
+  const [listing] = parseMarketplaceAgents([
+    event({
+      name: "Reviewer",
+      marketplace: {
+        listed: true,
+        description: "Remote review",
+        capabilities: [],
+        deployment: "local",
+        remote_invocation: {
+          policy: "allowlist",
+          relay_pubkeys: [relay],
+        },
+      },
+    }),
+  ]);
+
+  assert.deepEqual(listing.remoteInvocation, {
+    policy: "allowlist",
+    relay_pubkeys: [relay],
+  });
 });
 
 test("parser ignores unlisted and invalid listings and keeps the newest head", () => {

@@ -193,6 +193,12 @@ function AssignmentReceiptPanel({
           )}
         </div>
         <ReceiptId label="Prompt" value={receipt.promptEventId} />
+        {receipt.agentRelayPubkey ? (
+          <ReceiptId label="Home relay" value={receipt.agentRelayPubkey} />
+        ) : null}
+        {receipt.listingEventId ? (
+          <ReceiptId label="Listing" value={receipt.listingEventId} />
+        ) : null}
         {receipt.completionEventId ? (
           <ReceiptId label="Completion" value={receipt.completionEventId} />
         ) : (
@@ -353,7 +359,10 @@ export function WorkflowRunTrace({
               <AssignmentReceiptPanel
                 agent={marketplaceAgents.find(
                   (agent) =>
-                    agent.pubkey === step.assignmentReceipt?.agentPubkey,
+                    agent.pubkey === step.assignmentReceipt?.agentPubkey &&
+                    (!step.assignmentReceipt.agentRelayPubkey ||
+                      agent.sourceCommunity?.relayPubkey ===
+                        step.assignmentReceipt.agentRelayPubkey),
                 )}
                 receipt={step.assignmentReceipt}
               />

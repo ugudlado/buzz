@@ -1068,6 +1068,27 @@ pub(crate) fn p_gated_filters_authorized(filters: &[Filter], authed_pubkey_hex: 
             return true;
         }
 
+        // Job receipts are deliberately readable by either their author or
+        // their `p` recipient. Keep this exemption explicit-kind-only so an
+        // author filter cannot broaden a wildcard/mixed private query.
+        let reads_own_jobs = filter.kinds.as_ref().is_some_and(|kinds| {
+            kinds
+                .iter()
+                .any(|kind| buzz_core::agent_job::is_job_kind(kind.as_u16() as u32))
+                && kinds.iter().all(|kind| {
+                    let kind = kind.as_u16() as u32;
+                    !P_GATED_KINDS.contains(&kind) || buzz_core::agent_job::is_job_kind(kind)
+                })
+        }) && filter.authors.as_ref().is_some_and(|authors| {
+            !authors.is_empty()
+                && authors
+                    .iter()
+                    .all(|author| author.to_hex() == authed_pubkey_hex)
+        });
+        if reads_own_jobs {
+            return true;
+        }
+
         // The `ids` exemption ("knowing the id implies authorization") is only
         // safe for kinds whose id is author-bound or whose content is encrypted.
         // KIND_DM_VISIBILITY is relay-signed (id not author-bound) and exposes
@@ -2089,6 +2110,29 @@ mod tests {
             ))
             .search("x");
         assert!(!p_gated_filters_authorized(&[f], &agent));
+    }
+
+    #[test]
+    fn p_gate_allows_an_agent_to_query_its_own_job_receipts() {
+        let agent = nostr::Keys::generate().public_key();
+        let own_receipts = Filter::new()
+            .kinds([
+                nostr::Kind::Custom(buzz_core::kind::KIND_JOB_ACCEPTED as u16),
+                nostr::Kind::Custom(buzz_core::kind::KIND_JOB_RESULT as u16),
+            ])
+            .author(agent);
+        assert!(p_gated_filters_authorized(&[own_receipts], &agent.to_hex()));
+
+        let mixed_private = Filter::new()
+            .kinds([
+                nostr::Kind::Custom(buzz_core::kind::KIND_JOB_RESULT as u16),
+                nostr::Kind::Custom(buzz_core::kind::KIND_AGENT_OBSERVER_FRAME as u16),
+            ])
+            .author(agent);
+        assert!(!p_gated_filters_authorized(
+            &[mixed_private],
+            &agent.to_hex()
+        ));
     }
 
     // ── filter_can_match_result_gated_kinds + result_gated_count_safe_for_pushdown ──

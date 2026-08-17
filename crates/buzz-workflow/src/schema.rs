@@ -169,6 +169,13 @@ pub enum ActionDef {
         /// matching against channel members, as before.
         #[serde(default)]
         agent_pubkey: Option<String>,
+        /// NIP-11 `self` pubkey of the agent's home community. When omitted,
+        /// assignment keeps the existing local-channel semantics.
+        #[serde(default)]
+        agent_relay_pubkey: Option<String>,
+        /// `wss` routing hint for the agent's home community.
+        #[serde(default)]
+        agent_relay_url: Option<String>,
         /// Instruction text appended after the `@mention`.
         instruction: String,
         /// Duration string (e.g. `"24h"`) after which the assignment expires.
@@ -246,6 +253,8 @@ impl WorkflowDef {
             if let ActionDef::AssignToAgent {
                 agent,
                 agent_pubkey,
+                agent_relay_pubkey,
+                agent_relay_url,
                 instruction,
                 ..
             } = &step.action
@@ -270,6 +279,42 @@ impl WorkflowDef {
                     {
                         return Err(WorkflowError::InvalidDefinition(format!(
                             "step '{}': assign_to_agent 'agent_pubkey' must be a 64-char hex pubkey",
+                            step.id
+                        )));
+                    }
+                }
+                match (agent_relay_pubkey, agent_relay_url) {
+                    (None, None) => {}
+                    (Some(relay_pubkey), Some(relay_url)) => {
+                        let relay_pubkey = relay_pubkey.trim();
+                        if relay_pubkey.len() != 64
+                            || !relay_pubkey.chars().all(|c| c.is_ascii_hexdigit())
+                        {
+                            return Err(WorkflowError::InvalidDefinition(format!(
+                                "step '{}': assign_to_agent 'agent_relay_pubkey' must be a 64-char hex pubkey",
+                                step.id
+                            )));
+                        }
+                        let url = url::Url::parse(relay_url).map_err(|_| {
+                            WorkflowError::InvalidDefinition(format!(
+                                "step '{}': assign_to_agent 'agent_relay_url' must be an absolute wss URL",
+                                step.id
+                            ))
+                        })?;
+                        if url.scheme() != "wss"
+                            || url.host_str().is_none()
+                            || url.username() != ""
+                            || url.password().is_some()
+                        {
+                            return Err(WorkflowError::InvalidDefinition(format!(
+                                "step '{}': assign_to_agent 'agent_relay_url' must be an absolute wss URL without userinfo",
+                                step.id
+                            )));
+                        }
+                    }
+                    _ => {
+                        return Err(WorkflowError::InvalidDefinition(format!(
+                            "step '{}': assign_to_agent remote coordinates require both 'agent_relay_pubkey' and 'agent_relay_url'",
                             step.id
                         )));
                     }
@@ -1036,6 +1081,8 @@ mod tests {
             ActionDef::AssignToAgent {
                 agent,
                 agent_pubkey,
+                agent_relay_pubkey,
+                agent_relay_url,
                 instruction,
                 timeout,
             } => {
@@ -1043,6 +1090,8 @@ mod tests {
                 assert_eq!(instruction, "Please investigate the failing build");
                 assert_eq!(timeout.as_deref(), Some("4h"));
                 assert!(agent_pubkey.is_none());
+                assert!(agent_relay_pubkey.is_none());
+                assert!(agent_relay_url.is_none());
             }
             other => panic!("unexpected action: {other:?}"),
         }

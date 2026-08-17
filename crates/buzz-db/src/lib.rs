@@ -4267,6 +4267,25 @@ impl Db {
         workflow::get_agent_step(&self.pool, community_id, prompt_event_id).await
     }
 
+    /// List cross-community job requests due for delivery or retry.
+    pub async fn list_due_remote_agent_deliveries(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<workflow::RemoteAgentDelivery>> {
+        workflow::list_due_remote_agent_deliveries(&self.pool, limit).await
+    }
+
+    /// Record a successful or failed remote job delivery attempt.
+    pub async fn record_remote_agent_delivery(
+        &self,
+        community_id: CommunityId,
+        prompt_event_id: &str,
+        error: Option<&str>,
+    ) -> Result<bool> {
+        workflow::record_remote_agent_delivery(&self.pool, community_id, prompt_event_id, error)
+            .await
+    }
+
     /// List durable agent-assignment receipts for a run.
     pub async fn list_agent_steps_for_run(
         &self,

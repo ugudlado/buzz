@@ -224,6 +224,10 @@ fn run_json_with_receipts(
         entry["assignment_receipt"] = serde_json::json!({
             "agent_pubkey": hex::encode(&step.agent_pubkey),
             "agent_owner_pubkey": step.agent_owner_pubkey.as_ref().map(hex::encode),
+            "origin_relay_pubkey": step.origin_relay_pubkey.as_ref().map(hex::encode),
+            "agent_relay_pubkey": step.agent_relay_pubkey.as_ref().map(hex::encode),
+            "agent_relay_url": step.agent_relay_url,
+            "listing_event_id": step.listing_event_id,
             "prompt_event_id": step.prompt_event_id,
             "completion_event_id": step.completion_event_id,
             "prompt_published_at_ms": step.prompt_published_at.map(|time| time.timestamp_millis()),
@@ -334,6 +338,12 @@ mod tests {
             terminal_at: Some(prompt_at + chrono::Duration::seconds(90)),
             duration_ms: Some(90_000),
             outcome: Some("failed".into()),
+            request_id: None,
+            origin_relay_pubkey: Some(vec![0x44; 32]),
+            agent_relay_pubkey: Some(vec![0x55; 32]),
+            agent_relay_url: Some("wss://agents.example".into()),
+            listing_event_id: Some("66".repeat(32)),
+            delivered_at: None,
         };
 
         let value = run_json_with_receipts(&run, &[step]);
@@ -341,6 +351,9 @@ mod tests {
         assert_eq!(receipt["estimated_microunits"], 300_000);
         assert_eq!(receipt["review_state"], "human_review_required");
         assert_eq!(receipt["completion_event_id"], "completion-id");
+        assert_eq!(receipt["origin_relay_pubkey"], "44".repeat(32));
+        assert_eq!(receipt["agent_relay_pubkey"], "55".repeat(32));
+        assert_eq!(receipt["listing_event_id"], "66".repeat(32));
         assert_eq!(value["execution_trace"][0]["status"], "failed");
     }
 
@@ -369,6 +382,12 @@ mod tests {
             terminal_at: None,
             duration_ms: None,
             outcome: None,
+            request_id: None,
+            origin_relay_pubkey: None,
+            agent_relay_pubkey: None,
+            agent_relay_url: None,
+            listing_event_id: None,
+            delivered_at: None,
         };
 
         let value = run_json_with_receipts(&run, &[step]);

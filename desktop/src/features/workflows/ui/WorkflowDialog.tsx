@@ -6,6 +6,7 @@ import {
   useUpdateWorkflowMutation,
 } from "@/features/workflows/hooks";
 import type { Channel, Workflow } from "@/shared/api/types";
+import { triggerWorkflow } from "@/shared/api/tauriWorkflows";
 import { getRelayHttpUrl } from "@/shared/api/tauri";
 import { Button } from "@/shared/ui/button";
 import {
@@ -28,13 +29,17 @@ type WorkflowDialogProps = {
   onOpenChange: (open: boolean) => void;
   open: boolean;
   workflow?: Workflow | null;
+  initialDefinition?: Record<string, unknown> | null;
+  runAfterCreate?: boolean;
 };
 
 function getInitialYaml(
   mode: DialogMode,
   workflow: Workflow | null | undefined,
+  initialDefinition: Record<string, unknown> | null | undefined,
 ): string {
-  if (!workflow) return "";
+  if (!workflow)
+    return initialDefinition ? yamlStringify(initialDefinition) : "";
   const def = { ...workflow.definition };
   if (mode === "duplicate") {
     def.name = `${def.name ?? workflow.name} (copy)`;
@@ -66,6 +71,8 @@ export function WorkflowDialog({
   onOpenChange,
   open,
   workflow,
+  initialDefinition,
+  runAfterCreate = false,
 }: WorkflowDialogProps) {
   const channelId =
     mode === "edit" && workflow?.channelId
@@ -74,13 +81,15 @@ export function WorkflowDialog({
 
   const [selectedChannelId, setSelectedChannelId] = React.useState(channelId);
   const [yamlDefinition, setYamlDefinition] = React.useState(() =>
-    getInitialYaml(mode, workflow),
+    getInitialYaml(mode, workflow, initialDefinition),
   );
   const [savedWebhookInfo, setSavedWebhookInfo] = React.useState<{
     relayHttpUrl: string;
     webhookSecret: string;
     workflowId: string;
   } | null>(null);
+  const [submitError, setSubmitError] = React.useState<string | null>(null);
+  const [isStarting, setIsStarting] = React.useState(false);
 
   const createMutation = useCreateWorkflowMutation(selectedChannelId);
   const updateMutation = useUpdateWorkflowMutation(workflow?.id ?? "");
@@ -102,8 +111,10 @@ export function WorkflowDialog({
           ? workflowChannelId
           : defaultChannelId;
       setSelectedChannelId(newChannelId);
-      setYamlDefinition(getInitialYaml(mode, workflow));
+      setYamlDefinition(getInitialYaml(mode, workflow, initialDefinition));
       setSavedWebhookInfo(null);
+      setSubmitError(null);
+      setIsStarting(false);
       resetCreate();
       resetUpdate();
     }
@@ -111,6 +122,7 @@ export function WorkflowDialog({
     open,
     mode,
     workflow,
+    initialDefinition,
     workflowChannelId,
     defaultChannelId,
     resetCreate,
@@ -133,6 +145,20 @@ export function WorkflowDialog({
 
     try {
       const saved = await mutation.mutateAsync(yamlDefinition);
+      if (runAfterCreate && mode === "create") {
+        setIsStarting(true);
+        try {
+          await triggerWorkflow(saved.workflow.id);
+        } catch (error) {
+          setIsStarting(false);
+          setSubmitError(
+            `The workflow was created, but could not be started: ${
+              error instanceof Error ? error.message : "unknown error"
+            }`,
+          );
+          return;
+        }
+      }
       handleOpenChange(false);
       if (saved.webhookSecret) {
         const relayHttpUrl = await getRelayHttpUrl();
@@ -155,13 +181,17 @@ export function WorkflowDialog({
       <Dialog onOpenChange={handleOpenChange} open={open}>
         <DialogContent className="flex max-h-[85vh] flex-col overflow-hidden sm:max-w-lg">
           <DialogHeader className="flex-shrink-0">
-            <DialogTitle>{TITLES[mode]}</DialogTitle>
+            <DialogTitle>
+              {runAfterCreate ? "Use Remote Agent" : TITLES[mode]}
+            </DialogTitle>
             <DialogDescription>
-              {mode === "edit"
-                ? "Modify the workflow definition."
-                : channels.length === 1
-                  ? "Create a workflow scoped to this channel."
-                  : "Define a workflow and assign it to a channel."}
+              {runAfterCreate
+                ? "Choose a channel, review the instruction, then run one assignment."
+                : mode === "edit"
+                  ? "Modify the workflow definition."
+                  : channels.length === 1
+                    ? "Create a workflow scoped to this channel."
+                    : "Define a workflow and assign it to a channel."}
             </DialogDescription>
           </DialogHeader>
 
@@ -171,7 +201,7 @@ export function WorkflowDialog({
                 <FieldLabel htmlFor="wf-channel-select">Channel</FieldLabel>
                 <ChannelCombobox
                   channels={channels}
-                  disabled={mutation.isPending}
+                  disabled={mutation.isPending || isStarting}
                   id="wf-channel-select"
                   onChange={(value) => {
                     mutation.reset();
@@ -199,7 +229,7 @@ export function WorkflowDialog({
 
             <WorkflowFormBuilder
               channelId={selectedChannelId || null}
-              disabled={mutation.isPending}
+              disabled={mutation.isPending || isStarting}
               onChange={(yaml) => {
                 mutation.reset();
                 setYamlDefinition(yaml);
@@ -210,6 +240,11 @@ export function WorkflowDialog({
             {mutation.error instanceof Error ? (
               <p className="rounded-xl border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
                 {mutation.error.message}
+              </p>
+            ) : null}
+            {submitError ? (
+              <p className="rounded-xl border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+                {submitError}
               </p>
             ) : null}
           </div>
@@ -226,12 +261,19 @@ export function WorkflowDialog({
               disabled={
                 !selectedChannelId ||
                 !yamlDefinition.trim() ||
-                mutation.isPending
+                mutation.isPending ||
+                isStarting
               }
               onClick={handleSubmit}
               type="button"
             >
-              {mutation.isPending ? PENDING_LABELS[mode] : SUBMIT_LABELS[mode]}
+              {mutation.isPending || isStarting
+                ? runAfterCreate
+                  ? "Starting..."
+                  : PENDING_LABELS[mode]
+                : runAfterCreate
+                  ? "Create and run"
+                  : SUBMIT_LABELS[mode]}
             </Button>
           </div>
         </DialogContent>

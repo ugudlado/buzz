@@ -59,6 +59,7 @@ export const KIND_AGENT_TURN_METRIC = 44200;
 export const KIND_EVENT_REMINDER = 30300;
 export const KIND_REPO_ANNOUNCEMENT = 30617;
 export const KIND_REPO_STATE = 30618;
+export const KIND_WORKFLOW_DEF = 30620;
 // NIP-MP: project grouping above NIP-34 repositories.
 export const KIND_PROJECT_ANNOUNCEMENT = 30621;
 export const KIND_GIT_PATCH = 1617;

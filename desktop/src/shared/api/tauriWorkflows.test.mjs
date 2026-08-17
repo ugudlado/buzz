@@ -10,6 +10,10 @@ test("workflow trace conversion preserves a durable assignment receipt", () => {
     assignment_receipt: {
       agent_pubkey: "11".repeat(32),
       agent_owner_pubkey: "22".repeat(32),
+      origin_relay_pubkey: "44".repeat(32),
+      agent_relay_pubkey: "55".repeat(32),
+      agent_relay_url: "wss://agents.example",
+      listing_event_id: "66".repeat(32),
       prompt_event_id: "33".repeat(32),
       completion_event_id: null,
       prompt_published_at_ms: 1_000,
@@ -27,6 +31,8 @@ test("workflow trace conversion preserves a durable assignment receipt", () => {
   assert.equal(trace.assignmentReceipt.estimatedMicrounits, 300_000);
   assert.equal(trace.assignmentReceipt.reviewState, "human_review_required");
   assert.equal(trace.assignmentReceipt.completionEventId, null);
+  assert.equal(trace.assignmentReceipt.agentRelayPubkey, "55".repeat(32));
+  assert.equal(trace.assignmentReceipt.listingEventId, "66".repeat(32));
 });
 
 test("old workflow traces remain compatible without a receipt", () => {

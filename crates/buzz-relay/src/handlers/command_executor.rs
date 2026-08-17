@@ -860,7 +860,6 @@ async fn handle_workflow_trigger(
         .get_workflow(community_id, workflow_id)
         .await
         .map_err(|_| IngestError::Rejected("invalid: workflow not found".into()))?;
-
     // 3. Manual triggers execute with the workflow owner's authority, so only
     // the owner may start them. Channel membership alone is insufficient: a
     // member could otherwise invoke another user's webhook or message actions.
@@ -1036,6 +1035,13 @@ async fn handle_workflow_cancel(
         .get_workflow(community_id, run.workflow_id)
         .await
         .map_err(|_| IngestError::Rejected("invalid: workflow not found".into()))?;
+    let pending_step = state
+        .db
+        .list_agent_steps_for_run(community_id, run_id)
+        .await
+        .map_err(|e| IngestError::Internal(format!("error: load assignment: {e}")))?
+        .into_iter()
+        .find(|step| step.status == buzz_db::workflow::AgentStepStatus::Pending);
 
     let mut tx = match persist_command_event(state, tenant, event, workflow.channel_id).await? {
         PersistResult::Duplicate => {
@@ -1098,6 +1104,13 @@ async fn handle_workflow_cancel(
     tx.commit()
         .await
         .map_err(|e| IngestError::Internal(format!("error: commit cancellation: {e}")))?;
+    if let Some(step) = pending_step {
+        if let Err(error) =
+            crate::remote_jobs::publish_cancellation(state, community_id, &step).await
+        {
+            tracing::warn!(run_id = %run_id, %error, "remote assignment cancellation delivery failed");
+        }
+    }
     Ok(IngestResult {
         event_id: event.id.to_hex(),
         accepted: true,
@@ -1645,6 +1658,67 @@ pub async fn try_resume_agent_step(
     }
 
     resume_from_done_agent_step(state, community_id, &step, output, run.ok()).await;
+}
+
+/// Resume a durable assignment from an encrypted cross-community terminal event.
+pub async fn try_resume_remote_agent_step(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    event: &Event,
+    received_at: chrono::DateTime<chrono::Utc>,
+) {
+    let validated = match crate::remote_jobs::validate_incoming_terminal(
+        state,
+        tenant.community(),
+        event,
+    )
+    .await
+    {
+        Ok(validated) => validated,
+        Err(error) => {
+            tracing::warn!(event_id = %event.id, %error, "remote agent result failed correlation after storage");
+            return;
+        }
+    };
+    let status = if validated.payload.outcome == "completed" {
+        "success"
+    } else {
+        "failed"
+    };
+    let mut outputs = serde_json::Map::new();
+    if let Some(result) = &validated.payload.output {
+        outputs.insert("result".into(), serde_json::Value::String(result.clone()));
+    }
+    let output = serde_json::json!({
+        "status": status,
+        "outputs": outputs,
+        "reason": validated.payload.error.as_ref().or(validated.payload.output.as_ref()),
+    });
+    let event_id = event.id.to_hex();
+    let updated = state
+        .db
+        .complete_agent_step_by_prompt_event_id(buzz_db::workflow::CompleteAgentStepParams {
+            community_id: tenant.community(),
+            prompt_event_id: &validated.step.prompt_event_id,
+            status: buzz_db::workflow::AgentStepStatus::Done,
+            output: Some(&output),
+            completion_event_id: Some(&event_id),
+            // The caller community owns accounting. Use its observed receipt
+            // time rather than an agent-controlled encrypted timestamp.
+            terminal_at: received_at,
+            outcome: &validated.payload.outcome,
+        })
+        .await;
+    match updated {
+        Ok(true) => {
+            resume_from_done_agent_step(state, tenant.community(), &validated.step, output, None)
+                .await;
+        }
+        Ok(false) => {}
+        Err(error) => {
+            tracing::error!(event_id = %event.id, %error, "failed to complete remote agent step");
+        }
+    }
 }
 
 /// Serialize a parsed [`buzz_workflow::AgentCompletion`] into the JSON shape

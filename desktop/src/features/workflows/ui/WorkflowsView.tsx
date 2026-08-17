@@ -16,9 +16,11 @@ import { WorkflowCard } from "@/features/workflows/ui/WorkflowCard";
 import { WorkflowDeleteDialog } from "@/features/workflows/ui/WorkflowDeleteDialog";
 import { WorkflowDetailPanel } from "@/features/workflows/ui/WorkflowDetailPanel";
 import { WorkflowDialog } from "@/features/workflows/ui/WorkflowDialog";
+import { MarketplaceWorkflowCard } from "@/features/workflows/ui/MarketplaceWorkflowCard";
 import {
   formatMicrounits,
   getWorkflowMarketplace,
+  installMarketplaceWorkflowSnapshot,
 } from "@/features/workflows/marketplace";
 import {
   PRESENCE_REFETCH_INTERVAL_MS,
@@ -26,13 +28,17 @@ import {
   usePresenceQuery,
 } from "@/features/presence/hooks";
 import { useIdentityQuery } from "@/shared/api/hooks";
+import { useRelaySelfQuery } from "@/features/moderation/hooks";
 import { getPresenceLabel } from "@/features/presence/lib/presence";
 import { PresenceBadge } from "@/features/presence/ui/PresenceBadge";
 import {
   getMarketplaceAgents,
+  getMarketplaceWorkflows,
   marketplaceAgentQueryKey,
   marketplacePresenceTargets,
+  marketplaceWorkflowQueryKey,
   type MarketplaceAgent,
+  type MarketplaceWorkflow,
 } from "@/shared/api/marketplace";
 import type {
   Channel,
@@ -69,7 +75,11 @@ type WorkflowWithChannel = {
 
 type DialogState =
   | { mode: "closed" }
-  | { mode: "create" }
+  | {
+      mode: "create";
+      initialDefinition?: Record<string, unknown>;
+      runAfterCreate?: boolean;
+    }
   | { mode: "edit"; workflow: Workflow }
   | { mode: "duplicate"; workflow: Workflow };
 
@@ -89,6 +99,7 @@ function marketplaceFromListing(
           microunits_per_hour: agent.pricing.microunitsPerHour,
         }
       : null,
+    remote_invocation: agent.remoteInvocation,
   };
 }
 
@@ -111,6 +122,7 @@ function marketplaceAgentFromLocal(
           microunitsPerHour: marketplace.pricing.microunits_per_hour,
         }
       : null,
+    remoteInvocation: marketplace.remote_invocation ?? null,
     directUse:
       agent.respondTo === "anyone"
         ? "community"
@@ -118,6 +130,40 @@ function marketplaceAgentFromLocal(
           ? "restricted"
           : "owner",
     sourceCommunity,
+  };
+}
+
+function remotePolicyAllows(
+  agent: MarketplaceAgent,
+  callerRelayPubkey: string | null,
+): boolean {
+  if (!callerRelayPubkey || !agent.remoteInvocation) return false;
+  return (
+    agent.remoteInvocation.policy === "any_community" ||
+    agent.remoteInvocation.relay_pubkeys.includes(callerRelayPubkey)
+  );
+}
+
+function remoteAgentWorkflowDefinition(
+  agent: MarketplaceAgent,
+): Record<string, unknown> | null {
+  const source = agent.sourceCommunity;
+  if (!source?.relayPubkey) return null;
+  return {
+    name: `Use ${agent.name}`,
+    description: `Invoke ${agent.name} in ${source.name}.`,
+    trigger: { on: "manual" },
+    steps: [
+      {
+        id: "invoke_agent",
+        action: "assign_to_agent",
+        agent: agent.name,
+        agent_pubkey: agent.pubkey,
+        agent_relay_pubkey: source.relayPubkey,
+        agent_relay_url: source.relayUrl,
+        instruction: "Describe what you want the agent to do.",
+      },
+    ],
   };
 }
 
@@ -154,13 +200,17 @@ function AgentCatalogCard({
   agent,
   presenceStatus,
   localAgent,
+  canUseHere,
   onEdit,
+  onUseHere,
   onUnpublish,
 }: {
   agent: MarketplaceAgent;
   presenceStatus: PresenceStatus | null;
   localAgent?: ManagedAgent;
+  canUseHere: boolean;
   onEdit: (agent: ManagedAgent) => void;
+  onUseHere: (agent: MarketplaceAgent) => void;
   onUnpublish: (agent: ManagedAgent) => void;
 }) {
   return (
@@ -182,6 +232,9 @@ function AgentCatalogCard({
               <Badge variant="secondary">Presence unavailable</Badge>
             )}
             <Badge variant="secondary">{agent.deployment}</Badge>
+            <Badge variant={agent.remoteInvocation ? "default" : "outline"}>
+              {agent.remoteInvocation ? "Remote-ready" : "Discovery only"}
+            </Badge>
           </div>
           {agent.description ? (
             <p className="mt-2 text-xs text-muted-foreground">
@@ -247,6 +300,12 @@ function AgentCatalogCard({
                 Unpublish
               </Button>
             </div>
+          ) : canUseHere ? (
+            <div className="mt-3">
+              <Button onClick={() => onUseHere(agent)} size="sm">
+                Use here
+              </Button>
+            </div>
           ) : null}
         </div>
       </div>
@@ -278,6 +337,7 @@ export function WorkflowsView({
   const queryClient = useQueryClient();
   const { activeCommunity, communities } = useCommunities();
   const identityPubkey = useIdentityQuery().data?.pubkey.toLowerCase() ?? null;
+  const activeRelaySelf = useRelaySelfQuery(isMarketplace).data ?? null;
   const managedAgentsQuery = useManagedAgentsQuery();
   const updateManagedAgent = useUpdateManagedAgentMutation();
   const updateManagedAgentMutate = updateManagedAgent.mutate;
@@ -287,6 +347,14 @@ export function WorkflowsView({
     queryFn: () =>
       getMarketplaceAgents(communities, activeCommunity?.relayUrl ?? ""),
     enabled: Boolean(activeCommunity),
+    staleTime: 30_000,
+    refetchOnWindowFocus: true,
+  });
+  const marketplaceWorkflowsQuery = useQuery({
+    queryKey: marketplaceWorkflowQueryKey(communities),
+    queryFn: () =>
+      getMarketplaceWorkflows(communities, activeCommunity?.relayUrl ?? ""),
+    enabled: isMarketplace && Boolean(activeCommunity),
     staleTime: 30_000,
     refetchOnWindowFocus: true,
   });
@@ -315,6 +383,7 @@ export function WorkflowsView({
             id: activeCommunity.id,
             name: activeCommunity.name,
             relayUrl: activeCommunity.relayUrl,
+            relayPubkey: activeRelaySelf ?? undefined,
           }),
         );
       }
@@ -322,6 +391,7 @@ export function WorkflowsView({
     return merged.sort((left, right) => left.name.localeCompare(right.name));
   }, [
     activeCommunity,
+    activeRelaySelf,
     identityPubkey,
     listingOverrides,
     managedAgentByPubkey,
@@ -431,18 +501,13 @@ export function WorkflowsView({
       }
       return results;
     },
-    enabled: memberChannels.length > 0,
+    enabled: !isMarketplace && memberChannels.length > 0,
     ...workflowListFocusRefetchPolicy,
   });
 
   const allWorkflows = allWorkflowsQuery.data ?? [];
-  const visibleWorkflows = isMarketplace
-    ? allWorkflows.filter(({ workflow }) =>
-        getWorkflowMarketplace(workflow.definition),
-      )
-    : allWorkflows;
   const workflowSearchTerm = workflowSearch.trim().toLowerCase();
-  const filteredVisibleWorkflows = visibleWorkflows.filter(
+  const filteredVisibleWorkflows = allWorkflows.filter(
     ({ workflow, channelName }) =>
       !workflowSearchTerm ||
       [
@@ -452,6 +517,26 @@ export function WorkflowsView({
         getWorkflowMarketplace(workflow.definition)?.summary ?? "",
       ].some((value) => value.toLowerCase().includes(workflowSearchTerm)),
   );
+  const marketplaceWorkflows = marketplaceWorkflowsQuery.data ?? [];
+  const filteredMarketplaceWorkflows = marketplaceWorkflows.filter(
+    (workflow) =>
+      !workflowSearchTerm ||
+      [
+        workflow.name,
+        workflow.ownerPubkey,
+        workflow.sourceCommunity.name,
+        getWorkflowMarketplace(workflow.definition)?.summary ?? "",
+      ].some((value) => value.toLowerCase().includes(workflowSearchTerm)),
+  );
+  const workflowListIsFetching = isMarketplace
+    ? marketplaceWorkflowsQuery.isFetching
+    : allWorkflowsQuery.isFetching;
+  const workflowListIsLoading = isMarketplace
+    ? marketplaceWorkflowsQuery.isLoading
+    : allWorkflowsQuery.isLoading;
+  const workflowListIsError = isMarketplace
+    ? marketplaceWorkflowsQuery.isError
+    : allWorkflowsQuery.isError;
 
   const triggerMutation = useMutation({
     mutationFn: (workflowId: string) => triggerWorkflow(workflowId),
@@ -509,6 +594,24 @@ export function WorkflowsView({
   const handleDialogOpenChange = React.useCallback((open: boolean) => {
     if (!open) {
       setDialogState({ mode: "closed" });
+    }
+  }, []);
+
+  const useAgentHere = React.useCallback((agent: MarketplaceAgent) => {
+    const initialDefinition = remoteAgentWorkflowDefinition(agent);
+    if (initialDefinition) {
+      setDialogState({
+        mode: "create",
+        initialDefinition,
+        runAfterCreate: true,
+      });
+    }
+  }, []);
+
+  const useWorkflowHere = React.useCallback((workflow: MarketplaceWorkflow) => {
+    const initialDefinition = installMarketplaceWorkflowSnapshot(workflow);
+    if (initialDefinition) {
+      setDialogState({ mode: "create", initialDefinition });
     }
   }, []);
 
@@ -572,12 +675,14 @@ export function WorkflowsView({
               disabled={
                 isMarketplace && catalogTab === "agents"
                   ? marketplaceAgentsQuery.isFetching
-                  : allWorkflowsQuery.isFetching
+                  : workflowListIsFetching
               }
               onClick={() =>
                 void (isMarketplace && catalogTab === "agents"
                   ? marketplaceAgentsQuery.refetch()
-                  : allWorkflowsQuery.refetch())
+                  : isMarketplace
+                    ? marketplaceWorkflowsQuery.refetch()
+                    : allWorkflowsQuery.refetch())
               }
               size="icon"
               variant="ghost"
@@ -587,7 +692,7 @@ export function WorkflowsView({
                   (
                     isMarketplace && catalogTab === "agents"
                       ? marketplaceAgentsQuery.isFetching
-                      : allWorkflowsQuery.isFetching
+                      : workflowListIsFetching
                   )
                     ? "animate-spin"
                     : ""
@@ -684,6 +789,12 @@ export function WorkflowsView({
                   {filteredMarketplaceAgents.map((agent) => (
                     <AgentCatalogCard
                       agent={agent}
+                      canUseHere={
+                        agent.sourceCommunity?.relayUrl !==
+                          activeCommunity?.relayUrl &&
+                        Boolean(agent.sourceCommunity?.relayPubkey) &&
+                        remotePolicyAllows(agent, activeRelaySelf)
+                      }
                       key={`${agent.sourceCommunity?.relayUrl}:${agent.ownerPubkey}:${agent.pubkey}`}
                       localAgent={
                         agent.ownerPubkey === identityPubkey &&
@@ -703,6 +814,7 @@ export function WorkflowsView({
                           : undefined
                       }
                       onEdit={setListingAgent}
+                      onUseHere={useAgentHere}
                       onUnpublish={unpublishAgent}
                       presenceStatus={marketplacePresenceStatus(agent)}
                     />
@@ -740,20 +852,26 @@ export function WorkflowsView({
               )}
             </div>
           )
-        ) : allWorkflowsQuery.isLoading ? (
+        ) : workflowListIsLoading ? (
           <WorkflowsListSkeleton />
-        ) : allWorkflowsQuery.isError ? (
+        ) : workflowListIsError ? (
           <div className="flex flex-1 flex-col items-center justify-center gap-2 text-muted-foreground">
             <p className="text-sm text-red-400">Failed to load workflows</p>
             <Button
-              onClick={() => void allWorkflowsQuery.refetch()}
+              onClick={() =>
+                void (isMarketplace
+                  ? marketplaceWorkflowsQuery.refetch()
+                  : allWorkflowsQuery.refetch())
+              }
               size="sm"
               variant="outline"
             >
               Retry
             </Button>
           </div>
-        ) : filteredVisibleWorkflows.length === 0 ? (
+        ) : (isMarketplace
+            ? filteredMarketplaceWorkflows.length
+            : filteredVisibleWorkflows.length) === 0 ? (
           <div className="flex flex-1 flex-col items-center justify-center gap-3 text-muted-foreground">
             <Zap className="h-10 w-10 opacity-30" />
             <p className="text-sm">
@@ -776,25 +894,38 @@ export function WorkflowsView({
           </div>
         ) : (
           <div className="space-y-2">
-            {filteredVisibleWorkflows.map(({ workflow, channelName }) => (
-              <WorkflowCard
-                canManage={
-                  identityPubkey === workflow.ownerPubkey.toLowerCase()
-                }
-                channelName={channelName}
-                isActive={selectedWorkflowId === workflow.id}
-                key={workflow.id}
-                onDelete={handleDelete}
-                onDuplicate={handleDuplicate}
-                onEdit={handleEdit}
-                onSelect={onSelectWorkflow}
-                onTrigger={handleTrigger}
-                marketplaceAgents={activeMarketplaceAgents}
-                presence={presenceQuery.data}
-                presenceLoaded={presenceQuery.isSuccess}
-                workflow={workflow}
-              />
-            ))}
+            {isMarketplace
+              ? filteredMarketplaceWorkflows.map((workflow) => (
+                  <MarketplaceWorkflowCard
+                    canInstall={
+                      workflow.sourceCommunity.relayUrl !==
+                        activeCommunity?.relayUrl &&
+                      installMarketplaceWorkflowSnapshot(workflow) !== null
+                    }
+                    key={`${workflow.sourceCommunity.relayUrl}:${workflow.ownerPubkey}:${workflow.workflowId}`}
+                    onInstall={useWorkflowHere}
+                    workflow={workflow}
+                  />
+                ))
+              : filteredVisibleWorkflows.map(({ workflow, channelName }) => (
+                  <WorkflowCard
+                    canManage={
+                      identityPubkey === workflow.ownerPubkey.toLowerCase()
+                    }
+                    channelName={channelName}
+                    isActive={selectedWorkflowId === workflow.id}
+                    key={workflow.id}
+                    onDelete={handleDelete}
+                    onDuplicate={handleDuplicate}
+                    onEdit={handleEdit}
+                    onSelect={onSelectWorkflow}
+                    onTrigger={handleTrigger}
+                    marketplaceAgents={marketplaceAgents}
+                    presence={presenceQuery.data}
+                    presenceLoaded={presenceQuery.isSuccess}
+                    workflow={workflow}
+                  />
+                ))}
           </div>
         )}
       </div>
@@ -808,7 +939,7 @@ export function WorkflowsView({
                 ?.workflow.ownerPubkey.toLowerCase() === identityPubkey
             }
             key={selectedWorkflowId}
-            marketplaceAgents={activeMarketplaceAgents}
+            marketplaceAgents={marketplaceAgents}
             onClose={onCloseWorkflow}
             onEdit={handleEdit}
             workflowId={selectedWorkflowId}
@@ -818,9 +949,17 @@ export function WorkflowsView({
 
       <WorkflowDialog
         channels={memberChannels}
+        initialDefinition={
+          dialogState.mode === "create"
+            ? (dialogState.initialDefinition ?? null)
+            : null
+        }
         mode={dialogState.mode === "closed" ? "create" : dialogState.mode}
         onOpenChange={handleDialogOpenChange}
         open={dialogState.mode !== "closed"}
+        runAfterCreate={
+          dialogState.mode === "create" && dialogState.runAfterCreate === true
+        }
         workflow={
           dialogState.mode === "edit" || dialogState.mode === "duplicate"
             ? dialogState.workflow

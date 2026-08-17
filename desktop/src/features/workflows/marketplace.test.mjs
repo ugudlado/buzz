@@ -4,10 +4,11 @@ import test from "node:test";
 import {
   getWorkflowAgentDependencies,
   getWorkflowMarketplace,
+  installMarketplaceWorkflowSnapshot,
   resolveAssignmentTelemetryCorrelation,
   summarizeContributorEstimates,
 } from "./marketplace.ts";
-import { yamlToFormState } from "./ui/workflowFormTypes.ts";
+import { formStateToYaml, yamlToFormState } from "./ui/workflowFormTypes.ts";
 
 const A = "11".repeat(32);
 const B = "22".repeat(32);
@@ -56,6 +57,70 @@ steps: []
   assert.equal(result.state?.trigger.on, "manual");
 });
 
+test("remote agent coordinates survive form editing", () => {
+  const relayPubkey = "33".repeat(32);
+  const parsed = yamlToFormState(`
+name: Remote review
+trigger: { on: manual }
+steps:
+  - id: review
+    action: assign_to_agent
+    agent: Reviewer
+    agent_pubkey: "${A}"
+    agent_relay_pubkey: "${relayPubkey}"
+    agent_relay_url: wss://agents.example.com
+    instruction: Review this
+`);
+
+  assert.equal(parsed.ok, true);
+  const yaml = formStateToYaml(parsed.state);
+  assert.match(yaml, new RegExp(`agent_relay_pubkey: "${relayPubkey}"`));
+  assert.match(yaml, /agent_relay_url: wss:\/\/agents\.example\.com/);
+});
+
+test("workflow install snapshots origin and remote agent coordinates", () => {
+  const relayPubkey = "44".repeat(32);
+  const eventId = "55".repeat(32);
+  const definition = {
+    name: "Review",
+    trigger: { on: "manual" },
+    marketplace: { listed: true, summary: "Review changes" },
+    steps: [
+      {
+        id: "review",
+        action: "assign_to_agent",
+        agent: "Reviewer",
+        agent_pubkey: A,
+      },
+      { id: "done", action: "send_message", text: "Done" },
+    ],
+  };
+
+  const installed = installMarketplaceWorkflowSnapshot({
+    eventId,
+    workflowId: "workflow-id",
+    name: "Review",
+    ownerPubkey: B,
+    definition,
+    createdAt: 1,
+    sourceCommunity: {
+      id: "community-a",
+      name: "Community A",
+      relayUrl: "wss://community-a.example",
+      relayPubkey,
+    },
+  });
+
+  assert.deepEqual(installed.marketplace, {
+    listed: false,
+    summary: "Review changes",
+    origin_event_id: eventId,
+  });
+  assert.equal(installed.steps[0].agent_relay_pubkey, relayPubkey);
+  assert.equal(installed.steps[0].agent_relay_url, "wss://community-a.example");
+  assert.equal(definition.steps[0].agent_relay_pubkey, undefined);
+});
+
 test("workflow dependencies distinguish offline and missing agents", () => {
   const dependencies = getWorkflowAgentDependencies(
     {
@@ -74,6 +139,43 @@ test("workflow dependencies distinguish offline and missing agents", () => {
     [
       { name: "Reviewer", state: "offline" },
       { name: "Writer", state: "missing" },
+    ],
+  );
+});
+
+test("workflow dependencies keep identical agent keys separate by home relay", () => {
+  const relayA = "aa".repeat(32);
+  const relayB = "bb".repeat(32);
+  const dependencies = getWorkflowAgentDependencies(
+    {
+      steps: [
+        {
+          action: "assign_to_agent",
+          agent: "A Reviewer",
+          agent_pubkey: A,
+          agent_relay_pubkey: relayA,
+        },
+        {
+          action: "assign_to_agent",
+          agent: "B Reviewer",
+          agent_pubkey: A,
+          agent_relay_pubkey: relayB,
+        },
+      ],
+    },
+    [
+      { pubkey: A, sourceCommunity: { relayPubkey: relayA } },
+      { pubkey: A, sourceCommunity: { relayPubkey: relayB } },
+    ],
+    undefined,
+    false,
+  );
+
+  assert.deepEqual(
+    dependencies.map(({ name, relayPubkey }) => ({ name, relayPubkey })),
+    [
+      { name: "A Reviewer", relayPubkey: relayA },
+      { name: "B Reviewer", relayPubkey: relayB },
     ],
   );
 });

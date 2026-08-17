@@ -40,6 +40,10 @@ type RawTraceEntry = {
 type RawAssignmentReceipt = {
   agent_pubkey: string;
   agent_owner_pubkey: string | null;
+  origin_relay_pubkey?: string | null;
+  agent_relay_pubkey?: string | null;
+  agent_relay_url?: string | null;
+  listing_event_id?: string | null;
   prompt_event_id: string;
   completion_event_id: string | null;
   prompt_published_at_ms: number | null;
@@ -122,6 +126,10 @@ function fromRawAssignmentReceipt(
   return {
     agentPubkey: raw.agent_pubkey,
     agentOwnerPubkey: raw.agent_owner_pubkey,
+    originRelayPubkey: raw.origin_relay_pubkey ?? null,
+    agentRelayPubkey: raw.agent_relay_pubkey ?? null,
+    agentRelayUrl: raw.agent_relay_url ?? null,
+    listingEventId: raw.listing_event_id ?? null,
     promptEventId: raw.prompt_event_id,
     completionEventId: raw.completion_event_id,
     promptPublishedAtMs: raw.prompt_published_at_ms,

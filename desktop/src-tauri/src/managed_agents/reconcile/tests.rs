@@ -70,6 +70,7 @@ fn fresh_scope_does_not_copy_marketplace_listing_from_global_record() {
         capabilities: vec!["review".to_string()],
         deployment: buzz_core_pkg::marketplace::AgentDeployment::Local,
         pricing: None,
+        remote_invocation: None,
     });
     write_store(&dir, &[record]);
 
@@ -100,6 +101,7 @@ fn reconcile_preserves_listing_already_published_in_scope() {
         capabilities: vec!["review".to_string()],
         deployment: buzz_core_pkg::marketplace::AgentDeployment::Local,
         pricing: None,
+        remote_invocation: None,
     });
     let conn = open_retention_db(&dir.path().join("retention.db")).unwrap();
     assert!(retain_agent_record(&conn, &keys, &record).unwrap());

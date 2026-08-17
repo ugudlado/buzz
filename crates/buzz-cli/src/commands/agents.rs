@@ -3,7 +3,9 @@ use buzz_agent_record::{
     DEFAULT_AGENT_PARALLELISM,
 };
 use buzz_core::kind::{KIND_IA_ARCHIVED_LIST, KIND_MANAGED_AGENT};
-use buzz_core::marketplace::{AgentDeployment, AgentMarketplace, HourlyRate};
+use buzz_core::marketplace::{
+    AgentDeployment, AgentMarketplace, HourlyRate, RemoteInvocationPolicy,
+};
 use buzz_sdk::builders::{build_archive_identity_request, build_unarchive_identity_request};
 use nostr::{EventBuilder, Kind, PublicKey, Tag, ToBech32};
 use serde_json::json;
@@ -25,6 +27,7 @@ pub async fn dispatch(command: AgentsCmd, client: &BuzzClient) -> Result<(), Cli
                 deployment,
                 rate,
                 currency,
+                remote_invocation,
             } => {
                 cmd_marketplace_publish(
                     client,
@@ -32,8 +35,8 @@ pub async fn dispatch(command: AgentsCmd, client: &BuzzClient) -> Result<(), Cli
                     description,
                     capabilities,
                     deployment,
-                    rate,
-                    currency,
+                    (rate, currency),
+                    remote_invocation,
                 )
                 .await
             }
@@ -386,8 +389,8 @@ async fn cmd_marketplace_publish(
     description: Option<String>,
     capabilities: Vec<String>,
     deployment: Option<MarketplaceDeployment>,
-    rate: Option<u64>,
-    currency: Option<String>,
+    pricing: (Option<u64>, Option<String>),
+    remote_invocation: Option<String>,
 ) -> Result<(), CliError> {
     let event = owned_agent_event(client, agent_pubkey).await?;
     let content = event
@@ -400,6 +403,7 @@ async fn cmd_marketplace_publish(
         capabilities: Vec::new(),
         deployment: AgentDeployment::Local,
         pricing: None,
+        remote_invocation: None,
     });
     listing.listed = true;
     if let Some(description) = description {
@@ -415,11 +419,20 @@ async fn cmd_marketplace_publish(
             MarketplaceDeployment::Kubernetes => AgentDeployment::Kubernetes,
         };
     }
-    if let (Some(rate), Some(currency)) = (rate, currency) {
+    if let (Some(rate), Some(currency)) = pricing {
         listing.pricing = Some(HourlyRate {
             currency,
             microunits_per_hour: rate,
         });
+    }
+    if let Some(policy) = remote_invocation {
+        listing.remote_invocation = match policy.trim() {
+            "any" => Some(RemoteInvocationPolicy::AnyCommunity),
+            "off" => None,
+            value => Some(RemoteInvocationPolicy::Allowlist {
+                relay_pubkeys: value.split(',').map(str::to_string).collect(),
+            }),
+        };
     }
     let listing = listing
         .normalized()
@@ -1489,6 +1502,7 @@ mod tests {
                 currency: "USD".into(),
                 microunits_per_hour: 12_000_000,
             }),
+            remote_invocation: None,
         };
 
         let merged: serde_json::Value =

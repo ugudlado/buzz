@@ -113,6 +113,8 @@ const DRAIN_BUDGET_PER_ITER: usize = 1;
 /// (`gated_observer_dropped`). Note each dropped frame may carry a whole batch
 /// of events, so event-level loss is larger than the frame count.
 const GATED_OBSERVER_QUEUE_CAP: usize = 256;
+/// Maximum NIP-11 document accepted from a relay.
+const MAX_RELAY_INFO_BYTES: usize = 1_048_576;
 
 use std::time::Instant;
 
@@ -464,7 +466,7 @@ impl RestClient {
     /// to compare against this pubkey on every inbound event, and a NIP-11
     /// round-trip per message would be wasteful.
     pub async fn fetch_relay_pubkey(&self) -> Result<nostr::PublicKey, RelayError> {
-        let resp = self
+        let mut resp = self
             .http
             .get(&self.base_url)
             .header("Accept", "application/nostr+json")
@@ -478,10 +480,20 @@ impl RestClient {
                 resp.status()
             )));
         }
-        let info: Value = resp
-            .json()
+        let mut body = Vec::new();
+        while let Some(chunk) = resp
+            .chunk()
             .await
-            .map_err(|e| RelayError::Http(e.to_string()))?;
+            .map_err(|e| RelayError::Http(e.to_string()))?
+        {
+            if body.len().saturating_add(chunk.len()) > MAX_RELAY_INFO_BYTES {
+                return Err(RelayError::Http(format!(
+                    "relay info document exceeds {MAX_RELAY_INFO_BYTES} bytes"
+                )));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let info: Value = serde_json::from_slice(&body)?;
         let self_hex = info
             .get("self")
             .and_then(|v| v.as_str())

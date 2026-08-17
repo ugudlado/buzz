@@ -491,6 +491,9 @@ pub enum AgentsMarketplaceCmd {
         /// Three-letter uppercase currency code
         #[arg(long, requires = "rate")]
         currency: Option<String>,
+        /// Remote invocation policy: "any", "off", or comma-separated relay pubkeys
+        #[arg(long)]
+        remote_invocation: Option<String>,
     },
     /// Hide an existing owner-authored managed agent listing
     Unpublish {
@@ -2264,6 +2267,7 @@ mod tests {
                     agent_pubkey,
                     rate,
                     currency,
+                    remote_invocation,
                     ..
                 },
         }) = cli.command
@@ -2273,6 +2277,33 @@ mod tests {
         assert_eq!(agent_pubkey, agent);
         assert_eq!(rate, Some(12_000_000));
         assert_eq!(currency.as_deref(), Some("USD"));
+        assert!(remote_invocation.is_none());
+    }
+
+    #[test]
+    fn parses_agent_marketplace_remote_invocation_policy() {
+        let agent = "a".repeat(64);
+        let relay = "b".repeat(64);
+        let cli = Cli::try_parse_from([
+            "buzz",
+            "agents",
+            "marketplace",
+            "publish",
+            &agent,
+            "--remote-invocation",
+            &relay,
+        ])
+        .unwrap();
+        let Cmd::Agents(AgentsCmd::Marketplace {
+            command:
+                AgentsMarketplaceCmd::Publish {
+                    remote_invocation, ..
+                },
+        }) = cli.command
+        else {
+            panic!("expected agent marketplace publish");
+        };
+        assert_eq!(remote_invocation.as_deref(), Some(relay.as_str()));
     }
 
     #[test]

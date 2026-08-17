@@ -33,6 +33,8 @@ pub mod nip11;
 pub mod protocol;
 /// Durable NIP-PL matcher and delivery worker.
 pub mod push_runtime;
+/// Cross-community agent-job validation and relay-to-relay HTTP transport.
+pub mod remote_jobs;
 /// Axum router construction.
 pub mod router;
 /// Shared application state.

@@ -248,6 +248,7 @@ async fn cmd_marketplace_publish(
         listed: false,
         summary: default_summary,
         fixed_price: None,
+        origin_event_id: None,
     });
     marketplace.listed = true;
     if let Some(summary) = summary {
@@ -474,6 +475,7 @@ mod tests {
                     currency: "USD".into(),
                     microunits: 5_000_000,
                 }),
+                origin_event_id: None,
             },
         )
         .unwrap();

@@ -288,7 +288,7 @@ pub struct PromptResult {
     /// Identifies the completed turn for observer terminal events.
     pub turn_id: String,
     pub outcome: PromptOutcome,
-    /// Present on failure in Queue mode, for requeue.
+    /// Present on failure in Queue mode, or for remote terminalization.
     pub batch: Option<FlushBatch>,
 }
 
@@ -4044,6 +4044,16 @@ fn spawn_workflow_completion_if_applicable(
     let Some(be) = batch.events.last() else {
         return;
     };
+    if crate::remote_jobs::context(&be.event).is_some() {
+        let rest = ctx.rest_client.clone();
+        let event = be.event.clone();
+        tokio::spawn(async move {
+            if let Err(error) = crate::remote_jobs::post_result(&rest, &event, turn_text).await {
+                tracing::error!(event_id = %event.id, %error, "failed to deliver remote agent-job result");
+            }
+        });
+        return;
+    }
     if !crate::is_relay_workflow_message(&be.event, ctx.relay_pubkey.as_ref()) {
         return;
     }
@@ -4067,6 +4077,13 @@ fn spawn_workflow_completion_if_applicable(
 /// Return the batch for requeue only in Queue mode; drop it in Drop mode.
 #[inline]
 fn requeue_batch_if_queue(ctx: &PromptContext, batch: Option<FlushBatch>) -> Option<FlushBatch> {
+    if batch
+        .as_ref()
+        .and_then(|batch| batch.events.last())
+        .is_some_and(|event| crate::remote_jobs::context(&event.event).is_some())
+    {
+        return batch;
+    }
     match ctx.dedup_mode {
         DedupMode::Queue => batch,
         DedupMode::Drop => None,
@@ -4084,6 +4101,13 @@ fn requeue_cancelled_batch(
     signal: ControlSignal,
     batch: Option<FlushBatch>,
 ) -> Option<FlushBatch> {
+    if batch
+        .as_ref()
+        .and_then(|batch| batch.events.last())
+        .is_some_and(|event| crate::remote_jobs::context(&event.event).is_some())
+    {
+        return batch;
+    }
     let reason = match signal {
         ControlSignal::Steer => CancelReason::Steer,
         ControlSignal::Interrupt | ControlSignal::SwitchModel(_) => CancelReason::Interrupt,

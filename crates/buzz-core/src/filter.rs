@@ -11,10 +11,9 @@ pub fn filters_match(filters: &[Filter], event: &StoredEvent) -> bool {
     filters.iter().any(|f| filter_match_one(f, event))
 }
 
-/// Result-level read authorization for relay-signed events whose content is
-/// private to a single viewer. Currently gates `KIND_DM_VISIBILITY` and
-/// `KIND_AGENT_TURN_METRIC`: the reader MUST equal the event's `#p` tag
-/// (owner). Returns `true` for every other kind.
+/// Result-level read authorization for private events. Job events are readable
+/// by their signed author or their `#p` recipient; the other result-gated kinds
+/// remain readable only by their `#p` recipient.
 ///
 /// This guards every delivery surface — WS historical pull (`req.rs`), HTTP
 /// bridge (`bridge.rs`), and live fan-out (`event.rs`) — so a query that
@@ -22,7 +21,10 @@ pub fn filters_match(filters: &[Filter], event: &StoredEvent) -> bool {
 /// a known event id) still cannot read another user's private event.
 pub fn reader_authorized_for_event(event: &nostr::Event, reader_pubkey_hex: &str) -> bool {
     let kind = crate::kind::event_kind_u32(event);
-    if kind != crate::kind::KIND_DM_VISIBILITY && kind != crate::kind::KIND_AGENT_TURN_METRIC {
+    if !crate::kind::RESULT_GATED_KINDS.contains(&kind) {
+        return true;
+    }
+    if crate::agent_job::is_job_kind(kind) && event.pubkey.to_hex() == reader_pubkey_hex {
         return true;
     }
     let p = nostr::SingleLetterTag::lowercase(nostr::Alphabet::P);
@@ -296,5 +298,32 @@ mod tests {
             !reader_authorized_for_event(&metric, &agent_keys.public_key().to_hex()),
             "the authoring agent must NOT be authorized to read its own metric event (owner-only)"
         );
+    }
+
+    #[test]
+    fn reader_authorized_for_event_gates_jobs_to_author_or_recipient() {
+        let author = Keys::generate();
+        let recipient = Keys::generate();
+        let attacker = Keys::generate();
+        let job = EventBuilder::new(
+            Kind::Custom(crate::kind::KIND_JOB_REQUEST as u16),
+            "encrypted",
+        )
+        .tags([Tag::public_key(recipient.public_key())])
+        .sign_with_keys(&author)
+        .expect("sign");
+
+        assert!(reader_authorized_for_event(
+            &job,
+            &author.public_key().to_hex()
+        ));
+        assert!(reader_authorized_for_event(
+            &job,
+            &recipient.public_key().to_hex()
+        ));
+        assert!(!reader_authorized_for_event(
+            &job,
+            &attacker.public_key().to_hex()
+        ));
     }
 }

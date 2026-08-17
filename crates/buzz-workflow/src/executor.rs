@@ -451,11 +451,15 @@ pub fn resolve_step_templates(
         AssignToAgent {
             agent,
             agent_pubkey,
+            agent_relay_pubkey,
+            agent_relay_url,
             instruction,
             timeout,
         } => Ok(AssignToAgent {
             agent: t(agent)?,
             agent_pubkey: agent_pubkey.clone(),
+            agent_relay_pubkey: agent_relay_pubkey.clone(),
+            agent_relay_url: agent_relay_url.clone(),
             instruction: t(instruction)?,
             timeout: timeout.clone(),
         }),
@@ -496,6 +500,8 @@ pub enum SuspendReason {
         rate_microunits_per_hour: Option<u64>,
         /// Relay-observed publication instant in Unix milliseconds.
         prompt_published_at_ms: i64,
+        /// Whether the prompt is an invisible cross-community job request.
+        remote: bool,
     },
 }
 
@@ -766,6 +772,8 @@ pub async fn dispatch_action(
         AssignToAgent {
             agent,
             agent_pubkey: agent_pubkey_hint,
+            agent_relay_pubkey,
+            agent_relay_url,
             instruction,
             timeout,
         } => {
@@ -806,8 +814,34 @@ pub async fn dispatch_action(
             // nobody"), which would otherwise let this step appear to
             // succeed while no agent was actually woken. Surface either
             // failure mode as a typed step failure instead.
-            let agent_pubkey = match agent_pubkey_hint {
-                Some(pk) => sink
+            let remote_coordinate = match (agent_relay_pubkey, agent_relay_url) {
+                (Some(relay_pubkey), Some(relay_url)) => Some(
+                    crate::action_sink::AgentRelayCoordinate {
+                        relay_pubkey: hex::decode(relay_pubkey).map_err(|error| {
+                            WorkflowError::InvalidDefinition(format!(
+                                "AssignToAgent: invalid agent_relay_pubkey: {error}"
+                            ))
+                        })?,
+                        relay_url: relay_url.clone(),
+                    },
+                ),
+                (None, None) => None,
+                _ => {
+                    return Err(WorkflowError::InvalidDefinition(
+                        "AssignToAgent: remote coordinates are incomplete".into(),
+                    ));
+                }
+            };
+            let agent_pubkey = match (agent_pubkey_hint, remote_coordinate.as_ref()) {
+                (Some(pk), Some(_)) => nostr::PublicKey::from_hex(pk)
+                    .map_err(|error| {
+                        WorkflowError::InvalidDefinition(format!(
+                            "AssignToAgent: invalid agent_pubkey: {error}"
+                        ))
+                    })?
+                    .to_bytes()
+                    .to_vec(),
+                (Some(pk), None) => sink
                     .verify_agent_membership(community_id, &channel_id, pk)
                     .await
                     .map_err(WorkflowError::from)?
@@ -816,7 +850,12 @@ pub async fn dispatch_action(
                             "AssignToAgent: agent_pubkey '{pk}' is not a member of channel {channel_id}"
                         ))
                     })?,
-                None => sink
+                (None, Some(_)) => {
+                    return Err(WorkflowError::InvalidDefinition(
+                        "AssignToAgent: remote assignments require agent_pubkey".into(),
+                    ));
+                }
+                (None, None) => sink
                     .resolve_agent(community_id, &channel_id, agent)
                     .await
                     .map_err(WorkflowError::from)?
@@ -830,7 +869,11 @@ pub async fn dispatch_action(
             let text = format!("@{agent} {instruction}");
 
             let marketplace = sink
-                .agent_marketplace_snapshot(community_id, &agent_pubkey)
+                .agent_marketplace_snapshot(
+                    community_id,
+                    &agent_pubkey,
+                    remote_coordinate.as_ref(),
+                )
                 .await
                 .map_err(WorkflowError::from)?
                 .ok_or_else(|| {
@@ -838,11 +881,23 @@ pub async fn dispatch_action(
                         "AssignToAgent: agent '{agent}' has no verified owner"
                     ))
                 })?;
-            if marketplace_required && !marketplace.listed {
+            if (marketplace_required || remote_coordinate.is_some()) && !marketplace.listed {
                 return Err(WorkflowError::InvalidDefinition(format!(
                     "AssignToAgent: agent '{agent}' is not currently listed"
                 )));
             }
+            let remote_assignment = match remote_coordinate {
+                Some(coordinate) => Some(crate::action_sink::RemoteAgentAssignment {
+                    coordinate,
+                    listing_event_id: marketplace.listing_event_id.clone().ok_or_else(|| {
+                        WorkflowError::InvalidDefinition(
+                            "AssignToAgent: remote listing snapshot has no event id".into(),
+                        )
+                    })?,
+                    instruction: instruction.clone(),
+                }),
+                None => None,
+            };
 
             info!(
                 run_id = %run_id,
@@ -875,6 +930,7 @@ pub async fn dispatch_action(
                         timeout_secs: parse_duration_secs(timeout_str)?,
                         trace_prefix: trace_prefix.to_vec(),
                         step_started_at,
+                        remote: remote_assignment,
                     }),
                 )
                 .await
@@ -904,6 +960,7 @@ pub async fn dispatch_action(
                     rate_currency: marketplace.rate_currency,
                     rate_microunits_per_hour: marketplace.rate_microunits_per_hour,
                     prompt_published_at_ms,
+                    remote: marketplace.listing_event_id.is_some(),
                 },
                 timeout: timeout_str.to_owned(),
             })
@@ -1002,34 +1059,11 @@ pub(crate) fn parse_duration_secs(duration: &str) -> Result<u64, WorkflowError> 
 /// in the HTTP client, preventing DNS rebinding TOCTOU attacks.
 #[cfg(feature = "reqwest")]
 async fn check_ssrf(host: &str, port: u16) -> Result<std::net::IpAddr, WorkflowError> {
-    let addr_str = format!("{host}:{port}");
-    let addrs: Vec<std::net::IpAddr> = tokio::task::spawn_blocking(move || {
-        use std::net::ToSocketAddrs;
-        addr_str
-            .to_socket_addrs()
-            .map(|iter| iter.map(|sa| sa.ip()).collect::<Vec<_>>())
-    })
-    .await
-    .map_err(|e| WorkflowError::WebhookError(format!("SSRF check task failed: {e}")))?
-    .map_err(|e| WorkflowError::WebhookError(format!("DNS resolution failed: {e}")))?;
-
-    if addrs.is_empty() {
-        return Err(WorkflowError::WebhookError(
-            "DNS resolution returned no addresses".into(),
-        ));
-    }
-
-    debug!("Resolved webhook host '{}' → {:?}", host, addrs);
-
-    for ip in &addrs {
-        if buzz_core::network::is_private_ip(ip) {
-            return Err(WorkflowError::WebhookError(format!(
-                "SSRF blocked: '{host}' resolved to private/reserved address {ip}"
-            )));
-        }
-    }
-
-    Ok(addrs[0])
+    let host = host.to_owned();
+    tokio::task::spawn_blocking(move || buzz_core::network::resolve_public_host(&host, port))
+        .await
+        .map_err(|e| WorkflowError::WebhookError(format!("SSRF check task failed: {e}")))?
+        .map_err(|e| WorkflowError::WebhookError(format!("SSRF blocked: {e}")))
 }
 
 /// Maximum response body size for webhook calls (1 MiB).
@@ -1557,6 +1591,7 @@ async fn execute_steps(
                     prompt_created_at,
                     root_event_id,
                     root_created_at,
+                    remote: false,
                     ..
                 } = &reason
                 {
@@ -2361,6 +2396,7 @@ mod tests {
             &'a self,
             _community_id: CommunityId,
             agent_pubkey: &'a [u8],
+            _coordinate: Option<&'a crate::action_sink::AgentRelayCoordinate>,
         ) -> std::pin::Pin<
             Box<
                 dyn std::future::Future<
@@ -2379,6 +2415,7 @@ mod tests {
                     listed: true,
                     rate_currency: Some("USD".into()),
                     rate_microunits_per_hour: Some(12_000_000),
+                    listing_event_id: None,
                 }))
             })
         }
@@ -2471,6 +2508,8 @@ mod tests {
         let action = ActionDef::AssignToAgent {
             agent: "Lep".to_owned(),
             agent_pubkey: None,
+            agent_relay_pubkey: None,
+            agent_relay_url: None,
             instruction: "please investigate".to_owned(),
             timeout: None,
         };
@@ -2546,6 +2585,8 @@ mod tests {
         let action = ActionDef::AssignToAgent {
             agent: "Lep".to_owned(),
             agent_pubkey: Some(pubkey_hex),
+            agent_relay_pubkey: None,
+            agent_relay_url: None,
             instruction: "please investigate".to_owned(),
             timeout: None,
         };
@@ -2603,6 +2644,8 @@ mod tests {
         let action = ActionDef::AssignToAgent {
             agent: "Lep".to_owned(),
             agent_pubkey: Some(pubkey_hex),
+            agent_relay_pubkey: None,
+            agent_relay_url: None,
             instruction: "please investigate".to_owned(),
             timeout: None,
         };
@@ -2657,6 +2700,8 @@ mod tests {
         let action = ActionDef::AssignToAgent {
             agent: "Nobody".to_owned(),
             agent_pubkey: None,
+            agent_relay_pubkey: None,
+            agent_relay_url: None,
             instruction: "please investigate".to_owned(),
             timeout: None,
         };

@@ -35,10 +35,27 @@ fn migrate_legacy_retention_into(
     }
 }
 
-#[derive(Deserialize)]
-struct RelayInfoIcon {
+#[derive(Default, Deserialize)]
+struct RelayInfo {
     #[serde(default)]
     icon: Option<String>,
+    #[serde(default, rename = "self")]
+    self_: Option<String>,
+}
+
+async fn fetch_relay_info(relay_url: &str, state: &AppState) -> Option<RelayInfo> {
+    let http_url = relay::relay_http_base_url(relay_url);
+    let response = state
+        .http_client
+        .get(&http_url)
+        .header("Accept", "application/nostr+json")
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    response.json::<RelayInfo>().await.ok()
 }
 
 /// Fetch a relay's workspace icon from its NIP-11 relay information document.
@@ -52,24 +69,24 @@ pub async fn fetch_workspace_icon(
     relay_url: String,
     state: State<'_, AppState>,
 ) -> Result<Option<String>, String> {
-    let http_url = relay::relay_http_base_url(&relay_url);
-    let Ok(response) = state
-        .http_client
-        .get(&http_url)
-        .header("Accept", "application/nostr+json")
-        .send()
+    Ok(fetch_relay_info(&relay_url, &state)
         .await
-    else {
-        return Ok(None);
-    };
-    if !response.status().is_success() {
-        return Ok(None);
-    }
-    let doc = response
-        .json::<RelayInfoIcon>()
+        .and_then(|doc| doc.icon)
+        .filter(|icon| !icon.is_empty()))
+}
+
+/// Fetch and validate an arbitrary configured relay's NIP-11 `self` pubkey.
+#[tauri::command]
+pub async fn fetch_relay_self_for_url(
+    relay_url: String,
+    state: State<'_, AppState>,
+) -> Result<Option<String>, String> {
+    let relay_self = fetch_relay_info(&relay_url, &state)
         .await
-        .unwrap_or(RelayInfoIcon { icon: None });
-    Ok(doc.icon.filter(|icon| !icon.is_empty()))
+        .and_then(|doc| doc.self_)
+        .map(|value| value.to_ascii_lowercase());
+    Ok(relay_self
+        .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())))
 }
 
 #[derive(Serialize)]

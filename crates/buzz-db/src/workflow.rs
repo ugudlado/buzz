@@ -1380,6 +1380,18 @@ pub struct AgentStepRecord {
     pub duration_ms: Option<i64>,
     /// Marketplace outcome independent of the operational step status.
     pub outcome: Option<String>,
+    /// Random correlation id for a cross-community request.
+    pub request_id: Option<String>,
+    /// Caller relay identity for a cross-community request.
+    pub origin_relay_pubkey: Option<Vec<u8>>,
+    /// Agent home-relay identity for a cross-community request.
+    pub agent_relay_pubkey: Option<Vec<u8>>,
+    /// Agent home-relay URL for delivery and retry.
+    pub agent_relay_url: Option<String>,
+    /// Exact remote listing accepted at dispatch.
+    pub listing_event_id: Option<String>,
+    /// When the target relay first accepted the request.
+    pub delivered_at: Option<DateTime<Utc>>,
 }
 
 /// Parameters for creating a new agent-assignment step.
@@ -1411,6 +1423,16 @@ pub struct CreateAgentStepParams<'a> {
     pub expires_at: DateTime<Utc>,
     /// Complete executor checkpoint through the waiting assignment.
     pub execution_trace: Option<&'a serde_json::Value>,
+    /// Remote request correlation id, absent for local assignments.
+    pub request_id: Option<&'a str>,
+    /// Caller relay identity, absent for local assignments.
+    pub origin_relay_pubkey: Option<&'a [u8]>,
+    /// Agent home-relay identity, absent for local assignments.
+    pub agent_relay_pubkey: Option<&'a [u8]>,
+    /// Agent home-relay URL, absent for local assignments.
+    pub agent_relay_url: Option<&'a str>,
+    /// Exact remote listing event, absent for local assignments.
+    pub listing_event_id: Option<&'a str>,
 }
 
 /// Atomically insert a pending assignment and arm its run as `waiting_agent`.
@@ -1440,6 +1462,11 @@ pub(crate) async fn create_agent_step_tx(
         prompt_published_at,
         expires_at,
         execution_trace,
+        request_id,
+        origin_relay_pubkey,
+        agent_relay_pubkey,
+        agent_relay_url,
+        listing_event_id,
     } = params;
 
     let inserted = sqlx::query(
@@ -1447,8 +1474,10 @@ pub(crate) async fn create_agent_step_tx(
         INSERT INTO workflow_agent_steps
             (community_id, prompt_event_id, workflow_id, run_id, step_id, step_index,
              agent_pubkey, agent_owner_pubkey, rate_currency, rate_microunits_per_hour,
-             prompt_published_at, status, expires_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'pending', $12)
+             prompt_published_at, status, expires_at, request_id, origin_relay_pubkey,
+             agent_relay_pubkey, agent_relay_url, listing_event_id, next_delivery_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'pending', $12,
+                $13, $14, $15, $16, $17, CASE WHEN $13 IS NULL THEN NULL ELSE NOW() END)
         ON CONFLICT (community_id, prompt_event_id) DO NOTHING
         "#,
     )
@@ -1464,6 +1493,11 @@ pub(crate) async fn create_agent_step_tx(
     .bind(rate_microunits_per_hour.map(|value| value as i64))
     .bind(prompt_published_at)
     .bind(expires_at)
+    .bind(request_id)
+    .bind(origin_relay_pubkey)
+    .bind(agent_relay_pubkey)
+    .bind(agent_relay_url)
+    .bind(listing_event_id)
     .execute(&mut **tx)
     .await?
     .rows_affected()
@@ -1517,6 +1551,82 @@ pub async fn update_waiting_agent_trace(
         > 0)
 }
 
+/// A pending cross-community request that is due for relay-to-relay delivery.
+#[derive(Debug, Clone)]
+pub struct RemoteAgentDelivery {
+    /// Community that owns the request event.
+    pub community_id: CommunityId,
+    /// Request event id, also the durable assignment key.
+    pub prompt_event_id: String,
+    /// Expected NIP-11 identity of the target relay.
+    pub agent_relay_pubkey: Vec<u8>,
+    /// Target relay URL.
+    pub agent_relay_url: String,
+}
+
+/// List undelivered remote requests whose bounded backoff has elapsed.
+pub async fn list_due_remote_agent_deliveries(
+    pool: &PgPool,
+    limit: i64,
+) -> Result<Vec<RemoteAgentDelivery>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT community_id, prompt_event_id, agent_relay_pubkey, agent_relay_url
+        FROM workflow_agent_steps
+        WHERE status = 'pending'
+          AND request_id IS NOT NULL
+          AND delivered_at IS NULL
+          AND expires_at > NOW()
+          AND next_delivery_at <= NOW()
+        ORDER BY next_delivery_at
+        LIMIT $1
+        "#,
+    )
+    .bind(limit.clamp(1, LIST_MAX_LIMIT))
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            let community_id: Uuid = row.try_get("community_id")?;
+            Ok(RemoteAgentDelivery {
+                community_id: CommunityId::from_uuid(community_id),
+                prompt_event_id: row.try_get("prompt_event_id")?,
+                agent_relay_pubkey: row.try_get("agent_relay_pubkey")?,
+                agent_relay_url: row.try_get("agent_relay_url")?,
+            })
+        })
+        .collect()
+}
+
+/// Record one delivery attempt; failures use capped exponential backoff.
+pub async fn record_remote_agent_delivery(
+    pool: &PgPool,
+    community_id: CommunityId,
+    prompt_event_id: &str,
+    error: Option<&str>,
+) -> Result<bool> {
+    let error = error.map(|value| value.chars().take(1_024).collect::<String>());
+    Ok(sqlx::query(
+        r#"
+        UPDATE workflow_agent_steps
+        SET delivery_attempts = delivery_attempts + 1,
+            delivered_at = CASE WHEN $3::TEXT IS NULL THEN NOW() ELSE delivered_at END,
+            last_delivery_error = $3,
+            next_delivery_at = CASE WHEN $3::TEXT IS NULL THEN NULL
+                ELSE NOW() + POWER(2, LEAST(delivery_attempts, 8)) * INTERVAL '1 second' END
+        WHERE community_id = $1 AND prompt_event_id = $2
+          AND status = 'pending' AND request_id IS NOT NULL AND delivered_at IS NULL
+        "#,
+    )
+    .bind(community_id.as_uuid())
+    .bind(prompt_event_id)
+    .bind(error)
+    .execute(pool)
+    .await?
+    .rows_affected()
+        > 0)
+}
+
 /// Fetch an agent-assignment step by its prompt event id.
 pub async fn get_agent_step(
     pool: &PgPool,
@@ -1528,7 +1638,9 @@ pub async fn get_agent_step(
         SELECT prompt_event_id, workflow_id, run_id, step_id, step_index, agent_pubkey,
                status::text AS status, output, expires_at, created_at, resolved_at,
                agent_owner_pubkey, rate_currency, rate_microunits_per_hour,
-               prompt_published_at, completion_event_id, terminal_at, duration_ms, outcome
+               prompt_published_at, completion_event_id, terminal_at, duration_ms, outcome,
+               request_id, origin_relay_pubkey, agent_relay_pubkey, agent_relay_url,
+               listing_event_id, delivered_at
         FROM workflow_agent_steps
         WHERE community_id = $1 AND prompt_event_id = $2
         "#,
@@ -1553,7 +1665,9 @@ pub async fn list_agent_steps_for_run(
         SELECT prompt_event_id, workflow_id, run_id, step_id, step_index, agent_pubkey,
                status::text AS status, output, expires_at, created_at, resolved_at,
                agent_owner_pubkey, rate_currency, rate_microunits_per_hour,
-               prompt_published_at, completion_event_id, terminal_at, duration_ms, outcome
+               prompt_published_at, completion_event_id, terminal_at, duration_ms, outcome,
+               request_id, origin_relay_pubkey, agent_relay_pubkey, agent_relay_url,
+               listing_event_id, delivered_at
         FROM workflow_agent_steps
         WHERE community_id = $1 AND run_id = $2
         ORDER BY step_index ASC
@@ -1657,6 +1771,8 @@ pub struct ExpiredAgentStep {
     pub run_id: Uuid,
     /// Zero-based index of the step that requested the assignment.
     pub step_index: i32,
+    /// Request event id, used to publish remote cancellation.
+    pub prompt_event_id: String,
 }
 
 /// Sweep overdue `workflow_agent_steps` rows (`status = 'pending' AND
@@ -1693,7 +1809,8 @@ pub async fn sweep_expired_agent_steps(pool: &PgPool, limit: i64) -> Result<Vec<
             WHERE step.community_id = candidates.community_id
               AND step.prompt_event_id = candidates.prompt_event_id
               AND step.status = 'pending'
-            RETURNING step.community_id, step.run_id, step.step_index
+            RETURNING step.community_id, step.run_id, step.step_index,
+                      step.prompt_event_id
         )
         UPDATE workflow_runs AS run
         SET status = 'failed'::run_status,
@@ -1705,7 +1822,8 @@ pub async fn sweep_expired_agent_steps(pool: &PgPool, limit: i64) -> Result<Vec<
           AND run.id = expired.run_id
           AND run.status = 'waiting_agent'
           AND run.current_step = expired.step_index
-        RETURNING expired.community_id, expired.run_id, expired.step_index
+        RETURNING expired.community_id, expired.run_id, expired.step_index,
+                  expired.prompt_event_id
         "#,
     )
     .bind(limit)
@@ -1719,6 +1837,7 @@ pub async fn sweep_expired_agent_steps(pool: &PgPool, limit: i64) -> Result<Vec<
                 community_id: CommunityId::from_uuid(community_id),
                 run_id: row.try_get("run_id")?,
                 step_index: row.try_get("step_index")?,
+                prompt_event_id: row.try_get("prompt_event_id")?,
             })
         })
         .collect()
@@ -1896,6 +2015,12 @@ fn row_to_agent_step_record(row: sqlx::postgres::PgRow) -> Result<AgentStepRecor
         terminal_at: row.try_get("terminal_at")?,
         duration_ms: row.try_get("duration_ms")?,
         outcome: row.try_get("outcome")?,
+        request_id: row.try_get("request_id")?,
+        origin_relay_pubkey: row.try_get("origin_relay_pubkey")?,
+        agent_relay_pubkey: row.try_get("agent_relay_pubkey")?,
+        agent_relay_url: row.try_get("agent_relay_url")?,
+        listing_event_id: row.try_get("listing_event_id")?,
+        delivered_at: row.try_get("delivered_at")?,
     })
 }
 
@@ -3153,6 +3278,11 @@ mod tests {
                 prompt_published_at: Utc::now(),
                 expires_at,
                 execution_trace: None,
+                request_id: None,
+                origin_relay_pubkey: None,
+                agent_relay_pubkey: None,
+                agent_relay_url: None,
+                listing_event_id: None,
             },
         )
         .await

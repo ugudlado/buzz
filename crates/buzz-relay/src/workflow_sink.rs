@@ -12,7 +12,8 @@ use buzz_core::kind::{KIND_MANAGED_AGENT, KIND_STREAM_MESSAGE};
 use buzz_core::marketplace::AgentMarketplace;
 use buzz_core::tenant::CommunityId;
 use buzz_workflow::action_sink::{
-    ActionSink, ActionSinkError, AgentAssignmentArm, AgentMarketplaceSnapshot, ThreadAnchor,
+    ActionSink, ActionSinkError, AgentAssignmentArm, AgentMarketplaceSnapshot,
+    AgentRelayCoordinate, ThreadAnchor,
 };
 use chrono::Utc;
 use nostr::{EventBuilder, Kind, Tag};
@@ -306,6 +307,125 @@ impl ActionSink for RelayActionSink {
                 ));
             }
 
+            if assignment
+                .as_ref()
+                .and_then(|assignment| assignment.remote.as_ref())
+                .is_some()
+            {
+                let assignment = assignment.ok_or_else(|| {
+                    ActionSinkError::InvalidInput("remote assignment is missing".into())
+                })?;
+                let remote = assignment.remote.as_ref().ok_or_else(|| {
+                    ActionSinkError::InvalidInput("remote assignment is missing".into())
+                })?;
+                let target_agent =
+                    nostr::PublicKey::from_slice(&assignment.agent_pubkey).map_err(|error| {
+                        ActionSinkError::InvalidInput(format!("invalid agent pubkey: {error}"))
+                    })?;
+                let target_relay = nostr::PublicKey::from_slice(&remote.coordinate.relay_pubkey)
+                    .map_err(|error| {
+                        ActionSinkError::InvalidInput(format!(
+                            "invalid agent relay pubkey: {error}"
+                        ))
+                    })?;
+                let prompt_published_at = Utc::now();
+                let expires_at = assignment_expiry(prompt_published_at, assignment.timeout_secs)?;
+                let request_id = Uuid::new_v4().to_string();
+                let payload = buzz_core::agent_job::JobRequestPayload {
+                    instruction: remote.instruction.clone(),
+                    caller_pubkey: author_pubkey_hex.clone(),
+                    workflow_id: assignment.workflow_id.to_string(),
+                    run_id: assignment.run_id.to_string(),
+                    step_id: assignment.step_id.clone(),
+                    channel_id: channel_id_canonical.clone(),
+                    listing_event_id: remote.listing_event_id.clone(),
+                };
+                let event = buzz_core::agent_job::build_request_event(
+                    &state.relay_keypair,
+                    &target_agent,
+                    &request_id,
+                    expires_at.timestamp() as u64,
+                    &state.config.relay_url,
+                    &payload,
+                )
+                .map_err(|error| ActionSinkError::EventBuild(error.to_string()))?;
+                let event_id_hex = event.id.to_hex();
+                let mut trace = assignment.trace_prefix.clone();
+                trace.push(serde_json::json!({
+                    "step_id": assignment.step_id,
+                    "status": "waiting",
+                    "started_at": assignment.step_started_at,
+                    "completed_at": null,
+                    "__prompt_thread": null,
+                }));
+                let execution_trace = serde_json::Value::Array(trace);
+                let (stored_event, _) = state
+                    .db
+                    .insert_workflow_assignment_event(
+                        tenant.community(),
+                        &event,
+                        None,
+                        None,
+                        buzz_db::workflow::CreateAgentStepParams {
+                            community_id,
+                            prompt_event_id: &event_id_hex,
+                            workflow_id: assignment.workflow_id,
+                            run_id: assignment.run_id,
+                            step_id: &assignment.step_id,
+                            step_index: assignment.step_index,
+                            agent_pubkey: &assignment.agent_pubkey,
+                            agent_owner_pubkey: &assignment.agent_owner_pubkey,
+                            rate_currency: assignment.rate_currency.as_deref(),
+                            rate_microunits_per_hour: assignment.rate_microunits_per_hour,
+                            prompt_published_at,
+                            expires_at,
+                            execution_trace: Some(&execution_trace),
+                            request_id: Some(&request_id),
+                            origin_relay_pubkey: Some(state.relay_keypair.public_key().as_bytes()),
+                            agent_relay_pubkey: Some(&remote.coordinate.relay_pubkey),
+                            agent_relay_url: Some(&remote.coordinate.relay_url),
+                            listing_event_id: Some(&remote.listing_event_id),
+                        },
+                    )
+                    .await
+                    .map_err(|error| ActionSinkError::Database(error.to_string()))?;
+                let _ = dispatch_persistent_event(
+                    &tenant,
+                    &state,
+                    &stored_event,
+                    buzz_core::kind::KIND_JOB_REQUEST,
+                    &author_pubkey_hex,
+                    None,
+                )
+                .await;
+                match crate::remote_jobs::submit_remote_event(
+                    &state.relay_keypair,
+                    &remote.coordinate.relay_url,
+                    &target_relay,
+                    &event,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        if let Err(error) = state
+                            .db
+                            .record_remote_agent_delivery(community_id, &event_id_hex, None)
+                            .await
+                        {
+                            tracing::warn!(event_id = %event_id_hex, %error, "failed to record remote job delivery");
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(event_id = %event_id_hex, %error, "remote job delivery deferred for retry");
+                        let _ = state
+                            .db
+                            .record_remote_agent_delivery(community_id, &event_id_hex, Some(&error))
+                            .await;
+                    }
+                }
+                return Ok(event_id_hex);
+            }
+
             // 3. Build kind:9 Nostr event
             //    - Signed by relay keypair (event.pubkey = relay pubkey)
             //    - `p` tag attributes the message to the workflow owner
@@ -463,6 +583,11 @@ impl ActionSink for RelayActionSink {
                                 prompt_published_at,
                                 expires_at,
                                 execution_trace: Some(&execution_trace),
+                                request_id: None,
+                                origin_relay_pubkey: None,
+                                agent_relay_pubkey: None,
+                                agent_relay_url: None,
+                                listing_event_id: None,
                             },
                         )
                         .await
@@ -610,6 +735,7 @@ impl ActionSink for RelayActionSink {
         &'a self,
         community_id: CommunityId,
         agent_pubkey: &'a [u8],
+        coordinate: Option<&'a AgentRelayCoordinate>,
     ) -> Pin<
         Box<
             dyn Future<Output = Result<Option<AgentMarketplaceSnapshot>, ActionSinkError>>
@@ -622,6 +748,51 @@ impl ActionSink for RelayActionSink {
                 .state
                 .upgrade()
                 .ok_or_else(|| ActionSinkError::Database("relay is shutting down".into()))?;
+            if let Some(coordinate) = coordinate {
+                let relay_pubkey =
+                    nostr::PublicKey::from_slice(&coordinate.relay_pubkey).map_err(|error| {
+                        ActionSinkError::InvalidInput(format!(
+                            "invalid agent relay pubkey: {error}"
+                        ))
+                    })?;
+                let agent_pubkey = nostr::PublicKey::from_slice(agent_pubkey).map_err(|error| {
+                    ActionSinkError::InvalidInput(format!("invalid agent pubkey: {error}"))
+                })?;
+                let listing = crate::remote_jobs::query_remote_listing(
+                    &state.relay_keypair,
+                    &state.config.relay_url,
+                    &coordinate.relay_url,
+                    &relay_pubkey,
+                    &agent_pubkey,
+                )
+                .await
+                .map_err(ActionSinkError::InvalidInput)?;
+                let policy = listing
+                    .marketplace
+                    .remote_invocation
+                    .as_ref()
+                    .ok_or_else(|| {
+                        ActionSinkError::InvalidInput(
+                            "remote invocation is not enabled by the listing".into(),
+                        )
+                    })?;
+                if !policy.allows(&state.relay_keypair.public_key().to_hex()) {
+                    return Err(ActionSinkError::InvalidInput(
+                        "this relay is not allowed by the remote listing".into(),
+                    ));
+                }
+                let (rate_currency, rate_microunits_per_hour) =
+                    listing.marketplace.pricing.map_or((None, None), |rate| {
+                        (Some(rate.currency), Some(rate.microunits_per_hour))
+                    });
+                return Ok(Some(AgentMarketplaceSnapshot {
+                    owner_pubkey: listing.owner_pubkey,
+                    listed: true,
+                    rate_currency,
+                    rate_microunits_per_hour,
+                    listing_event_id: Some(listing.event_id),
+                }));
+            }
             let (_, owner) = state
                 .db
                 .get_agent_channel_policy(community_id, agent_pubkey)
@@ -666,6 +837,7 @@ impl ActionSink for RelayActionSink {
                 listed,
                 rate_currency,
                 rate_microunits_per_hour,
+                listing_event_id: None,
             }))
         })
     }

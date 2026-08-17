@@ -49,6 +49,10 @@ export type AssignmentReviewState = "not_required" | "human_review_required";
 export type AssignmentReceipt = {
   agentPubkey: string;
   agentOwnerPubkey: string | null;
+  originRelayPubkey: string | null;
+  agentRelayPubkey: string | null;
+  agentRelayUrl: string | null;
+  listingEventId: string | null;
   promptEventId: string;
   completionEventId: string | null;
   promptPublishedAtMs: number | null;

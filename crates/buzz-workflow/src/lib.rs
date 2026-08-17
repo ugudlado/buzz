@@ -487,6 +487,11 @@ impl WorkflowEngine {
             prompt_published_at,
             expires_at,
             execution_trace: Some(trace_json),
+            request_id: None,
+            origin_relay_pubkey: None,
+            agent_relay_pubkey: None,
+            agent_relay_url: None,
+            listing_event_id: None,
         };
 
         if let Err(e) = self.db.create_agent_step(params).await {
