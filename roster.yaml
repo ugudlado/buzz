@@ -35,4 +35,5 @@ steps:
   design-review: reviewer
   implement: implementer
   code-review: reviewer
+  verify-changes: reviewer
   learn: reviewer
