@@ -1303,22 +1303,72 @@ fn to_ws_url(http_url: &str) -> String {
 }
 
 /// Normalize raw event JSON array into consistent shape.
-/// Each event becomes: {id, pubkey, kind, content, created_at, tags}
+/// Each event becomes: {id, pubkey, kind, content, created_at, tags, sig}
+/// `sig` is passed through as-is when the upstream relay response carries it
+/// (never fabricated) so downstream consumers can verify signatures; `--format
+/// compact` (see `format_events`) drops it again for reduced agent scanning.
 pub fn normalize_events(events: &[serde_json::Value]) -> String {
     let normalized: Vec<serde_json::Value> = events
         .iter()
         .map(|e| {
-            serde_json::json!({
+            let mut event = serde_json::json!({
                 "id": e.get("id").and_then(|v| v.as_str()).unwrap_or(""),
                 "pubkey": e.get("pubkey").and_then(|v| v.as_str()).unwrap_or(""),
                 "kind": e.get("kind").and_then(|v| v.as_u64()).unwrap_or(0),
                 "content": e.get("content").and_then(|v| v.as_str()).unwrap_or(""),
                 "created_at": e.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0),
                 "tags": e.get("tags").cloned().unwrap_or(serde_json::json!([])),
-            })
+            });
+            if let Some(sig) = e.get("sig").and_then(|v| v.as_str()) {
+                event["sig"] = serde_json::json!(sig);
+            }
+            event
         })
         .collect();
     serde_json::to_string(&normalized).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod normalize_events_tests {
+    use super::normalize_events;
+
+    fn sample_event(sig: Option<&str>) -> serde_json::Value {
+        let mut e = serde_json::json!({
+            "id": "abc123",
+            "pubkey": "def456",
+            "kind": 9,
+            "content": "hello",
+            "created_at": 1_700_000_000,
+            "tags": [["h", "channel-uuid"]],
+        });
+        if let Some(sig) = sig {
+            e["sig"] = serde_json::json!(sig);
+        }
+        e
+    }
+
+    #[test]
+    fn json_format_preserves_sig_when_present() {
+        let events = vec![sample_event(Some("deadbeef"))];
+        let normalized = normalize_events(&events);
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&normalized).unwrap();
+        assert_eq!(
+            parsed[0].get("sig").and_then(|v| v.as_str()),
+            Some("deadbeef"),
+            "normalize_events must pass through sig unchanged when the relay supplied it"
+        );
+    }
+
+    #[test]
+    fn json_format_omits_sig_key_when_absent_upstream() {
+        let events = vec![sample_event(None)];
+        let normalized = normalize_events(&events);
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&normalized).unwrap();
+        assert!(
+            parsed[0].get("sig").is_none(),
+            "normalize_events must not fabricate a sig field the relay never sent"
+        );
+    }
 }
 
 /// Extract the d-tag value from a Nostr event JSON object.

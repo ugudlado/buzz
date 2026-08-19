@@ -993,8 +993,8 @@ pub async fn dispatch(
 #[cfg(test)]
 mod tests {
     use super::{
-        event_mention_pubkeys, find_root_from_tags, match_profiles_by_name, merge_message_mentions,
-        missing_members, normalize_explicit_mentions, parse_member_pubkeys,
+        event_mention_pubkeys, find_root_from_tags, format_events, match_profiles_by_name,
+        merge_message_mentions, missing_members, normalize_explicit_mentions, parse_member_pubkeys,
         resolve_names_to_pubkeys,
     };
     use buzz_sdk::mentions::{
@@ -1011,6 +1011,35 @@ mod tests {
     const PK_VALID_A: &str = "35c18ae273fccfaf80d629e20e7f8721b90499379addff533054acc2504c12b4";
     const PK_VALID_B: &str = "c6237ef84fa537c78dcee78efd2d4e59f728859c7f194da42ac51ededfa0be05";
     const PK_VALID_C: &str = "f4a42a97e594b77bdbd8ee35191c8b28a94a4cb871d96f32921558275421fb68";
+
+    #[test]
+    fn format_events_json_preserves_sig_compact_omits_it() {
+        let normalized = json!([{
+            "id": ID_A,
+            "pubkey": PUBKEY,
+            "kind": 9,
+            "content": "hi",
+            "created_at": 1_700_000_000,
+            "tags": [],
+            "sig": "deadbeef",
+        }])
+        .to_string();
+
+        let json_out = format_events(&normalized, &crate::OutputFormat::Json);
+        let json_parsed: serde_json::Value = serde_json::from_str(&json_out).unwrap();
+        assert_eq!(
+            json_parsed[0].get("sig").and_then(|v| v.as_str()),
+            Some("deadbeef"),
+            "--format json must preserve sig"
+        );
+
+        let compact_out = format_events(&normalized, &crate::OutputFormat::Compact);
+        let compact_parsed: serde_json::Value = serde_json::from_str(&compact_out).unwrap();
+        assert!(
+            compact_parsed[0].get("sig").is_none(),
+            "--format compact must omit sig"
+        );
+    }
 
     #[test]
     fn root_marker_wins_over_reply_marker() {
