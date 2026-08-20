@@ -46,18 +46,11 @@ const BUZZ_CLI_SKILL_MD: &str = include_str!("nest_skill.md");
 /// Workflow skills shared by Buzz-managed agents. The source files stay in
 /// the repository's canonical `.agents/skills` directory and are embedded in
 /// the desktop binary for installation into the nest.
-const MANAGED_WORKFLOW_SKILLS: &[(&str, &str, u32)] = &[
-    (
-        "orchestrate",
-        include_str!("../../../../.agents/skills/orchestrate/SKILL.md"),
-        3,
-    ),
-    (
-        "workflow-step",
-        include_str!("../../../../.agents/skills/workflow-step/SKILL.md"),
-        2,
-    ),
-];
+const MANAGED_WORKFLOW_SKILLS: &[(&str, &str, u32)] = &[(
+    "orchestrate",
+    include_str!("../../../../.agents/skills/orchestrate/SKILL.md"),
+    3,
+)];
 
 /// Template content version for AGENTS.md static content (above managed markers).
 /// Bump this when changing `nest_agents.md` to trigger refresh on existing installs.
@@ -271,7 +264,7 @@ pub fn ensure_nest_at(root: &Path) -> Result<(), String> {
         // Skill directory trees inside root get 700.
         // Build the list from canonical path + all known provider skill dirs.
         let mut skill_perm_dirs = Vec::new();
-        for skill_name in ["buzz-cli", "orchestrate", "workflow-step"] {
+        for skill_name in ["buzz-cli", "orchestrate"] {
             let mut accumulated = std::path::PathBuf::new();
             let canonical = format!(".agents/skills/{skill_name}");
             for component in std::path::Path::new(&canonical).components() {

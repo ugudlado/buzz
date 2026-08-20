@@ -83,7 +83,8 @@ deploy/charts/*/charts/*.tgz
 
 .tmp
 
-# Per-agent skill/config fan-out (source of truth: .claude/skills + global ~/.claude/skills)
+# Shared skills are installed globally; project-specific skills stay tracked.
+.agents/skills/
 .goose/
 .cursor/
 skills-lock.json

@@ -139,7 +139,7 @@ fn ensure_nest_creates_skill_file() {
     // On unix, harness-specific symlinks should resolve to the canonical dir.
     #[cfg(unix)]
     {
-        for skill_name in ["buzz-cli", "orchestrate", "workflow-step"] {
+        for skill_name in ["buzz-cli", "orchestrate"] {
             for dir in [".goose/skills", ".claude/skills", ".codex/skills"] {
                 let link = root.join(dir).join(skill_name);
                 assert!(
@@ -182,7 +182,6 @@ fn ensure_nest_skill_dir_has_700_permissions() {
         ".agents/skills",
         ".agents/skills/buzz-cli",
         ".agents/skills/orchestrate",
-        ".agents/skills/workflow-step",
         ".goose",
         ".goose/skills",
         ".claude",
