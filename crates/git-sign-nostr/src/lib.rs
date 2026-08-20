@@ -1419,8 +1419,16 @@ fn parse_envelope(json_str: &str) -> Result<Envelope, String> {
             );
         }
 
-        // Validate oa[0] is a valid BIP-340 x-only public key (not just hex)
+        // Validate oa[0] is a valid BIP-340 x-only public key (not just hex).
+        //
+        // `from_hex` alone is NOT enough: it only checks hex shape, so a
+        // well-formed-but-off-curve value (e.g. 64 zeros) parses fine and the
+        // check silently passes. `xonly()` is what actually runs the
+        // point-on-curve validation — same idiom the verify paths use before
+        // `verify_schnorr`.
         PublicKey::from_hex(owner)
+            .map_err(|e| format!("oa[0] is not a valid BIP-340 public key: {e}"))?
+            .xonly()
             .map_err(|e| format!("oa[0] is not a valid BIP-340 public key: {e}"))?;
 
         // Self-attestation is meaningless — owner must differ from signer
@@ -2116,25 +2124,34 @@ Initial commit"
 
     #[test]
     fn test_parse_envelope_rejects_invalid_oa_pubkey() {
-        // oa[0] is valid hex but not a valid BIP-340 point (all zeros)
-        let zero_pk = "0".repeat(64);
-        let fake_sig = "b".repeat(128);
+        // Both values are well-formed 64-char hex but are NOT points on the
+        // secp256k1 curve, so `PublicKey::from_hex` accepts them (it checks
+        // hex shape only) and the parser must reject them at the `xonly()`
+        // curve check. All-zeros is the degenerate case; the second is an
+        // ordinary off-curve x-coordinate, so this stays honest if zero ever
+        // gets special-cased upstream.
         let sig_field = "a".repeat(128);
-        let json = [
-            r#"{"v":1,"pk":""#,
-            TEST_PK,
-            r#"","sig":""#,
-            &sig_field,
-            r#"","t":1700000000,"oa":[""#,
-            &zero_pk,
-            r#"","",""#,
-            &fake_sig,
-            r#""]}"#,
-        ]
-        .concat();
-        let result = parse_envelope(&json);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("BIP-340"));
+        let fake_sig = "b".repeat(128);
+        for bad_pk in [
+            "0".repeat(64),
+            "f".repeat(64), // > field prime p, and not a valid x-coordinate
+        ] {
+            let json = [
+                r#"{"v":1,"pk":""#,
+                TEST_PK,
+                r#"","sig":""#,
+                &sig_field,
+                r#"","t":1700000000,"oa":[""#,
+                &bad_pk,
+                r#"","",""#,
+                &fake_sig,
+                r#""]}"#,
+            ]
+            .concat();
+            let result = parse_envelope(&json);
+            assert!(result.is_err(), "off-curve oa[0] {bad_pk} must be rejected");
+            assert!(result.unwrap_err().contains("BIP-340"));
+        }
     }
 
     #[test]
