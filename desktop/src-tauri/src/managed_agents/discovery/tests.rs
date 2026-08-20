@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use super::overrides::{divergent_agent_command_override, update_time_agent_command_override};
+use super::pre_publish_test_hook::PrePublishHookGuard;
 use super::{
     apply_agent_command_update, classify_runtime, codex_adapter_availability,
     codex_adapter_is_outdated, create_time_agent_command_override, default_agent_command,
@@ -1742,23 +1743,6 @@ fn builtin_catalog_entry_has_empty_definition_env() {
 // to publishing its pre-probe `loaded_defs` snapshot — the original bug —
 // unlike the `custom_harnesses` seam tests, which pin only the fresh-read
 // contract of `warm_harness_registry_locked`.
-
-/// RAII guard: installs the pre-publish hook, clears it on drop (even on
-/// panic) so a failing test cannot poison later ones.
-struct PrePublishHookGuard;
-
-impl PrePublishHookGuard {
-    fn install(hook: Box<dyn Fn() + Send>) -> Self {
-        super::pre_publish_test_hook::set(Some(hook));
-        PrePublishHookGuard
-    }
-}
-
-impl Drop for PrePublishHookGuard {
-    fn drop(&mut self) {
-        super::pre_publish_test_hook::set(None);
-    }
-}
 
 fn harness_def(
     id: &str,

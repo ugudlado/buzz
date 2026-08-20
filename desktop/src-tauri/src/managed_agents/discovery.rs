@@ -440,13 +440,24 @@ pub fn try_record_agent_command(
     Ok(default_agent_command())
 }
 
+/// Harnesses that take their ACP subcommand implicitly and so need no args.
+const IMPLICIT_ACP_COMMANDS: &[&str] = &[
+    "codex",
+    "codex-acp",
+    "claude-agent-acp",
+    "claude-code-acp",
+    "claude-code",
+    "claudecode",
+    "hermes",
+    "hermes-agent",
+    "hermes-acp",
+    "buzz-agent",
+];
+
 fn default_agent_args(command: &str) -> Option<Vec<String>> {
     match normalize_command_identity(command).as_str() {
         "goose" => Some(vec!["acp".to_string()]),
-        "codex" | "codex-acp" | "claude-agent-acp" | "claude-code-acp" | "claude-code"
-        | "claudecode" | "hermes" | "hermes-agent" | "hermes-acp" | "buzz-agent" => {
-            Some(Vec::new())
-        }
+        other if IMPLICIT_ACP_COMMANDS.contains(&other) => Some(Vec::new()),
         _ => None,
     }
 }
@@ -462,12 +473,12 @@ pub fn normalize_agent_args(command: &str, agent_args: Vec<String>) -> Vec<Strin
         return normalized;
     };
 
-    if normalized.is_empty() {
-        return default_args;
-    }
-
-    if normalized.len() == 1 && normalized[0].eq_ignore_ascii_case("acp") && default_args.is_empty()
-    {
+    // Empty args take the default; a lone redundant `acp` is dropped for the
+    // wrappers that take the subcommand implicitly.
+    let redundant_acp = normalized.len() == 1
+        && normalized[0].eq_ignore_ascii_case("acp")
+        && default_args.is_empty();
+    if normalized.is_empty() || redundant_acp {
         return default_args;
     }
 
@@ -1590,33 +1601,8 @@ pub fn discover_acp_runtimes_from(
     entries
 }
 
-/// Test-only seam: a callback invoked between discovery's directory scan and
-/// its registry publish, so tests can land a `save_and_warm`/`delete_and_warm`
-/// in exactly the window the stale-snapshot bug lived in — through the REAL
-/// `discover_acp_runtimes_from` call path, not a hand-called seam.
 #[cfg(test)]
-pub(crate) mod pre_publish_test_hook {
-    use std::sync::{Mutex, OnceLock};
-
-    type Hook = Box<dyn Fn() + Send>;
-
-    fn cell() -> &'static Mutex<Option<Hook>> {
-        static CELL: OnceLock<Mutex<Option<Hook>>> = OnceLock::new();
-        CELL.get_or_init(|| Mutex::new(None))
-    }
-
-    /// Install (or clear, with `None`) the hook. Callers must serialize via
-    /// `registry_test_lock` — the hook is process-global.
-    pub(crate) fn set(hook: Option<Hook>) {
-        *cell().lock().unwrap_or_else(|e| e.into_inner()) = hook;
-    }
-
-    pub(crate) fn run() {
-        if let Some(hook) = cell().lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-            hook();
-        }
-    }
-}
+pub(crate) mod pre_publish_test_hook;
 
 pub fn managed_agent_avatar_url(command: &str) -> Option<String> {
     let runtime = known_acp_runtime(command)?;

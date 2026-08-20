@@ -69,9 +69,9 @@ pub use lifecycle::{kill_stale_tracked_processes, sync_managed_agent_processes};
 
 mod summary;
 pub use summary::build_managed_agent_summary;
+pub(crate) use summary::workspace_pair_key;
 #[cfg(test)]
 pub(crate) use summary::{persona_drift_state, resolve_workspace_pair_key};
-pub(crate) use summary::workspace_pair_key;
 
 pub fn find_managed_agent_mut<'a>(
     records: &'a mut [ManagedAgentRecord],

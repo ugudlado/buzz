@@ -11,6 +11,17 @@ import {
   useUpdateManagedAgentMutation,
 } from "@/features/agents/hooks";
 import { useCommunities } from "@/features/communities/useCommunities";
+import { AgentCatalogCard } from "@/features/workflows/ui/AgentCatalogCard";
+import {
+  AskAgentDialog,
+  InstallAgentDialog,
+} from "@/features/workflows/ui/MarketplaceAgentDialogs";
+import {
+  agentCoordinateKey,
+  marketplaceAgentFromLocal,
+  marketplaceFromListing,
+  remotePolicyAllows,
+} from "@/features/workflows/ui/marketplaceAgentCatalog";
 import { AgentMarketplaceDialog } from "@/features/workflows/ui/AgentMarketplaceDialog";
 import { AgentJobsDialog } from "@/features/workflows/ui/AgentJobsDialog";
 import { WorkflowCard } from "@/features/workflows/ui/WorkflowCard";
@@ -19,11 +30,9 @@ import { WorkflowDetailPanel } from "@/features/workflows/ui/WorkflowDetailPanel
 import { WorkflowDialog } from "@/features/workflows/ui/WorkflowDialog";
 import { MarketplaceWorkflowCard } from "@/features/workflows/ui/MarketplaceWorkflowCard";
 import {
-  formatMicrounits,
   getInstalledRemoteAgent,
   getWorkflowMarketplace,
   installMarketplaceWorkflowSnapshot,
-  installedRemoteAgentDefinition,
 } from "@/features/workflows/marketplace";
 import {
   PRESENCE_REFETCH_INTERVAL_MS,
@@ -32,8 +41,6 @@ import {
 } from "@/features/presence/hooks";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import { useRelaySelfQuery } from "@/features/moderation/hooks";
-import { getPresenceLabel } from "@/features/presence/lib/presence";
-import { PresenceBadge } from "@/features/presence/ui/PresenceBadge";
 import {
   getMarketplaceAgents,
   getMarketplaceWorkflows,
@@ -51,24 +58,12 @@ import type {
 } from "@/shared/api/types";
 import type { ManagedAgentMarketplace } from "@/shared/api/marketplace";
 import {
-  createWorkflow,
   deleteWorkflow,
   getChannelsWorkflows,
   triggerWorkflow,
 } from "@/shared/api/tauriWorkflows";
-import { stringify as yamlStringify } from "yaml";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogHeader,
-  DialogTitle,
-} from "@/shared/ui/dialog";
-import { Textarea } from "@/shared/ui/textarea";
-import { ChannelCombobox } from "./ChannelCombobox";
 import { getPresence } from "@/shared/api/tauri";
 import { Button } from "@/shared/ui/button";
-import { Badge } from "@/shared/ui/badge";
 import { Card } from "@/shared/ui/card";
 import { Input } from "@/shared/ui/input";
 import { PubKey } from "@/shared/ui/PubKey";
@@ -98,70 +93,6 @@ type DialogState =
 
 type CatalogTab = "agents" | "workflows";
 
-function marketplaceFromListing(
-  agent: MarketplaceAgent,
-): ManagedAgentMarketplace {
-  return {
-    listed: true,
-    description: agent.description,
-    capabilities: agent.capabilities,
-    deployment: agent.deployment,
-    pricing: agent.pricing
-      ? {
-          currency: agent.pricing.currency,
-          microunits_per_hour: agent.pricing.microunitsPerHour,
-        }
-      : null,
-    remote_invocation: agent.remoteInvocation,
-  };
-}
-
-function marketplaceAgentFromLocal(
-  agent: ManagedAgent,
-  ownerPubkey: string,
-  marketplace: ManagedAgentMarketplace,
-  sourceCommunity: NonNullable<MarketplaceAgent["sourceCommunity"]>,
-): MarketplaceAgent {
-  return {
-    pubkey: agent.pubkey.toLowerCase(),
-    name: agent.name,
-    ownerPubkey,
-    description: marketplace.description,
-    capabilities: marketplace.capabilities,
-    deployment: marketplace.deployment,
-    pricing: marketplace.pricing
-      ? {
-          currency: marketplace.pricing.currency,
-          microunitsPerHour: marketplace.pricing.microunits_per_hour,
-        }
-      : null,
-    remoteInvocation: marketplace.remote_invocation ?? null,
-    directUse:
-      agent.respondTo === "anyone"
-        ? "community"
-        : agent.respondTo === "allowlist"
-          ? "restricted"
-          : "owner",
-    sourceCommunity,
-  };
-}
-
-function remotePolicyAllows(
-  agent: MarketplaceAgent,
-  callerRelayPubkey: string | null,
-): boolean {
-  if (!callerRelayPubkey || !agent.remoteInvocation) return false;
-  return (
-    agent.remoteInvocation.policy === "any_community" ||
-    agent.remoteInvocation.relay_pubkeys.includes(callerRelayPubkey)
-  );
-}
-
-/** Coordinate key for matching a marketplace listing to an installed agent. */
-function agentCoordinateKey(relayPubkey: string, pubkey: string): string {
-  return `${relayPubkey.toLowerCase()}:${pubkey.toLowerCase()}`;
-}
-
 function WorkflowsListSkeleton() {
   return (
     <div className="space-y-2">
@@ -188,164 +119,6 @@ function WorkflowsListSkeleton() {
         </Card>
       ))}
     </div>
-  );
-}
-
-function AgentCatalogCard({
-  agent,
-  presenceStatus,
-  localAgent,
-  canInstall,
-  installedWorkflow,
-  onEdit,
-  onInstall,
-  onAsk,
-  onRemove,
-  onShowRuns,
-  onShowEarnings,
-  onUnpublish,
-}: {
-  agent: MarketplaceAgent;
-  presenceStatus: PresenceStatus | null;
-  localAgent?: ManagedAgent;
-  canInstall: boolean;
-  installedWorkflow: Workflow | null;
-  onEdit: (agent: ManagedAgent) => void;
-  onInstall: (agent: MarketplaceAgent) => void;
-  onAsk: (workflow: Workflow, agentName: string) => void;
-  onRemove: (workflow: Workflow) => void;
-  onShowRuns: (workflowId: string) => void;
-  onShowEarnings: (agentPubkey: string, agentName: string) => void;
-  onUnpublish: (agent: ManagedAgent) => void;
-}) {
-  return (
-    <Card className="p-4" data-testid={`marketplace-agent-${agent.pubkey}`}>
-      <div className="flex items-start gap-3">
-        <div className="mt-0.5 rounded-md bg-primary/10 p-2 text-primary">
-          <Bot className="h-4 w-4" />
-        </div>
-        <div className="min-w-0 flex-1">
-          <div className="flex flex-wrap items-center gap-2">
-            <h3 className="text-sm font-semibold">{agent.name}</h3>
-            {presenceStatus ? (
-              <PresenceBadge
-                className="px-2 py-0.5 text-2xs"
-                label={getPresenceLabel(presenceStatus)}
-                status={presenceStatus}
-              />
-            ) : (
-              <Badge variant="secondary">Presence unavailable</Badge>
-            )}
-            <Badge variant="secondary">{agent.deployment}</Badge>
-            <Badge variant={agent.remoteInvocation ? "default" : "outline"}>
-              {agent.remoteInvocation ? "Remote-ready" : "Discovery only"}
-            </Badge>
-          </div>
-          {agent.description ? (
-            <p className="mt-2 text-xs text-muted-foreground">
-              {agent.description}
-            </p>
-          ) : null}
-          <div className="mt-3 flex flex-wrap gap-1.5">
-            {agent.capabilities.map((capability) => (
-              <Badge key={capability} variant="outline">
-                {capability}
-              </Badge>
-            ))}
-          </div>
-          <div className="mt-3 grid gap-2 border-t pt-3 text-xs sm:grid-cols-2">
-            <div>
-              <p className="text-2xs text-muted-foreground">Hourly rate</p>
-              <p>
-                {agent.pricing
-                  ? `${formatMicrounits(
-                      agent.pricing.currency,
-                      agent.pricing.microunitsPerHour,
-                    )}/hour`
-                  : "Unpriced"}
-              </p>
-            </div>
-            <div>
-              <p className="text-2xs text-muted-foreground">Availability</p>
-              <p>
-                Workflows · Direct use{" "}
-                {agent.directUse.replace("owner", "owner only")}
-              </p>
-            </div>
-            <div className="sm:col-span-2">
-              <p className="text-2xs text-muted-foreground">Community</p>
-              <p>{agent.sourceCommunity?.name ?? "Current community"}</p>
-            </div>
-            <div className="sm:col-span-2">
-              <p className="text-2xs text-muted-foreground">Agent</p>
-              <PubKey
-                pubkey={agent.pubkey}
-                testId={`marketplace-agent-pubkey-${agent.pubkey}`}
-              />
-            </div>
-            <div className="sm:col-span-2">
-              <p className="text-2xs text-muted-foreground">Publisher</p>
-              <PubKey pubkey={agent.ownerPubkey} />
-            </div>
-          </div>
-          {localAgent ? (
-            <div className="mt-3 flex gap-2">
-              <Button
-                onClick={() => onEdit(localAgent)}
-                size="sm"
-                variant="outline"
-              >
-                Edit listing
-              </Button>
-              <Button
-                onClick={() => onShowEarnings(agent.pubkey, agent.name)}
-                size="sm"
-                variant="outline"
-              >
-                Jobs &amp; earnings
-              </Button>
-              <Button
-                onClick={() => onUnpublish(localAgent)}
-                size="sm"
-                variant="ghost"
-              >
-                Unpublish
-              </Button>
-            </div>
-          ) : installedWorkflow ? (
-            <div className="mt-3 flex items-center gap-2">
-              <Button
-                onClick={() => onAsk(installedWorkflow, agent.name)}
-                size="sm"
-              >
-                Ask
-              </Button>
-              <Button
-                onClick={() => onShowRuns(installedWorkflow.id)}
-                size="sm"
-                variant="outline"
-              >
-                Runs
-              </Button>
-              <Button
-                onClick={() => onRemove(installedWorkflow)}
-                size="sm"
-                variant="ghost"
-              >
-                Remove from community
-              </Button>
-              <Badge variant="secondary">Added</Badge>
-            </div>
-          ) : canInstall ? (
-            <div className="mt-3">
-              <Button onClick={() => onInstall(agent)} size="sm">
-                Add to community
-              </Button>
-            </div>
-          ) : null}
-        </div>
-      </div>
-    </Card>
   );
 }
 
@@ -1093,143 +866,5 @@ export function WorkflowsView({
         }}
       />
     </div>
-  );
-}
-
-function InstallAgentDialog({
-  agent,
-  channels,
-  onInstalled,
-  onOpenChange,
-}: {
-  agent: MarketplaceAgent | null;
-  channels: Channel[];
-  onInstalled: () => void;
-  onOpenChange: (open: boolean) => void;
-}) {
-  const [channelId, setChannelId] = React.useState("");
-  React.useEffect(() => {
-    if (agent) setChannelId(channels[0]?.id ?? "");
-  }, [agent, channels]);
-
-  const installMutation = useMutation({
-    mutationFn: async () => {
-      if (!agent) throw new Error("no agent selected");
-      const definition = installedRemoteAgentDefinition(agent);
-      if (!definition) throw new Error("listing is missing its home community");
-      return createWorkflow(channelId, yamlStringify(definition));
-    },
-    onSuccess: onInstalled,
-  });
-  const install = installMutation.mutate;
-
-  return (
-    <Dialog
-      onOpenChange={(open) => {
-        if (!open) installMutation.reset();
-        onOpenChange(open);
-      }}
-      open={agent !== null}
-    >
-      <DialogContent className="sm:max-w-md">
-        <DialogHeader>
-          <DialogTitle>Add {agent?.name} to this community</DialogTitle>
-          <DialogDescription>
-            The agent keeps running in {agent?.sourceCommunity?.name}. Answers
-            to your requests are posted in the channel you pick.
-          </DialogDescription>
-        </DialogHeader>
-        <ChannelCombobox
-          channels={channels}
-          disabled={installMutation.isPending}
-          onChange={setChannelId}
-          value={channelId}
-        />
-        {installMutation.error instanceof Error ? (
-          <p className="text-sm text-destructive">
-            {installMutation.error.message}
-          </p>
-        ) : null}
-        <div className="flex justify-end gap-2">
-          <Button onClick={() => onOpenChange(false)} variant="outline">
-            Cancel
-          </Button>
-          <Button
-            disabled={!channelId || installMutation.isPending}
-            onClick={() => install()}
-          >
-            {installMutation.isPending ? "Adding..." : "Add to community"}
-          </Button>
-        </div>
-      </DialogContent>
-    </Dialog>
-  );
-}
-
-function AskAgentDialog({
-  onAsked,
-  onOpenChange,
-  target,
-}: {
-  onAsked: () => void;
-  onOpenChange: (open: boolean) => void;
-  target: { workflow: Workflow; agentName: string } | null;
-}) {
-  const [prompt, setPrompt] = React.useState("");
-  React.useEffect(() => {
-    if (target) setPrompt("");
-  }, [target]);
-
-  const askMutation = useMutation({
-    mutationFn: async () => {
-      if (!target) throw new Error("no agent selected");
-      return triggerWorkflow(target.workflow.id, { prompt: prompt.trim() });
-    },
-    onSuccess: onAsked,
-  });
-  const ask = askMutation.mutate;
-
-  return (
-    <Dialog
-      onOpenChange={(open) => {
-        if (!open) askMutation.reset();
-        onOpenChange(open);
-      }}
-      open={target !== null}
-    >
-      <DialogContent className="sm:max-w-md">
-        <DialogHeader>
-          <DialogTitle>Ask {target?.agentName}</DialogTitle>
-          <DialogDescription>
-            Runs on the agent&apos;s home community; the answer is posted in
-            this community when it completes.
-          </DialogDescription>
-        </DialogHeader>
-        <Textarea
-          aria-label="Prompt"
-          disabled={askMutation.isPending}
-          onChange={(event) => setPrompt(event.target.value)}
-          placeholder="What do you want the agent to do?"
-          rows={4}
-          value={prompt}
-        />
-        {askMutation.error instanceof Error ? (
-          <p className="text-sm text-destructive">
-            {askMutation.error.message}
-          </p>
-        ) : null}
-        <div className="flex justify-end gap-2">
-          <Button onClick={() => onOpenChange(false)} variant="outline">
-            Cancel
-          </Button>
-          <Button
-            disabled={!prompt.trim() || askMutation.isPending}
-            onClick={() => ask()}
-          >
-            {askMutation.isPending ? "Sending..." : "Send"}
-          </Button>
-        </div>
-      </DialogContent>
-    </Dialog>
   );
 }
