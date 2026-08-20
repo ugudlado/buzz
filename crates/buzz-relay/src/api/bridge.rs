@@ -801,39 +801,106 @@ async fn submit_event_authed(
         }
     };
 
-    // Enforce relay membership (with NIP-OA fallback via x-auth-tag header).
-    let auth_tag = headers.get("x-auth-tag").and_then(|v| v.to_str().ok());
-    let nip_oa_owner = match super::relay_members::enforce_relay_membership(
-        state,
-        tenant.community(),
-        &pubkey_bytes,
-        auth_tag,
-    )
-    .await
+    let kind_u32 = buzz_core::kind::event_kind_u32(&event);
+    let cross_community = if kind_u32 == buzz_core::kind::KIND_JOB_REQUEST && event.pubkey == pubkey
     {
-        Ok(owner) => owner.or_else(|| {
-            if !state.config.require_relay_membership {
-                super::relay_members::extract_nip_oa_owner(&pubkey_bytes, auth_tag)
-            } else {
-                None
+        match crate::remote_jobs::validate_incoming_request(state, tenant.community(), &event).await
+        {
+            Ok(_) => true,
+            Err(reason) => {
+                return SubmitOutcome::Err {
+                    status: StatusCode::FORBIDDEN,
+                    response: api_error(StatusCode::FORBIDDEN, &reason),
+                };
             }
-        }),
-        Err(e) => {
-            return SubmitOutcome::Err {
-                status: e.0,
-                response: e,
-            };
+        }
+    } else if matches!(
+        kind_u32,
+        buzz_core::kind::KIND_JOB_RESULT | buzz_core::kind::KIND_JOB_ERROR
+    ) && event.pubkey == pubkey
+    {
+        // Two distinct terminal cases, keyed on the `p` (recipient relay) tag:
+        //
+        //  - p == this relay: a cross-community result arriving for a run we
+        //    own as the *caller*. Correlate it against the pending assignment
+        //    before admitting the non-member author.
+        //  - p == a different relay: one of our *own* listed agents posting its
+        //    result back to the foreign caller that dispatched to it. Admit it
+        //    when the author is a remote-invocable local agent — otherwise a
+        //    stray non-member could inject a terminal addressed to a third
+        //    party. (Correlation is the caller's job, not the origin's.)
+        let targets_self = buzz_core::agent_job::validate_response_envelope(&event)
+            .is_ok_and(|envelope| envelope.relay_pubkey == state.relay_keypair.public_key());
+        let result = if targets_self {
+            crate::remote_jobs::validate_incoming_terminal(state, tenant.community(), &event)
+                .await
+                .map(|_| ())
+        } else {
+            crate::remote_jobs::validate_outgoing_terminal(state, tenant.community(), &event).await
+        };
+        match result {
+            Ok(()) => true,
+            Err(reason) => {
+                return SubmitOutcome::Err {
+                    status: StatusCode::FORBIDDEN,
+                    response: api_error(StatusCode::FORBIDDEN, &reason),
+                };
+            }
+        }
+    } else if kind_u32 == buzz_core::kind::KIND_JOB_CANCEL && event.pubkey == pubkey {
+        match crate::remote_jobs::validate_incoming_cancellation(state, tenant.community(), &event)
+            .await
+        {
+            Ok(_) => true,
+            Err(reason) => {
+                return SubmitOutcome::Err {
+                    status: StatusCode::FORBIDDEN,
+                    response: api_error(StatusCode::FORBIDDEN, &reason),
+                };
+            }
+        }
+    } else {
+        false
+    };
+
+    // Enforce relay membership unless the signed request passed the stricter
+    // cross-community relay-identity and listing-policy checks above.
+    let auth_tag = headers.get("x-auth-tag").and_then(|v| v.to_str().ok());
+    let nip_oa_owner = if cross_community {
+        None
+    } else {
+        match super::relay_members::enforce_relay_membership(
+            state,
+            tenant.community(),
+            &pubkey_bytes,
+            auth_tag,
+        )
+        .await
+        {
+            Ok(owner) => owner.or_else(|| {
+                if !state.config.require_relay_membership {
+                    super::relay_members::extract_nip_oa_owner(&pubkey_bytes, auth_tag)
+                } else {
+                    None
+                }
+            }),
+            Err(e) => {
+                return SubmitOutcome::Err {
+                    status: e.0,
+                    response: e,
+                };
+            }
         }
     };
     if let Some(owner) = nip_oa_owner {
         super::relay_members::materialize_nip_oa_owner(state, tenant, &pubkey, &owner).await;
     }
 
-    let kind_u32 = buzz_core::kind::event_kind_u32(&event);
     let auth = IngestAuth::Http {
         pubkey,
         scopes: buzz_auth::Scope::all_known(), // Pure Nostr: full scopes, channel access via membership
         auth_method: crate::handlers::ingest::HttpAuthMethod::Nip98,
+        cross_community,
     };
 
     match crate::handlers::ingest::ingest_event(state, tenant, event, auth).await {
@@ -963,17 +1030,8 @@ async fn query_events_authed(
     check_nip98_replay(state, tenant, event_id_bytes).await?;
     let pubkey_bytes = pubkey.to_bytes().to_vec();
 
-    let auth_tag = headers.get("x-auth-tag").and_then(|v| v.to_str().ok());
-    super::relay_members::enforce_relay_membership(
-        state,
-        tenant.community(),
-        &pubkey_bytes,
-        auth_tag,
-    )
-    .await?;
-
-    // Two-pass parse: preserve raw JSON for custom extension fields (before_id,
-    // depth_limit, feed_types) that nostr::Filter silently drops.
+    // Parse before membership so a verified community relay can read only the
+    // public managed-agent projection needed to validate a remote assignment.
     let raw_filters: Vec<Value> = serde_json::from_slice(body)
         .map_err(|e| api_error(StatusCode::BAD_REQUEST, &format!("invalid filters: {e}")))?;
     let filters: Vec<nostr::Filter> = raw_filters
@@ -981,6 +1039,40 @@ async fn query_events_authed(
         .map(|v| serde_json::from_value(v.clone()))
         .collect::<Result<_, _>>()
         .map_err(|e| api_error(StatusCode::BAD_REQUEST, &format!("invalid filters: {e}")))?;
+
+    let auth_tag = headers.get("x-auth-tag").and_then(|v| v.to_str().ok());
+    let remote_listing_query = filters.iter().all(|filter| {
+        filter.kinds.as_ref().is_some_and(|kinds| {
+            kinds.len() == 1
+                && kinds
+                    .iter()
+                    .next()
+                    .is_some_and(|kind| kind.as_u16() as u32 == buzz_core::kind::KIND_MANAGED_AGENT)
+        })
+    }) && !filters.is_empty();
+    let remote_relay_url = headers
+        .get("x-buzz-relay-url")
+        .and_then(|value| value.to_str().ok());
+    match remote_relay_url {
+        Some(remote_relay_url) if remote_listing_query => {
+            crate::remote_jobs::verify_relay_identity(
+                remote_relay_url,
+                &pubkey,
+                &state.config.relay_url,
+            )
+            .await
+            .map_err(|reason| api_error(StatusCode::FORBIDDEN, &reason))?;
+        }
+        _ => {
+            super::relay_members::enforce_relay_membership(
+                state,
+                tenant.community(),
+                &pubkey_bytes,
+                auth_tag,
+            )
+            .await?;
+        }
+    }
 
     // P-gated kinds (gift wraps, member notifications, observer frames) require
     // the caller's own pubkey in the #p tag — same enforcement as WS REQ handler.
@@ -1958,6 +2050,7 @@ pub async fn workflow_webhook(
             &def,
             &trigger_ctx_clone,
             0,
+            None,
             None,
         )
         .await;

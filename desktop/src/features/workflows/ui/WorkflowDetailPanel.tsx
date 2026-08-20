@@ -8,6 +8,7 @@ import {
   useWorkflowRunsQuery,
 } from "@/features/workflows/hooks";
 import { WorkflowRunTrace } from "@/features/workflows/ui/WorkflowRunTrace";
+import type { MarketplaceAgent } from "@/shared/api/marketplace";
 import type { Workflow } from "@/shared/api/types";
 import { Badge, type BadgeProps } from "@/shared/ui/badge";
 import { Button } from "@/shared/ui/button";
@@ -22,12 +23,16 @@ type WorkflowDetailPanelProps = {
   workflowId: string;
   onClose: () => void;
   onEdit: (workflow: Workflow) => void;
+  marketplaceAgents?: readonly MarketplaceAgent[];
+  canManage?: boolean;
 };
 
 export function WorkflowDetailPanel({
   workflowId,
   onClose,
   onEdit,
+  marketplaceAgents = [],
+  canManage = false,
 }: WorkflowDetailPanelProps) {
   const workflowQuery = useWorkflowQuery(workflowId);
   const runsQuery = useWorkflowRunsQuery(workflowId);
@@ -97,7 +102,7 @@ export function WorkflowDetailPanel({
           ) : null}
         </div>
         <div className="flex items-center gap-1">
-          {workflow ? (
+          {workflow && canManage ? (
             <Button
               onClick={() => onEdit(workflow)}
               size="sm"
@@ -107,15 +112,17 @@ export function WorkflowDetailPanel({
               Edit
             </Button>
           ) : null}
-          <Button
-            disabled={triggerMutation.isPending || workflowQuery.isLoading}
-            onClick={() => void handleTrigger()}
-            size="sm"
-            variant="outline"
-          >
-            <Play className="mr-1 h-4 w-4" />
-            {triggerMutation.isPending ? "Triggering..." : "Trigger"}
-          </Button>
+          {canManage ? (
+            <Button
+              disabled={triggerMutation.isPending || workflowQuery.isLoading}
+              onClick={() => void handleTrigger()}
+              size="sm"
+              variant="outline"
+            >
+              <Play className="mr-1 h-4 w-4" />
+              {triggerMutation.isPending ? "Triggering..." : "Trigger"}
+            </Button>
+          ) : null}
           <Button
             aria-label="Close detail panel"
             onClick={onClose}
@@ -281,6 +288,7 @@ export function WorkflowDetailPanel({
                             ) : null}
                             <WorkflowRunTrace
                               approvals={approvalsQuery.data}
+                              marketplaceAgents={marketplaceAgents}
                               run={run}
                             />
                           </div>

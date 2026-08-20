@@ -13,6 +13,7 @@ type WorkflowsScreenProps = {
   onCloseWorkflow: () => void;
   onSelectWorkflow: (workflowId: string) => void;
   selectedWorkflowId: string | null;
+  surface: "manage" | "marketplace";
 };
 
 export function WorkflowsScreen({
@@ -20,6 +21,7 @@ export function WorkflowsScreen({
   onCloseWorkflow,
   onSelectWorkflow,
   selectedWorkflowId,
+  surface,
 }: WorkflowsScreenProps) {
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
@@ -29,6 +31,7 @@ export function WorkflowsScreen({
           onCloseWorkflow={onCloseWorkflow}
           onSelectWorkflow={onSelectWorkflow}
           selectedWorkflowId={selectedWorkflowId}
+          surface={surface}
         />
       </React.Suspense>
     </div>

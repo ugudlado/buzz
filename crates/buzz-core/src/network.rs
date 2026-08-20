@@ -94,6 +94,36 @@ pub fn is_private_ip(ip: &std::net::IpAddr) -> bool {
     }
 }
 
+/// Resolve a host once, reject any private/reserved answer, and return the
+/// first public address for DNS-pinned HTTP clients.
+///
+/// `BUZZ_UNSAFE_ALLOW_PRIVATE_REMOTE_HOSTS=1` skips the private/reserved
+/// rejection so local and tailnet relays can exercise cross-community
+/// dispatch in development. Never set it in production — it disables the
+/// SSRF guard on relay-to-relay and agent-to-relay requests.
+pub fn resolve_public_host(host: &str, port: u16) -> Result<std::net::IpAddr, String> {
+    use std::net::ToSocketAddrs;
+
+    let addrs = (host, port)
+        .to_socket_addrs()
+        .map_err(|error| format!("DNS resolution failed: {error}"))?
+        .map(|address| address.ip())
+        .collect::<Vec<_>>();
+    if addrs.is_empty() {
+        return Err("DNS resolution returned no addresses".into());
+    }
+    let allow_private =
+        std::env::var("BUZZ_UNSAFE_ALLOW_PRIVATE_REMOTE_HOSTS").as_deref() == Ok("1");
+    if !allow_private {
+        if let Some(private) = addrs.iter().find(|address| is_private_ip(address)) {
+            return Err(format!(
+                "'{host}' resolved to private/reserved address {private}"
+            ));
+        }
+    }
+    Ok(addrs[0])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -173,6 +173,23 @@ pub async fn get_workflow_runs(
     .await
 }
 
+/// Provider-side job ledger for one of this community's agents: which caller
+/// communities invoked it, duration, and estimated cost. Owner-gated by the
+/// relay. Returns `{ jobs: [...], totals: {...} }`.
+#[tauri::command]
+pub async fn get_agent_jobs(
+    agent_pubkey: String,
+    limit: Option<u32>,
+    state: State<'_, AppState>,
+) -> Result<Value, String> {
+    let mut path = format!("/api/agents/{agent_pubkey}/jobs");
+    if let Some(limit) = limit {
+        path.push_str(&format!("?limit={limit}"));
+    }
+    let values: Value = get_relay_json(&state, &path).await?;
+    Ok(values)
+}
+
 // ── Writes ───────────────────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -271,9 +288,15 @@ pub async fn delete_workflow(
 #[tauri::command]
 pub async fn trigger_workflow(
     workflow_id: String,
+    fields: Option<Value>,
     state: State<'_, AppState>,
 ) -> Result<WorkflowTriggerWire, String> {
-    let builder = events::build_workflow_trigger(&workflow_id)?;
+    let content = match &fields {
+        Some(value) if value.is_object() => Some(value.to_string()),
+        Some(_) => return Err("trigger fields must be a JSON object".to_string()),
+        None => None,
+    };
+    let builder = events::build_workflow_trigger(&workflow_id, content.as_deref())?;
     let result = submit_event(builder, &state).await?;
     trigger_wire_from_message(workflow_id, &result.message)
 }

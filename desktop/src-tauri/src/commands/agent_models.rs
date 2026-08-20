@@ -57,7 +57,6 @@ pub async fn get_agent_models(
         for pubkey in &exited_pubkeys {
             state.clear_agent_session_caches(pubkey);
         }
-
         let record = records
             .iter()
             .find(|r| r.pubkey == pubkey)
@@ -708,6 +707,7 @@ pub async fn update_managed_agent(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<UpdateManagedAgentResponse, String> {
+    let marketplace_changed = input.marketplace.is_some();
     // Phase 1: local save (synchronous, under lock)
     let (summary, sync_params, rollback) = {
         let _store_guard = state
@@ -727,7 +727,6 @@ pub async fn update_managed_agent(
 
         let record = find_managed_agent_mut(&mut records, &input.pubkey)?;
         let previous_record = record.clone();
-
         let mut name_changed = false;
         if let Some(name_update) = input.name {
             let trimmed = name_update.trim().to_string();
@@ -823,20 +822,21 @@ pub async fn update_managed_agent(
         if input.respond_to_allowlist.is_some() {
             record.respond_to_allowlist = prospective_allowlist;
         }
-
+        if let Some(marketplace) = input.marketplace {
+            record.marketplace = marketplace
+                .map(buzz_core_pkg::marketplace::AgentMarketplace::normalized)
+                .transpose()?;
+        }
         record.updated_at = now_iso();
-
         save_managed_agents(&app, &records)?;
-
         let record = records
             .iter()
             .find(|r| r.pubkey == input.pubkey)
             .ok_or_else(|| format!("agent {} not found", input.pubkey))?;
-
         // Publish the edit to the relay. After-save, inside the lock, before
         // any .await. The retention upsert hashes the opt-IN projection, so an
         // update that touched only runtime/local fields is a no-op publish.
-        super::agents::retain_managed_agent_pending(&app, &state, record);
+        super::agents::retain_managed_agent_pending(&app, &state, record, !marketplace_changed);
 
         let sync_params = if name_changed {
             let agent_keys = Keys::parse(&record.private_key_nsec)
@@ -900,6 +900,16 @@ pub async fn update_managed_agent(
             return Err(format!(
                 "Agent rename failed because its relay profile could not be updated. No changes were saved: {sync_error}"
             ));
+        }
+    }
+
+    // Publish before callers can switch communities; the fallback sweep only
+    // drains the active community.
+    if marketplace_changed {
+        if let Err(error) =
+            crate::managed_agents::persona_events::flush_active_pending_events(&app, &state).await
+        {
+            eprintln!("buzz-desktop: marketplace event flush: {error}");
         }
     }
 

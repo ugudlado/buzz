@@ -12,6 +12,7 @@ import {
 
 import { relayClient } from "@/shared/api/relayClient";
 import { activateRateLimit } from "@/shared/api/relayRateLimitGate";
+import type { ManagedAgentMarketplace } from "@/shared/api/marketplace";
 import { resolveAgentParallelism } from "@/features/agents/lib/agentParallelism";
 import type { ConnectionState } from "@/shared/api/relayClientShared";
 import type { ChannelTemplate, RelayEvent } from "@/shared/api/types";
@@ -43,6 +44,7 @@ import {
   KIND_HUDDLE_STARTED,
   KIND_MEMBER_ADDED_NOTIFICATION,
   KIND_MEMBER_REMOVED_NOTIFICATION,
+  KIND_MANAGED_AGENT,
   KIND_PERSONA,
   KIND_PROJECT_ANNOUNCEMENT,
   KIND_REPO_ANNOUNCEMENT,
@@ -51,6 +53,7 @@ import {
   KIND_SYSTEM_MESSAGE,
   KIND_TEXT_NOTE,
   KIND_USER_STATUS,
+  KIND_WORKFLOW_DEF,
 } from "@/shared/constants/kinds";
 import type {
   RawAcpAuthMethodsResult,
@@ -101,6 +104,7 @@ export type MockManagedAgentSeed = {
   autoRestartOnConfigChange?: boolean;
   respondTo?: RawManagedAgent["respond_to"];
   respondToAllowlist?: string[];
+  marketplace?: RawManagedAgent["marketplace"];
   /** Per-agent env vars seeded into the mock store. */
   envVars?: Record<string, string>;
 };
@@ -900,6 +904,7 @@ type RawManagedAgent = {
   backend_agent_id: string | null;
   respond_to: "owner-only" | "allowlist" | "anyone";
   respond_to_allowlist: string[];
+  marketplace?: ManagedAgentMarketplace | null;
 };
 
 type RawCreateManagedAgentResponse = {
@@ -1746,6 +1751,7 @@ function cloneManagedAgent(agent: MockManagedAgent): RawManagedAgent {
     respond_to_allowlist: agent.respond_to_allowlist
       ? [...agent.respond_to_allowlist]
       : [],
+    marketplace: agent.marketplace ?? null,
   };
 }
 
@@ -2298,6 +2304,7 @@ function buildSeededManagedAgent(seed: MockManagedAgentSeed): MockManagedAgent {
     backend_agent_id: null,
     respond_to: seed.respondTo ?? "owner-only",
     respond_to_allowlist: seed.respondToAllowlist ?? [],
+    marketplace: seed.marketplace ?? null,
     private_key_nsec: `nsec1mock${seed.pubkey.slice(0, 20)}`,
     log_lines: [
       `buzz-acp starting: relay=${DEFAULT_RELAY_WS_URL} agent_pubkey=${seed.pubkey} parallelism=1`,
@@ -3374,6 +3381,28 @@ type RawWorkflowTraceEntry = {
   started_at?: number | null;
   completed_at?: number | null;
   error?: string | null;
+  assignment_receipt?: {
+    agent_pubkey: string;
+    agent_owner_pubkey: string | null;
+    prompt_event_id: string;
+    completion_event_id: string | null;
+    prompt_published_at_ms: number | null;
+    terminal_at_ms: number | null;
+    duration_ms: number | null;
+    rate_currency: string | null;
+    rate_microunits_per_hour: number | null;
+    estimated_microunits: number | null;
+    outcome: "completed" | "failed" | "timed_out" | "cancelled";
+    review_state: "not_required" | "human_review_required";
+    reported_usage?: {
+      harness: string;
+      model: string | null;
+      input_tokens: number | null;
+      output_tokens: number | null;
+      cost_microunits: number | null;
+      currency: string | null;
+    } | null;
+  } | null;
 };
 
 type RawWorkflowRun = {
@@ -3393,6 +3422,9 @@ type RawWorkflowRun = {
   completed_at: number | null;
   error_code: string | null;
   error_message: string | null;
+  workflow_author_pubkey: string | null;
+  fixed_price_currency: string | null;
+  fixed_price_microunits: number | null;
   created_at: number;
 };
 
@@ -3501,37 +3533,72 @@ function buildMockWorkflowRun(workflow: MockWorkflow): RawWorkflowRun {
   const rawSteps = Array.isArray(workflow.definition.steps)
     ? workflow.definition.steps
     : [];
-  const executionTrace = rawSteps.map((candidate, index) => {
-    const step =
-      candidate && typeof candidate === "object"
-        ? (candidate as Record<string, unknown>)
-        : {};
-    const startedAt = createdAt + index;
-    const completedAt = startedAt + 1;
-    const output: Record<string, unknown> = {};
+  const executionTrace: RawWorkflowTraceEntry[] = rawSteps.map(
+    (candidate, index) => {
+      const step =
+        candidate && typeof candidate === "object"
+          ? (candidate as Record<string, unknown>)
+          : {};
+      const startedAt = createdAt + index;
+      const completedAt = startedAt + 1;
+      const output: Record<string, unknown> = {};
+      const isAgentAssignment = step.action === "assign_to_agent";
+      const failed = step.instruction === "fail in e2e";
+      const agentPubkey =
+        typeof step.agent_pubkey === "string" ? step.agent_pubkey : "";
 
-    if (typeof step.action === "string") {
-      output.action = step.action;
-    }
-    if (typeof step.name === "string" && step.name.trim().length > 0) {
-      output.name = step.name;
-    }
-    if (typeof step.text === "string" && step.text.trim().length > 0) {
-      output.preview = step.text;
-    }
+      if (typeof step.action === "string") {
+        output.action = step.action;
+      }
+      if (typeof step.name === "string" && step.name.trim().length > 0) {
+        output.name = step.name;
+      }
+      if (typeof step.text === "string" && step.text.trim().length > 0) {
+        output.preview = step.text;
+      }
 
-    return {
-      step_id:
-        typeof step.id === "string" && step.id.trim().length > 0
-          ? step.id
-          : `step_${index + 1}`,
-      status: "completed",
-      output,
-      started_at: startedAt,
-      completed_at: completedAt,
-      error: null,
-    };
-  });
+      return {
+        step_id:
+          typeof step.id === "string" && step.id.trim().length > 0
+            ? step.id
+            : `step_${index + 1}`,
+        status: failed ? "failed" : "completed",
+        output,
+        started_at: startedAt,
+        completed_at: completedAt,
+        error: failed ? "Agent returned partial work before failing" : null,
+        assignment_receipt:
+          isAgentAssignment && agentPubkey
+            ? {
+                agent_pubkey: agentPubkey,
+                agent_owner_pubkey: MOCK_IDENTITY_PUBKEY,
+                prompt_event_id: `${index + 3}`.repeat(64).slice(0, 64),
+                completion_event_id: failed
+                  ? null
+                  : `${index + 5}`.repeat(64).slice(0, 64),
+                prompt_published_at_ms: startedAt * 1_000,
+                terminal_at_ms: completedAt * 1_000,
+                duration_ms: 1_000,
+                rate_currency: "USD",
+                rate_microunits_per_hour: 12_000_000,
+                estimated_microunits: 3_333,
+                outcome: failed ? "failed" : "completed",
+                review_state: failed ? "human_review_required" : "not_required",
+                reported_usage: failed
+                  ? null
+                  : {
+                      harness: "goose",
+                      model: "claude-sonnet-5",
+                      input_tokens: 15_500,
+                      output_tokens: 2_000,
+                      cost_microunits: 42_000,
+                      currency: "USD",
+                    },
+              }
+            : null,
+      };
+    },
+  );
 
   const startedAt =
     executionTrace.length > 0
@@ -3543,16 +3610,35 @@ function buildMockWorkflowRun(workflow: MockWorkflow): RawWorkflowRun {
       ? (lastTraceEntry?.completed_at ?? createdAt)
       : createdAt;
 
+  const marketplace =
+    workflow.definition.marketplace &&
+    typeof workflow.definition.marketplace === "object" &&
+    !Array.isArray(workflow.definition.marketplace)
+      ? (workflow.definition.marketplace as Record<string, unknown>)
+      : null;
+  const fixedPrice =
+    marketplace?.fixed_price &&
+    typeof marketplace.fixed_price === "object" &&
+    !Array.isArray(marketplace.fixed_price)
+      ? (marketplace.fixed_price as Record<string, unknown>)
+      : null;
+  const failed = executionTrace.some((entry) => entry.status === "failed");
+
   return {
     id: `mock-run-${Date.now()}`,
     workflow_id: workflow.id,
-    status: "completed",
+    status: failed ? "failed" : "completed",
     current_step: null,
     execution_trace: executionTrace,
     started_at: startedAt,
     completed_at: completedAt,
     error_code: null,
-    error_message: null,
+    error_message: failed ? "Workflow stopped after agent failure" : null,
+    workflow_author_pubkey: workflow.owner_pubkey,
+    fixed_price_currency:
+      typeof fixedPrice?.currency === "string" ? fixedPrice.currency : null,
+    fixed_price_microunits:
+      typeof fixedPrice?.microunits === "number" ? fixedPrice.microunits : null,
     created_at: createdAt,
   };
 }
@@ -8829,6 +8915,7 @@ async function handleUpdateManagedAgent(args: {
     envVars?: Record<string, string>;
     respondTo?: "owner-only" | "allowlist" | "anyone";
     respondToAllowlist?: string[];
+    marketplace?: RawManagedAgent["marketplace"];
   };
 }): Promise<{ agent: RawManagedAgent; profile_sync_error: string | null }> {
   const agent = getMockManagedAgent(args.input.pubkey);
@@ -8849,6 +8936,9 @@ async function handleUpdateManagedAgent(args: {
   }
   if (args.input.respondToAllowlist !== undefined) {
     agent.respond_to_allowlist = args.input.respondToAllowlist;
+  }
+  if (args.input.marketplace !== undefined) {
+    agent.marketplace = args.input.marketplace;
   }
   agent.updated_at = new Date().toISOString();
   return { agent: cloneManagedAgent(agent), profile_sync_error: null };
@@ -9925,12 +10015,38 @@ function sendToMockSocket(args: {
       return;
     }
 
-    if (filter.kinds?.includes(KIND_PERSONA)) {
+    // Published workflow definitions (kind:30620): the real backend publishes
+    // one per workflow whose definition opts into the marketplace. Serve every
+    // mock workflow as JSON (valid YAML) — the parser drops unlisted ones.
+    if (filter.kinds?.includes(KIND_WORKFLOW_DEF)) {
+      for (const workflow of mockWorkflows) {
+        sendWsText(socket.handler, [
+          "EVENT",
+          subId,
+          createMockEvent(
+            KIND_WORKFLOW_DEF,
+            JSON.stringify(workflow.definition),
+            [["d", workflow.id]],
+            workflow.owner_pubkey,
+            workflow.created_at,
+          ),
+        ]);
+      }
+      sendWsText(socket.handler, ["EOSE", subId]);
+      return;
+    }
+
+    if (
+      filter.kinds?.includes(KIND_PERSONA) ||
+      filter.kinds?.includes(KIND_MANAGED_AGENT)
+    ) {
       const authors = filter.authors?.map((author) => author.toLowerCase());
       const sourceIds = filter["#d"];
       for (const event of mockPersonaEvents) {
+        if (!filter.kinds?.includes(event.kind)) continue;
         if (authors && !authors.includes(event.pubkey.toLowerCase())) continue;
         if (
+          event.kind === KIND_PERSONA &&
           event.pubkey.toLowerCase() !== MOCK_IDENTITY_PUBKEY.toLowerCase() &&
           !personaHasExactSharedTag(event)
         ) {
@@ -13357,6 +13473,8 @@ export function maybeInstallE2eTauriMocks() {
             ),
           );
         }
+        return activeConfig?.mock?.relaySelf ?? null;
+      case "fetch_relay_self_for_url":
         return activeConfig?.mock?.relaySelf ?? null;
       case "archive_identity":
       case "unarchive_identity":

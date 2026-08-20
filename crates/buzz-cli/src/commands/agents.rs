@@ -2,19 +2,48 @@ use buzz_agent_record::{
     validate_respond_to_allowlist, ManagedAgentRecord, RespondTo, DEFAULT_ACP_COMMAND,
     DEFAULT_AGENT_PARALLELISM,
 };
-use buzz_core::kind::KIND_IA_ARCHIVED_LIST;
+use buzz_core::kind::{KIND_IA_ARCHIVED_LIST, KIND_MANAGED_AGENT};
+use buzz_core::marketplace::{
+    AgentDeployment, AgentMarketplace, HourlyRate, RemoteInvocationPolicy,
+};
 use buzz_sdk::builders::{build_archive_identity_request, build_unarchive_identity_request};
-use nostr::{PublicKey, ToBech32};
+use nostr::{EventBuilder, Kind, PublicKey, Tag, ToBech32};
 use serde_json::json;
 
 use crate::agent_management::{build_create, build_update, CreateAgentDraft, UpdateAgentDraft};
-use crate::client::BuzzClient;
+use crate::client::{extract_d_tag, normalize_write_response, BuzzClient};
 use crate::error::CliError;
 use crate::validate::{read_or_stdin, validate_hex64};
-use crate::{AgentAccessArg, AgentsCmd, RespondToArg};
+use crate::{AgentAccessArg, AgentsCmd, AgentsMarketplaceCmd, MarketplaceDeployment, RespondToArg};
 
 pub async fn dispatch(command: AgentsCmd, client: &BuzzClient) -> Result<(), CliError> {
     match command {
+        AgentsCmd::Marketplace { command } => match command {
+            AgentsMarketplaceCmd::List => cmd_marketplace_list(client).await,
+            AgentsMarketplaceCmd::Publish {
+                agent_pubkey,
+                description,
+                capabilities,
+                deployment,
+                rate,
+                currency,
+                remote_invocation,
+            } => {
+                cmd_marketplace_publish(
+                    client,
+                    &agent_pubkey,
+                    description,
+                    capabilities,
+                    deployment,
+                    (rate, currency),
+                    remote_invocation,
+                )
+                .await
+            }
+            AgentsMarketplaceCmd::Unpublish { agent_pubkey } => {
+                cmd_marketplace_unpublish(client, &agent_pubkey).await
+            }
+        },
         AgentsCmd::Import {
             file,
             store_dir,
@@ -211,6 +240,225 @@ pub async fn dispatch(command: AgentsCmd, client: &BuzzClient) -> Result<(), Cli
 
         AgentsCmd::Archived => cmd_archived(client).await,
     }
+}
+
+const PUBLIC_AGENT_FIELDS: &[&str] = &[
+    "name",
+    "persona_id",
+    "system_prompt",
+    "model",
+    "provider",
+    "persona_source_version",
+    "parallelism",
+    "respond_to",
+    "respond_to_allowlist",
+    "marketplace",
+];
+
+fn sanitized_agent_content(
+    content: &str,
+) -> Result<serde_json::Map<String, serde_json::Value>, CliError> {
+    let mut content = serde_json::from_str::<serde_json::Value>(content)
+        .map_err(|e| CliError::Other(format!("managed-agent content is not valid JSON: {e}")))?
+        .as_object()
+        .cloned()
+        .ok_or_else(|| CliError::Other("managed-agent content must be a JSON object".into()))?;
+    content.retain(|key, _| PUBLIC_AGENT_FIELDS.contains(&key.as_str()));
+    Ok(content)
+}
+
+fn merge_agent_marketplace(
+    content: &str,
+    marketplace: AgentMarketplace,
+) -> Result<String, CliError> {
+    let mut content = sanitized_agent_content(content)?;
+    content.insert(
+        "marketplace".into(),
+        serde_json::to_value(marketplace).map_err(|e| {
+            CliError::Other(format!("failed to serialize marketplace listing: {e}"))
+        })?,
+    );
+    serde_json::to_string(&content)
+        .map_err(|e| CliError::Other(format!("failed to serialize managed-agent content: {e}")))
+}
+
+fn existing_agent_marketplace(content: &str) -> Result<Option<AgentMarketplace>, CliError> {
+    sanitized_agent_content(content)?
+        .remove("marketplace")
+        .map(serde_json::from_value::<AgentMarketplace>)
+        .transpose()
+        .map_err(|e| CliError::Other(format!("invalid existing marketplace listing: {e}")))?
+        .map(AgentMarketplace::normalized)
+        .transpose()
+        .map_err(|e| CliError::Other(format!("invalid existing marketplace listing: {e}")))
+}
+
+async fn owned_agent_event(
+    client: &BuzzClient,
+    agent_pubkey: &str,
+) -> Result<serde_json::Value, CliError> {
+    validate_hex64(agent_pubkey)?;
+    let signer = client.keys().public_key().to_hex();
+    let filter = json!({
+        "kinds": [KIND_MANAGED_AGENT],
+        "authors": [signer],
+        "#d": [agent_pubkey],
+        "limit": 1,
+    });
+    let raw = client.query(&filter).await?;
+    let events: Vec<serde_json::Value> = serde_json::from_str(&raw)
+        .map_err(|e| CliError::Other(format!("invalid managed-agent query response: {e}")))?;
+    let event = events.into_iter().next().ok_or_else(|| {
+        CliError::NotFound(format!(
+            "managed agent {agent_pubkey} was not found with the current signer as author"
+        ))
+    })?;
+    if event.get("pubkey").and_then(serde_json::Value::as_str) != Some(signer.as_str())
+        || extract_d_tag(&event) != agent_pubkey
+    {
+        return Err(CliError::Auth(
+            "current signer is not the managed-agent event author".into(),
+        ));
+    }
+    Ok(event)
+}
+
+fn agent_listing_event(
+    client: &BuzzClient,
+    event: &serde_json::Value,
+    agent_pubkey: &str,
+    marketplace: AgentMarketplace,
+) -> Result<nostr::Event, CliError> {
+    let content = event
+        .get("content")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| CliError::Other("managed-agent event is missing content".into()))?;
+    let content = merge_agent_marketplace(content, marketplace)?;
+    let d_tag = Tag::parse(["d", agent_pubkey])
+        .map_err(|e| CliError::Other(format!("invalid managed-agent d-tag: {e}")))?;
+    client
+        .sign_event(EventBuilder::new(Kind::Custom(KIND_MANAGED_AGENT as u16), content).tag(d_tag))
+}
+
+async fn cmd_marketplace_list(client: &BuzzClient) -> Result<(), CliError> {
+    let events = client
+        .query_all(json!({"kinds": [KIND_MANAGED_AGENT]}))
+        .await?;
+    let mut listings = Vec::new();
+    for event in events {
+        let Some(raw_content) = event.get("content").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let mut content = sanitized_agent_content(raw_content)?;
+        let Some(marketplace) = content.remove("marketplace") else {
+            continue;
+        };
+        let marketplace: AgentMarketplace = serde_json::from_value(marketplace)
+            .map_err(|e| CliError::Other(format!("invalid marketplace listing: {e}")))?;
+        let marketplace = marketplace
+            .normalized()
+            .map_err(|e| CliError::Other(format!("invalid marketplace listing: {e}")))?;
+        if !marketplace.listed {
+            continue;
+        }
+        content.insert("marketplace".into(), serde_json::json!(marketplace));
+        content.insert("agent_pubkey".into(), extract_d_tag(&event).into());
+        content.insert(
+            "owner_pubkey".into(),
+            event
+                .get("pubkey")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        );
+        content.insert(
+            "created_at".into(),
+            event
+                .get("created_at")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        );
+        listings.push(serde_json::Value::Object(content));
+    }
+    println!("{}", serde_json::Value::Array(listings));
+    Ok(())
+}
+
+async fn cmd_marketplace_publish(
+    client: &BuzzClient,
+    agent_pubkey: &str,
+    description: Option<String>,
+    capabilities: Vec<String>,
+    deployment: Option<MarketplaceDeployment>,
+    pricing: (Option<u64>, Option<String>),
+    remote_invocation: Option<String>,
+) -> Result<(), CliError> {
+    let event = owned_agent_event(client, agent_pubkey).await?;
+    let content = event
+        .get("content")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| CliError::Other("managed-agent event is missing content".into()))?;
+    let mut listing = existing_agent_marketplace(content)?.unwrap_or(AgentMarketplace {
+        listed: false,
+        description: String::new(),
+        capabilities: Vec::new(),
+        deployment: AgentDeployment::Local,
+        pricing: None,
+        remote_invocation: None,
+    });
+    listing.listed = true;
+    if let Some(description) = description {
+        listing.description = description;
+    }
+    if !capabilities.is_empty() {
+        listing.capabilities = capabilities;
+    }
+    if let Some(deployment) = deployment {
+        listing.deployment = match deployment {
+            MarketplaceDeployment::Local => AgentDeployment::Local,
+            MarketplaceDeployment::Remote => AgentDeployment::Remote,
+            MarketplaceDeployment::Kubernetes => AgentDeployment::Kubernetes,
+        };
+    }
+    if let (Some(rate), Some(currency)) = pricing {
+        listing.pricing = Some(HourlyRate {
+            currency,
+            microunits_per_hour: rate,
+        });
+    }
+    if let Some(policy) = remote_invocation {
+        listing.remote_invocation = match policy.trim() {
+            "any" => Some(RemoteInvocationPolicy::AnyCommunity),
+            "off" => None,
+            value => Some(RemoteInvocationPolicy::Allowlist {
+                relay_pubkeys: value.split(',').map(str::to_string).collect(),
+            }),
+        };
+    }
+    let listing = listing
+        .normalized()
+        .map_err(|e| CliError::Usage(format!("invalid marketplace listing: {e}")))?;
+    let event = agent_listing_event(client, &event, agent_pubkey, listing)?;
+    let response = client.submit_event(event).await?;
+    println!("{}", normalize_write_response(&response));
+    Ok(())
+}
+
+async fn cmd_marketplace_unpublish(
+    client: &BuzzClient,
+    agent_pubkey: &str,
+) -> Result<(), CliError> {
+    let event = owned_agent_event(client, agent_pubkey).await?;
+    let content = event
+        .get("content")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| CliError::Other("managed-agent event is missing content".into()))?;
+    let mut listing = existing_agent_marketplace(content)?
+        .ok_or_else(|| CliError::Usage("managed agent is not published".into()))?;
+    listing.listed = false;
+    let event = agent_listing_event(client, &event, agent_pubkey, listing)?;
+    let response = client.submit_event(event).await?;
+    println!("{}", normalize_write_response(&response));
+    Ok(())
 }
 
 // ── `agents import` ──────────────────────────────────────────────────────────
@@ -446,6 +694,7 @@ fn import_agent(
         last_error_code: None,
         respond_to: respond_to.unwrap_or_default(),
         respond_to_allowlist: allowlist,
+        marketplace: None,
         display_name: None,
         slug: None,
         runtime,
@@ -1231,6 +1480,41 @@ mod tests {
 
     fn hex64(c: char) -> String {
         std::iter::repeat_n(c, 64).collect()
+    }
+
+    #[test]
+    fn marketplace_merge_preserves_public_projection_and_drops_private_fields() {
+        let content = json!({
+            "name": "Reviewer",
+            "persona_id": "reviewer",
+            "parallelism": 2,
+            "respond_to": "anyone",
+            "private_key_nsec": "nsec-secret",
+            "env_vars": {"TOKEN": "secret"},
+            "marketplace": {"listed": false, "description": "old", "capabilities": [], "deployment": "local"}
+        });
+        let listing = AgentMarketplace {
+            listed: true,
+            description: "Reviews Rust".into(),
+            capabilities: vec!["rust".into()],
+            deployment: AgentDeployment::Remote,
+            pricing: Some(HourlyRate {
+                currency: "USD".into(),
+                microunits_per_hour: 12_000_000,
+            }),
+            remote_invocation: None,
+        };
+
+        let merged: serde_json::Value =
+            serde_json::from_str(&merge_agent_marketplace(&content.to_string(), listing).unwrap())
+                .unwrap();
+
+        assert_eq!(merged["name"], "Reviewer");
+        assert_eq!(merged["persona_id"], "reviewer");
+        assert_eq!(merged["parallelism"], 2);
+        assert_eq!(merged["marketplace"]["description"], "Reviews Rust");
+        assert!(merged.get("private_key_nsec").is_none());
+        assert!(merged.get("env_vars").is_none());
     }
 
     // --- `agents import --dry-run` ---
@@ -2159,6 +2443,7 @@ mod tests {
             last_error_code: None,
             respond_to: Default::default(),
             respond_to_allowlist: Vec::new(),
+            marketplace: None,
             display_name: None,
             slug: None,
             runtime: None,

@@ -303,7 +303,6 @@ export type ManagedAgentRuntimeStatus = {
 export type ManagedAgentBackend =
   | { type: "local" }
   | { type: "provider"; id: string; config: Record<string, unknown> };
-
 import type { RestartDiffEntry } from "./restartDiff";
 export type { JsonValue, RestartChange, RestartDiffEntry } from "./restartDiff";
 export type ManagedAgent = {
@@ -377,6 +376,7 @@ export type ManagedAgent = {
   autoRestartOnConfigChange: boolean;
   backend: ManagedAgentBackend;
   backendAgentId: string | null;
+  marketplace: import("./marketplace").ManagedAgentMarketplace | null;
   /** Who the agent should respond to. Maps to `buzz-acp --respond-to`. */
   respondTo: RespondToMode;
   /**
@@ -385,7 +385,6 @@ export type ManagedAgent = {
    */
   respondToAllowlist: string[];
 };
-
 /** Inbound author gate mode. Mirrors buzz-acp's --respond-to CLI flag. */
 export type RespondToMode = "owner-only" | "allowlist" | "anyone";
 
@@ -706,6 +705,7 @@ export type UpdateManagedAgentInput = {
    * (validated & normalized server-side).
    */
   respondToAllowlist?: string[];
+  marketplace?: import("./marketplace").ManagedAgentMarketplace | null;
 };
 export type AgentPersona = {
   id: string;

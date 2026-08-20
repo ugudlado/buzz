@@ -212,7 +212,9 @@ pub(super) async fn update_persona_with<R: Send + 'static>(
                     // Avatar-only edits are excluded — the avatar is not in the
                     // projection, so retaining would be a guaranteed no-op.
                     for record in records.iter().filter(|r| renamed.contains(&r.pubkey)) {
-                        crate::commands::agents::retain_managed_agent_pending(&app, &state, record);
+                        crate::commands::agents::retain_managed_agent_pending(
+                            &app, &state, record, true,
+                        );
                     }
                 }
 

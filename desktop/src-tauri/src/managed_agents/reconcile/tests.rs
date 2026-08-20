@@ -59,6 +59,75 @@ fn fresh_record_is_retained_pending() {
 }
 
 #[test]
+fn fresh_scope_does_not_copy_marketplace_listing_from_global_record() {
+    let dir = TempDir::new().unwrap();
+    let keys = nostr::Keys::generate();
+    let pubkey = "1".repeat(64);
+    let mut record = sample_record(&pubkey, "community-scoped-agent");
+    record.marketplace = Some(buzz_core_pkg::marketplace::AgentMarketplace {
+        listed: true,
+        description: "Listed elsewhere".to_string(),
+        capabilities: vec!["review".to_string()],
+        deployment: buzz_core_pkg::marketplace::AgentDeployment::Local,
+        pricing: None,
+        remote_invocation: None,
+    });
+    write_store(&dir, &[record]);
+
+    assert_eq!(reconcile_agents_in_dir(dir.path(), &keys).unwrap(), 1);
+    let conn = open_retention_db(&dir.path().join("retention.db")).unwrap();
+    let row = get_retained_event(
+        &conn,
+        KIND_MANAGED_AGENT,
+        &keys.public_key().to_hex(),
+        &pubkey,
+    )
+    .unwrap()
+    .unwrap();
+    let content: crate::managed_agents::agent_events::ManagedAgentEventContent =
+        serde_json::from_str(&row.content).unwrap();
+    assert_eq!(content.marketplace, None);
+}
+
+#[test]
+fn reconcile_preserves_listing_already_published_in_scope() {
+    let dir = TempDir::new().unwrap();
+    let keys = nostr::Keys::generate();
+    let pubkey = "2".repeat(64);
+    let mut record = sample_record(&pubkey, "original-name");
+    record.marketplace = Some(buzz_core_pkg::marketplace::AgentMarketplace {
+        listed: true,
+        description: "This community".to_string(),
+        capabilities: vec!["review".to_string()],
+        deployment: buzz_core_pkg::marketplace::AgentDeployment::Local,
+        pricing: None,
+        remote_invocation: None,
+    });
+    let conn = open_retention_db(&dir.path().join("retention.db")).unwrap();
+    assert!(retain_agent_record(&conn, &keys, &record).unwrap());
+    drop(conn);
+
+    record.name = "renamed-agent".to_string();
+    record.marketplace = None;
+    write_store(&dir, &[record]);
+    assert_eq!(reconcile_agents_in_dir(dir.path(), &keys).unwrap(), 1);
+
+    let conn = open_retention_db(&dir.path().join("retention.db")).unwrap();
+    let row = get_retained_event(
+        &conn,
+        KIND_MANAGED_AGENT,
+        &keys.public_key().to_hex(),
+        &pubkey,
+    )
+    .unwrap()
+    .unwrap();
+    let content: crate::managed_agents::agent_events::ManagedAgentEventContent =
+        serde_json::from_str(&row.content).unwrap();
+    assert_eq!(content.name, "renamed-agent");
+    assert_eq!(content.marketplace.unwrap().description, "This community");
+}
+
+#[test]
 fn unchanged_record_does_not_churn_pending_sync() {
     let dir = TempDir::new().unwrap();
     let keys = nostr::Keys::generate();

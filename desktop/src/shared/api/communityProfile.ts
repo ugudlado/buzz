@@ -32,6 +32,13 @@ export async function fetchCommunityIcon(
   return icon || null;
 }
 
+/** Read a configured community relay's validated NIP-11 identity. */
+export async function fetchCommunityRelaySelf(
+  relayUrl: string,
+): Promise<string | null> {
+  return invokeTauri<string | null>("fetch_relay_self_for_url", { relayUrl });
+}
+
 /**
  * Publish a kind:9033 command setting (or clearing, with "") the community
  * icon on the active relay. Requires relay admin/owner role — the relay

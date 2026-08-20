@@ -625,7 +625,13 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 33);
+        assert_eq!(
+            migrations
+                .iter()
+                .map(|migration| migration.version)
+                .collect::<Vec<_>>(),
+            (1..=37).collect::<Vec<_>>()
+        );
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -1036,6 +1042,13 @@ mod tests {
         assert_eq!(migrations[29].version, 30);
         let deletion_recovery = migrations[29].sql.as_str();
         assert!(deletion_recovery.contains("SET LOCAL lock_timeout = '5s'"));
+
+        assert_eq!(migrations[34].version, 35);
+        let remote_jobs = migrations[34].sql.as_str();
+        assert!(remote_jobs.contains("ADD COLUMN request_id TEXT"));
+        assert!(remote_jobs.contains("idx_workflow_agent_steps_remote_request"));
+        assert!(remote_jobs.contains("kind BETWEEN 43001 AND 43006"));
+        assert!(desired_schema.contains("43001, 43002, 43003, 43004, 43005, 43006"));
     }
 
     #[test]

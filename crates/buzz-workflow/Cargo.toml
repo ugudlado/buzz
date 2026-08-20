@@ -21,6 +21,7 @@ evalexpr    = "11"
 cron        = "0.16"
 nostr       = { workspace = true }
 uuid        = { workspace = true }
+url         = { workspace = true }
 chrono      = { workspace = true }
 tokio       = { workspace = true }
 tracing     = { workspace = true }

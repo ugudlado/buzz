@@ -127,6 +127,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/workflows/{workflow_id}/runs/{run_id}/approvals",
             get(api::workflows::list_run_approvals),
         )
+        // Provider-side cross-community job ledger (NIP-98 auth + agent-owner gate)
+        .route(
+            "/api/agents/{agent_pubkey}/jobs",
+            get(api::provider_jobs::list_agent_jobs),
+        )
         // Moderation queue reads (NIP-98 auth + mod-authz gate, L6)
         .route("/moderation/reports", get(api::bridge::moderation_reports))
         .route("/moderation/audit", get(api::bridge::moderation_audit))

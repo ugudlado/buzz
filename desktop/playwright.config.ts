@@ -14,6 +14,10 @@ export default defineConfig({
     screenshot: "only-on-failure",
     trace: "on-first-retry",
     video: "retain-on-failure",
+    // Watchable headed runs: PW_SLOWMO=500 pnpm exec playwright test --headed
+    launchOptions: {
+      slowMo: process.env.PW_SLOWMO ? Number(process.env.PW_SLOWMO) : 0,
+    },
   },
   projects: [
     {
@@ -73,6 +77,7 @@ export default defineConfig({
         "**/relay-reconnect.spec.ts",
         "**/relay-reconnect-affordance.spec.ts",
         "**/workflows.spec.ts",
+        "**/remote-agent-install.spec.ts",
         "**/identity-archive.spec.ts",
         "**/identity-archive-hide.spec.ts",
         "**/relay-connectivity.spec.ts",

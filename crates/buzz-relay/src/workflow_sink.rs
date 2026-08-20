@@ -8,9 +8,13 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Weak};
 
-use buzz_core::kind::KIND_STREAM_MESSAGE;
+use buzz_core::kind::{KIND_MANAGED_AGENT, KIND_STREAM_MESSAGE};
+use buzz_core::marketplace::AgentMarketplace;
 use buzz_core::tenant::CommunityId;
-use buzz_workflow::action_sink::{ActionSink, ActionSinkError, ThreadAnchor};
+use buzz_workflow::action_sink::{
+    ActionSink, ActionSinkError, AgentAssignmentArm, AgentMarketplaceSnapshot,
+    AgentRelayCoordinate, ThreadAnchor,
+};
 use chrono::Utc;
 use nostr::{EventBuilder, Kind, Tag};
 use tracing::info;
@@ -18,6 +22,27 @@ use uuid::Uuid;
 
 use crate::handlers::event::dispatch_persistent_event;
 use crate::state::AppState;
+
+fn assignment_expiry(
+    published_at: chrono::DateTime<Utc>,
+    timeout_secs: u64,
+) -> Result<chrono::DateTime<Utc>, ActionSinkError> {
+    let seconds = i64::try_from(timeout_secs)
+        .ok()
+        .and_then(chrono::Duration::try_seconds)
+        .ok_or_else(|| ActionSinkError::InvalidInput("assignment timeout is too large".into()))?;
+    published_at
+        .checked_add_signed(seconds)
+        .ok_or_else(|| ActionSinkError::InvalidInput("assignment timeout is too large".into()))
+}
+
+async fn run_durable_assignment_tail(
+    tail: impl Future<Output = Result<(), ActionSinkError>> + Send + 'static,
+) -> Result<(), ActionSinkError> {
+    tokio::spawn(tail)
+        .await
+        .map_err(|e| ActionSinkError::Database(format!("assignment task: {e}")))?
+}
 
 /// Resolves `@Name` mentions in workflow message text to the pubkeys of the
 /// channel members they name, so the emitted kind:9 carries the `p` tags that
@@ -206,6 +231,7 @@ impl ActionSink for RelayActionSink {
         text: &str,
         author_pubkey: &str,
         reply_to: Option<&ThreadAnchor>,
+        assignment: Option<AgentAssignmentArm>,
     ) -> Pin<Box<dyn Future<Output = Result<String, ActionSinkError>> + Send + '_>> {
         let channel_id = channel_id.to_owned();
         let text = text.to_owned();
@@ -281,6 +307,125 @@ impl ActionSink for RelayActionSink {
                 ));
             }
 
+            if assignment
+                .as_ref()
+                .and_then(|assignment| assignment.remote.as_ref())
+                .is_some()
+            {
+                let assignment = assignment.ok_or_else(|| {
+                    ActionSinkError::InvalidInput("remote assignment is missing".into())
+                })?;
+                let remote = assignment.remote.as_ref().ok_or_else(|| {
+                    ActionSinkError::InvalidInput("remote assignment is missing".into())
+                })?;
+                let target_agent =
+                    nostr::PublicKey::from_slice(&assignment.agent_pubkey).map_err(|error| {
+                        ActionSinkError::InvalidInput(format!("invalid agent pubkey: {error}"))
+                    })?;
+                let target_relay = nostr::PublicKey::from_slice(&remote.coordinate.relay_pubkey)
+                    .map_err(|error| {
+                        ActionSinkError::InvalidInput(format!(
+                            "invalid agent relay pubkey: {error}"
+                        ))
+                    })?;
+                let prompt_published_at = Utc::now();
+                let expires_at = assignment_expiry(prompt_published_at, assignment.timeout_secs)?;
+                let request_id = Uuid::new_v4().to_string();
+                let payload = buzz_core::agent_job::JobRequestPayload {
+                    instruction: remote.instruction.clone(),
+                    caller_pubkey: author_pubkey_hex.clone(),
+                    workflow_id: assignment.workflow_id.to_string(),
+                    run_id: assignment.run_id.to_string(),
+                    step_id: assignment.step_id.clone(),
+                    channel_id: channel_id_canonical.clone(),
+                    listing_event_id: remote.listing_event_id.clone(),
+                };
+                let event = buzz_core::agent_job::build_request_event(
+                    &state.relay_keypair,
+                    &target_agent,
+                    &request_id,
+                    expires_at.timestamp() as u64,
+                    &state.config.relay_url,
+                    &payload,
+                )
+                .map_err(|error| ActionSinkError::EventBuild(error.to_string()))?;
+                let event_id_hex = event.id.to_hex();
+                let mut trace = assignment.trace_prefix.clone();
+                trace.push(serde_json::json!({
+                    "step_id": assignment.step_id,
+                    "status": "waiting",
+                    "started_at": assignment.step_started_at,
+                    "completed_at": null,
+                    "__prompt_thread": null,
+                }));
+                let execution_trace = serde_json::Value::Array(trace);
+                let (stored_event, _) = state
+                    .db
+                    .insert_workflow_assignment_event(
+                        tenant.community(),
+                        &event,
+                        None,
+                        None,
+                        buzz_db::workflow::CreateAgentStepParams {
+                            community_id,
+                            prompt_event_id: &event_id_hex,
+                            workflow_id: assignment.workflow_id,
+                            run_id: assignment.run_id,
+                            step_id: &assignment.step_id,
+                            step_index: assignment.step_index,
+                            agent_pubkey: &assignment.agent_pubkey,
+                            agent_owner_pubkey: &assignment.agent_owner_pubkey,
+                            rate_currency: assignment.rate_currency.as_deref(),
+                            rate_microunits_per_hour: assignment.rate_microunits_per_hour,
+                            prompt_published_at,
+                            expires_at,
+                            execution_trace: Some(&execution_trace),
+                            request_id: Some(&request_id),
+                            origin_relay_pubkey: Some(state.relay_keypair.public_key().as_bytes()),
+                            agent_relay_pubkey: Some(&remote.coordinate.relay_pubkey),
+                            agent_relay_url: Some(&remote.coordinate.relay_url),
+                            listing_event_id: Some(&remote.listing_event_id),
+                        },
+                    )
+                    .await
+                    .map_err(|error| ActionSinkError::Database(error.to_string()))?;
+                let _ = dispatch_persistent_event(
+                    &tenant,
+                    &state,
+                    &stored_event,
+                    buzz_core::kind::KIND_JOB_REQUEST,
+                    &author_pubkey_hex,
+                    None,
+                )
+                .await;
+                match crate::remote_jobs::submit_remote_event(
+                    &state.relay_keypair,
+                    &remote.coordinate.relay_url,
+                    &target_relay,
+                    &event,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        if let Err(error) = state
+                            .db
+                            .record_remote_agent_delivery(community_id, &event_id_hex, None)
+                            .await
+                        {
+                            tracing::warn!(event_id = %event_id_hex, %error, "failed to record remote job delivery");
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(event_id = %event_id_hex, %error, "remote job delivery deferred for retry");
+                        let _ = state
+                            .db
+                            .record_remote_agent_delivery(community_id, &event_id_hex, Some(&error))
+                            .await;
+                    }
+                }
+                return Ok(event_id_hex);
+            }
+
             // 3. Build kind:9 Nostr event
             //    - Signed by relay keypair (event.pubkey = relay pubkey)
             //    - `p` tag attributes the message to the workflow owner
@@ -300,6 +445,14 @@ impl ActionSink for RelayActionSink {
                 Tag::parse([buzz_core::thread::TAG_WORKFLOW, "true"])
                     .map_err(|e| ActionSinkError::EventBuild(format!("workflow tag: {e}")))?,
             ];
+            if let Some(assignment) = assignment.as_ref() {
+                let run_id = assignment.run_id.to_string();
+                tags.push(
+                    Tag::parse(["buzz:workflow-run", &run_id, &assignment.step_id]).map_err(
+                        |e| ActionSinkError::EventBuild(format!("workflow run tag: {e}")),
+                    )?,
+                );
+            }
             if let Some(anchor) = &reply_to {
                 // buzz-sdk emits the client convention (direct reply to root
                 // → single `reply` marker; the client derives thread
@@ -375,6 +528,87 @@ impl ActionSink for RelayActionSink {
                 }
                 None => (None, None, None, None, 0),
             };
+            if let Some(assignment) = assignment {
+                let prompt_published_at = Utc::now();
+                let expires_at = assignment_expiry(prompt_published_at, assignment.timeout_secs)?;
+                let mut trace = assignment.trace_prefix.clone();
+                let (root_event_id, root_created_at) = reply_to
+                    .as_ref()
+                    .map(|anchor| (anchor.root_event_id.clone(), anchor.root_created_at))
+                    .unwrap_or_else(|| (event_id_hex.clone(), event.created_at.as_secs() as i64));
+                trace.push(serde_json::json!({
+                    "step_id": assignment.step_id,
+                    "status": "waiting",
+                    "started_at": assignment.step_started_at,
+                    "completed_at": null,
+                    "__prompt_thread": {
+                        "event_id": event_id_hex,
+                        "created_at": event.created_at.as_secs() as i64,
+                        "root_event_id": root_event_id,
+                        "root_created_at": root_created_at,
+                    },
+                }));
+                let execution_trace = serde_json::Value::Array(trace);
+                let task_event_id = event_id_hex.clone();
+                run_durable_assignment_tail(async move {
+                    let thread_meta = Some(buzz_db::event::ThreadMetadataParams {
+                        event_id: &event_id_bytes,
+                        event_created_at,
+                        channel_id: channel_uuid,
+                        parent_event_id: parent_bytes.as_deref(),
+                        parent_event_created_at: parent_created,
+                        root_event_id: root_bytes.as_deref(),
+                        root_event_created_at: root_created,
+                        depth,
+                        broadcast: false,
+                    });
+                    let (stored_event, was_inserted) = state
+                        .db
+                        .insert_workflow_assignment_event(
+                            tenant.community(),
+                            &event,
+                            Some(channel_uuid),
+                            thread_meta,
+                            buzz_db::workflow::CreateAgentStepParams {
+                                community_id,
+                                prompt_event_id: &task_event_id,
+                                workflow_id: assignment.workflow_id,
+                                run_id: assignment.run_id,
+                                step_id: &assignment.step_id,
+                                step_index: assignment.step_index,
+                                agent_pubkey: &assignment.agent_pubkey,
+                                agent_owner_pubkey: &assignment.agent_owner_pubkey,
+                                rate_currency: assignment.rate_currency.as_deref(),
+                                rate_microunits_per_hour: assignment.rate_microunits_per_hour,
+                                prompt_published_at,
+                                expires_at,
+                                execution_trace: Some(&execution_trace),
+                                request_id: None,
+                                origin_relay_pubkey: None,
+                                agent_relay_pubkey: None,
+                                agent_relay_url: None,
+                                listing_event_id: None,
+                            },
+                        )
+                        .await
+                        .map_err(|e| ActionSinkError::Database(e.to_string()))?;
+                    if was_inserted {
+                        let _ = dispatch_persistent_event(
+                            &tenant,
+                            &state,
+                            &stored_event,
+                            kind_u32,
+                            &author_pubkey_hex,
+                            None,
+                        )
+                        .await;
+                    }
+                    Ok::<(), ActionSinkError>(())
+                })
+                .await?;
+                return Ok(event_id_hex);
+            }
+
             let thread_meta = Some(buzz_db::event::ThreadMetadataParams {
                 event_id: &event_id_bytes,
                 event_created_at,
@@ -386,7 +620,6 @@ impl ActionSink for RelayActionSink {
                 depth,
                 broadcast: false,
             });
-
             let (stored_event, was_inserted) = state
                 .db
                 .insert_event_with_thread_metadata(
@@ -397,9 +630,6 @@ impl ActionSink for RelayActionSink {
                 )
                 .await
                 .map_err(|e| ActionSinkError::Database(e.to_string()))?;
-
-            // 5. Post-persist side effects (fan-out, search, audit)
-            //    Only if actually inserted (idempotency guard).
             if was_inserted {
                 let _ = dispatch_persistent_event(
                     &tenant,
@@ -411,7 +641,6 @@ impl ActionSink for RelayActionSink {
                 )
                 .await;
             }
-
             Ok(event_id_hex)
         })
     }
@@ -501,6 +730,117 @@ impl ActionSink for RelayActionSink {
                 .map(|m| m.pubkey))
         })
     }
+
+    fn agent_marketplace_snapshot<'a>(
+        &'a self,
+        community_id: CommunityId,
+        agent_pubkey: &'a [u8],
+        coordinate: Option<&'a AgentRelayCoordinate>,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<AgentMarketplaceSnapshot>, ActionSinkError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let state = self
+                .state
+                .upgrade()
+                .ok_or_else(|| ActionSinkError::Database("relay is shutting down".into()))?;
+            if let Some(coordinate) = coordinate {
+                let relay_pubkey =
+                    nostr::PublicKey::from_slice(&coordinate.relay_pubkey).map_err(|error| {
+                        ActionSinkError::InvalidInput(format!(
+                            "invalid agent relay pubkey: {error}"
+                        ))
+                    })?;
+                let agent_pubkey = nostr::PublicKey::from_slice(agent_pubkey).map_err(|error| {
+                    ActionSinkError::InvalidInput(format!("invalid agent pubkey: {error}"))
+                })?;
+                let listing = crate::remote_jobs::query_remote_listing(
+                    &state.relay_keypair,
+                    &state.config.relay_url,
+                    &coordinate.relay_url,
+                    &relay_pubkey,
+                    &agent_pubkey,
+                )
+                .await
+                .map_err(ActionSinkError::InvalidInput)?;
+                let policy = listing
+                    .marketplace
+                    .remote_invocation
+                    .as_ref()
+                    .ok_or_else(|| {
+                        ActionSinkError::InvalidInput(
+                            "remote invocation is not enabled by the listing".into(),
+                        )
+                    })?;
+                if !policy.allows(&state.relay_keypair.public_key().to_hex()) {
+                    return Err(ActionSinkError::InvalidInput(
+                        "this relay is not allowed by the remote listing".into(),
+                    ));
+                }
+                let (rate_currency, rate_microunits_per_hour) =
+                    listing.marketplace.pricing.map_or((None, None), |rate| {
+                        (Some(rate.currency), Some(rate.microunits_per_hour))
+                    });
+                return Ok(Some(AgentMarketplaceSnapshot {
+                    owner_pubkey: listing.owner_pubkey,
+                    listed: true,
+                    rate_currency,
+                    rate_microunits_per_hour,
+                    listing_event_id: Some(listing.event_id),
+                }));
+            }
+            let (_, owner) = state
+                .db
+                .get_agent_channel_policy(community_id, agent_pubkey)
+                .await
+                .map_err(|e| ActionSinkError::Database(e.to_string()))?
+                .ok_or_else(|| ActionSinkError::InvalidInput("agent identity not found".into()))?;
+            let Some(owner_pubkey) = owner else {
+                return Ok(None);
+            };
+            let agent_hex = nostr::PublicKey::from_slice(agent_pubkey)
+                .map_err(|e| ActionSinkError::InvalidInput(format!("invalid agent pubkey: {e}")))?
+                .to_hex();
+            let mut query = buzz_db::event::EventQuery::for_community(community_id);
+            query.kinds = Some(vec![KIND_MANAGED_AGENT as i32]);
+            query.pubkey = Some(owner_pubkey.clone());
+            query.d_tag = Some(agent_hex);
+            query.limit = Some(1);
+            query.global_only = true;
+            let event = state
+                .db
+                .query_events(&query)
+                .await
+                .map_err(|e| ActionSinkError::Database(e.to_string()))?
+                .into_iter()
+                .next();
+            let listing = event
+                .and_then(|event| {
+                    serde_json::from_str::<serde_json::Value>(&event.event.content).ok()
+                })
+                .and_then(|content| content.get("marketplace").cloned())
+                .and_then(|value| serde_json::from_value::<AgentMarketplace>(value).ok())
+                .and_then(|listing| listing.normalized().ok())
+                .filter(|listing| listing.listed);
+            let listed = listing.is_some();
+            let (rate_currency, rate_microunits_per_hour) = listing
+                .and_then(|listing| listing.pricing)
+                .map_or((None, None), |rate| {
+                    (Some(rate.currency), Some(rate.microunits_per_hour))
+                });
+            Ok(Some(AgentMarketplaceSnapshot {
+                owner_pubkey,
+                listed,
+                rate_currency,
+                rate_microunits_per_hour,
+                listing_event_id: None,
+            }))
+        })
+    }
 }
 
 #[cfg(test)]
@@ -509,6 +849,37 @@ mod tests {
 
     fn m(name: &str, pubkey: &str) -> (String, String) {
         (name.to_string(), pubkey.to_string())
+    }
+
+    #[test]
+    fn assignment_expiry_rejects_unrepresentable_duration() {
+        let published_at = Utc::now();
+        assert_eq!(
+            assignment_expiry(published_at, 0).expect("zero timeout"),
+            published_at
+        );
+        assert!(assignment_expiry(published_at, u64::MAX).is_err());
+    }
+
+    #[tokio::test]
+    async fn assignment_tail_survives_cancelled_waiter() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+        let waiter = tokio::spawn(run_durable_assignment_tail(async move {
+            let _ = started_tx.send(());
+            let _ = release_rx.await;
+            let _ = completed_tx.send(());
+            Ok(())
+        }));
+
+        started_rx.await.expect("tail started");
+        waiter.abort();
+        let _ = release_tx.send(());
+        tokio::time::timeout(std::time::Duration::from_secs(1), completed_rx)
+            .await
+            .expect("tail was not cancelled with its waiter")
+            .expect("tail reported completion");
     }
 
     // A 64-char hex pubkey built from a single repeated nibble, for readable tests.
@@ -815,6 +1186,7 @@ mod integration_tests {
                 &channel.id.to_string(),
                 "heads up @Robby — please take a look",
                 &author_hex,
+                None,
                 None,
             )
             .await

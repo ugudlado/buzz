@@ -139,7 +139,16 @@ pub const AUTHOR_ONLY_KINDS: &[u32] = &[
 ///
 /// Used by `filter_can_match_result_gated_kinds` to force the per-event
 /// fallback path in COUNT rather than the fast SQL `count_events()`.
-pub const RESULT_GATED_KINDS: &[u32] = &[KIND_DM_VISIBILITY, KIND_AGENT_TURN_METRIC];
+pub const RESULT_GATED_KINDS: &[u32] = &[
+    KIND_DM_VISIBILITY,
+    KIND_JOB_REQUEST,
+    KIND_JOB_ACCEPTED,
+    KIND_JOB_PROGRESS,
+    KIND_JOB_RESULT,
+    KIND_JOB_CANCEL,
+    KIND_JOB_ERROR,
+    KIND_AGENT_TURN_METRIC,
+];
 
 /// Kinds whose stored events have `#p`-bound read access — readable only by
 /// subscribers whose pubkey appears in the event's `#p` tag.
@@ -162,6 +171,12 @@ pub const P_GATED_KINDS: &[u32] = &[
     KIND_MEMBER_REMOVED_NOTIFICATION,
     KIND_GIFT_WRAP,
     KIND_DM_VISIBILITY,
+    KIND_JOB_REQUEST,
+    KIND_JOB_ACCEPTED,
+    KIND_JOB_PROGRESS,
+    KIND_JOB_RESULT,
+    KIND_JOB_CANCEL,
+    KIND_JOB_ERROR,
     // NIP-AM: agent turn metrics are encrypted to the owner and must not be
     // readable by any unauthenticated or non-owner party, including via `ids`
     // filters — see NIP-AM §Relay Behavior.
@@ -820,6 +835,7 @@ pub const fn is_command_kind(kind: u32) -> bool {
             | KIND_DM_ADD_MEMBER
             | KIND_DM_HIDE
             | KIND_WORKFLOW_TRIGGER
+            | KIND_WORKFLOW_CANCELLED
             | KIND_APPROVAL_GRANT
             | KIND_APPROVAL_DENY
     )
@@ -921,6 +937,12 @@ mod tests {
         assert!(is_parameterized_replaceable(39000)); // NIP-29 group metadata
         assert!(is_parameterized_replaceable(39999));
         assert!(!is_parameterized_replaceable(40000));
+    }
+
+    #[test]
+    fn workflow_cancelled_is_an_ingested_command_and_execution_event() {
+        assert!(is_command_kind(KIND_WORKFLOW_CANCELLED));
+        assert!(is_workflow_execution_kind(KIND_WORKFLOW_CANCELLED));
     }
 
     #[test]

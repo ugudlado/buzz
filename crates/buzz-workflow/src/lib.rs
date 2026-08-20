@@ -247,6 +247,10 @@ impl WorkflowEngine {
                         executor::SuspendReason::AgentAssignment {
                             prompt_event_id,
                             agent_pubkey,
+                            agent_owner_pubkey,
+                            rate_currency,
+                            rate_microunits_per_hour,
+                            prompt_published_at_ms,
                             ..
                         } => {
                             self.suspend_run_for_agent_step(
@@ -258,6 +262,10 @@ impl WorkflowEngine {
                                 &prompt_event_id,
                                 &suspend.step_id,
                                 &agent_pubkey,
+                                &agent_owner_pubkey,
+                                rate_currency.as_deref(),
+                                rate_microunits_per_hour,
+                                prompt_published_at_ms,
                                 &suspend.timeout,
                             )
                             .await;
@@ -291,10 +299,9 @@ impl WorkflowEngine {
                 let trace_json = serde_json::Value::Array(full_trace);
                 if let Err(db_err) = self
                     .db
-                    .update_workflow_run(
+                    .fail_workflow_run_if_running(
                         community_id,
                         run_id,
-                        RunStatus::Failed,
                         progress.step_index as i32,
                         &trace_json,
                         Some(buzz_db::workflow::WorkflowRunFailure {
@@ -422,8 +429,6 @@ impl WorkflowEngine {
     /// Default assignment expiry when an `AssignToAgent` step does not specify
     /// (or specifies an unparseable) `timeout`. Matches `ActionDef::AssignToAgent`'s
     /// own default in `executor::dispatch_action`.
-    const DEFAULT_AGENT_STEP_TIMEOUT_SECS: i64 = 24 * 3600;
-
     /// Persist an agent-assignment row and move the run to `WaitingAgent`.
     ///
     /// Called from [`finalize_run`](Self::finalize_run) when the executor
@@ -446,14 +451,30 @@ impl WorkflowEngine {
         prompt_event_id: &str,
         step_id: &str,
         agent_pubkey: &[u8],
+        agent_owner_pubkey: &[u8],
+        rate_currency: Option<&str>,
+        rate_microunits_per_hour: Option<u64>,
+        prompt_published_at_ms: i64,
         timeout: &str,
     ) {
+        let prompt_published_at = chrono::DateTime::from_timestamp_millis(prompt_published_at_ms)
+            .unwrap_or_else(Utc::now);
         let expires_at = executor::parse_duration_secs(timeout)
             .ok()
-            .map(|secs| Utc::now() + chrono::Duration::seconds(secs as i64))
-            .unwrap_or_else(|| {
-                Utc::now() + chrono::Duration::seconds(Self::DEFAULT_AGENT_STEP_TIMEOUT_SECS)
-            });
+            .and_then(|secs| i64::try_from(secs).ok())
+            .and_then(chrono::Duration::try_seconds)
+            .and_then(|duration| prompt_published_at.checked_add_signed(duration));
+        let Some(expires_at) = expires_at else {
+            self.fail_run_after_suspend_error(
+                community_id,
+                run_id,
+                step_index,
+                trace_json,
+                "invalid agent assignment timeout",
+            )
+            .await;
+            return;
+        };
 
         let params = buzz_db::workflow::CreateAgentStepParams {
             community_id,
@@ -463,7 +484,17 @@ impl WorkflowEngine {
             step_id,
             step_index,
             agent_pubkey,
+            agent_owner_pubkey,
+            rate_currency,
+            rate_microunits_per_hour,
+            prompt_published_at,
             expires_at,
+            execution_trace: Some(trace_json),
+            request_id: None,
+            origin_relay_pubkey: None,
+            agent_relay_pubkey: None,
+            agent_relay_url: None,
+            listing_event_id: None,
         };
 
         if let Err(e) = self.db.create_agent_step(params).await {
@@ -486,14 +517,7 @@ impl WorkflowEngine {
         );
         if let Err(e) = self
             .db
-            .update_workflow_run(
-                community_id,
-                run_id,
-                RunStatus::WaitingAgent,
-                step_index,
-                trace_json,
-                None,
-            )
+            .update_waiting_agent_trace(community_id, run_id, step_index, trace_json)
             .await
         {
             tracing::error!(

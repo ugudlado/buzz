@@ -1151,24 +1151,27 @@ async fn main() -> anyhow::Result<()> {
 
                 match sweep_state.db.sweep_expired_agent_steps(100).await {
                     Ok(expired) => {
-                        for agent_step in &expired {
-                            // Conditional UPDATE: only fails runs still
-                            // `waiting_agent`, so a run that resumed between
-                            // the row expiring and this tick is left alone.
-                            if let Err(e) = sweep_state
+                        for item in &expired {
+                            match sweep_state
                                 .db
-                                .fail_run_if_waiting_agent(
-                                    agent_step.community_id,
-                                    agent_step.run_id,
-                                    agent_step.step_index,
-                                    "agent assignment expired",
-                                )
+                                .get_agent_step(item.community_id, &item.prompt_event_id)
                                 .await
                             {
-                                tracing::error!(
-                                    run_id = %agent_step.run_id,
-                                    "Agent-step sweep: failed to fail expired run: {e}"
-                                );
+                                Ok(step) => {
+                                    if let Err(error) =
+                                        buzz_relay::remote_jobs::publish_cancellation(
+                                            &sweep_state,
+                                            item.community_id,
+                                            &step,
+                                        )
+                                        .await
+                                    {
+                                        tracing::warn!(run_id = %item.run_id, %error, "expired remote assignment cancellation delivery failed");
+                                    }
+                                }
+                                Err(error) => {
+                                    tracing::warn!(run_id = %item.run_id, %error, "expired assignment receipt reload failed")
+                                }
                             }
                         }
                         if !expired.is_empty() {
@@ -1180,6 +1183,16 @@ async fn main() -> anyhow::Result<()> {
                     }
                     Err(e) => {
                         tracing::error!("Agent-step expiry sweep tick failed: {e}");
+                    }
+                }
+
+                match buzz_relay::remote_jobs::retry_due_deliveries(&sweep_state).await {
+                    Ok(count) if count > 0 => {
+                        tracing::info!(count, "Retried cross-community agent-job deliveries");
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::error!("Remote agent-job delivery tick failed: {e}");
                     }
                 }
 

@@ -464,6 +464,46 @@ just desktop-dev   # web-only dev server (faster iteration)
 just dev           # full Tauri app with native shell
 ```
 
+### Buzz Dev.app — native bundle for computer-use testing
+
+To test the real native app (required for computer-use automation — the raw
+`just dev` binary has no `.app` bundle and cannot be targeted by
+`request_access`/`open_application`), build the dev bundle:
+
+```bash
+just desktop-dev-app               # build + sign + verify + relaunch
+just desktop-dev-app --build-only  # skip the relaunch
+```
+
+This wraps `scripts/build-buzz-dev-app.sh`, which builds with
+`tauri.dev.conf.json` (productName "Buzz Dev", bundle id
+`xyz.block.buzz.app.dev`, `signingIdentity: "Buzz Dev Signing"`) and
+`--no-default-features`, guards against the stale-bundle pitfall (tauri
+re-bundling without copying the fresh binary), patches
+CFBundleName/DisplayName to "Buzz Dev", re-signs, verifies the signature,
+installs to `/Applications/Buzz Dev.app`, and relaunches.
+
+**Keychain prompts — why this build never shows one:**
+`--no-default-features` drops the `system-keyring` cargo feature, so the dev
+build stores secrets in `0o600` files (the designed fallback) and never
+touches the macOS keychain. This is the only complete fix: keychain
+partition lists only match Apple `teamid:` signers, so with a self-signed
+cert macOS demands the login-keychain password on **every** access and
+"Always Allow" cannot stick. The first keyring-free launch shows onboarding
+once (re-import the dev key); after that the identity lives in the dev
+app-data dir. The stable "Buzz Dev Signing" identity is still applied so
+macOS TCC grants (screen recording, automation, computer-use) survive
+rebuilds — if the identity is missing from the keychain, the script prints
+the one-time cert setup commands.
+
+Always target "Buzz Dev" (never `/Applications/Buzz.app`, a separate
+production install) — verify the menu bar reads "Buzz Dev". The app is
+installed to /Applications because bundles under `.worktrees/*` are
+invisible to Spotlight/LaunchServices, so automation tooling cannot resolve
+them by name. Sidecars are zero-byte stubs unless release sidecars exist —
+build them first if the feature under test launches agents:
+`cargo build --release -p buzz-acp -p buzz-agent -p buzz-backend-host -p buzz-backend-kubernetes -p buzz-dev-mcp -p git-credential-nostr -p buzz-cli`.
+
 ### Text sizing & zoom (use rem, never px)
 
 The desktop app implements Cmd +/- zoom by scaling the root `<html>`

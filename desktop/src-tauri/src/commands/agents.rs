@@ -27,34 +27,30 @@ pub(super) fn workspace_owner_hex(state: &AppState) -> Result<String, String> {
     Ok(keys.public_key().to_hex())
 }
 
-/// Retain a freshly authored managed-agent event in the local store, flagged
-/// for relay sync. MUST be called inside the `managed_agents_store_lock`-held
-/// body after `save_managed_agents`, NEVER across an `.await`: it acquires
-/// `state.keys` and a retention-db connection, both `std::sync` guards, and
-/// drops them before returning.
-///
-/// Owner-authored, mirroring `commands::personas::retain_persona_pending`: the
-/// owner keys sign, the d_tag is the agent's pubkey, so the coordinate is
-/// `30177:<owner>:<agent_pubkey>`. The event content is the opt-IN
-/// [`agent_event_content`] projection — the retention upsert's content-equality
-/// guard compares this projection, so an operational start/stop that mutates
-/// only runtime fields produces an identical row and never re-enqueues a
-/// publish. Best-effort: a failure here is logged and swallowed so a retention
-/// hiccup never blocks the disk-authoritative write.
+/// Retain an owner-authored managed-agent event for relay sync. Call inside the
+/// `managed_agents_store_lock` after saving and never across an `.await`.
+/// Ordinary edits preserve the active relay's marketplace state; explicit
+/// publish/unpublish edits pass `false` to apply the record's new state.
 pub(super) fn retain_managed_agent_pending(
     app: &AppHandle,
     state: &AppState,
     record: &ManagedAgentRecord,
+    preserve_marketplace: bool,
 ) {
-    use crate::managed_agents::{reconcile::retain_agent_record, retention::open_retention_db};
+    use crate::managed_agents::{
+        reconcile::{retain_agent_record, retain_agent_record_for_scope},
+        retention::open_retention_db,
+    };
 
     let result = (|| -> Result<(), String> {
         let scope = crate::managed_agents::retention::active_retention_scope(app, state)?;
         let conn = open_retention_db(&scope.db_path)?;
-        // Shared engine with the boot-time reconcile: projection content diff
-        // (no republish for runtime-only churn) + monotonic created_at bump
-        // past the retained head (NIP-AP step 3).
-        retain_agent_record(&conn, &scope.owner_keys, record).map(|_| ())
+        if preserve_marketplace {
+            retain_agent_record_for_scope(&conn, &scope.owner_keys, record)
+        } else {
+            retain_agent_record(&conn, &scope.owner_keys, record)
+        }
+        .map(|_| ())
     })();
     if let Err(e) = result {
         eprintln!("buzz-desktop: agent-retain: {e}");
@@ -304,7 +300,7 @@ pub(super) async fn start_local_agent_pairs_with_preflight(
         }
         save_managed_agents(app, &records)?;
         if let Some(saved_record) = records.iter().find(|record| record.pubkey == pubkey) {
-            retain_managed_agent_pending(app, state, saved_record);
+            retain_managed_agent_pending(app, state, saved_record, true);
         }
     }
 
@@ -426,7 +422,7 @@ pub(super) async fn start_local_agent_with_preflight(
     start_managed_agent_process(app, record, &mut runtimes, Some(owner_hex))?;
     save_managed_agents(app, &records)?;
     if let Some(saved_record) = records.iter().find(|r| r.pubkey == pubkey) {
-        retain_managed_agent_pending(app, state, saved_record);
+        retain_managed_agent_pending(app, state, saved_record, true);
     }
     let record = records
         .iter()
@@ -883,6 +879,7 @@ pub async fn create_managed_agent(
             last_error_code: None,
             respond_to: minted.respond_to,
             respond_to_allowlist: minted.respond_to_allowlist.clone(),
+            marketplace: None,
             display_name: None,
             slug: None,
             runtime: None,
@@ -906,7 +903,6 @@ pub async fn create_managed_agent(
                 relay_mesh.clone()
             },
         };
-
         records.push(record);
 
         save_managed_agents(&app, &records)?;
@@ -918,7 +914,7 @@ pub async fn create_managed_agent(
         // Publish the agent to the relay. Inside the Phase-3 lock, after save,
         // before any .await — owner-authored, every agent (Will's ruling: no
         // is_builtin/persona-membership gate).
-        retain_managed_agent_pending(&app, &state, record);
+        retain_managed_agent_pending(&app, &state, record, true);
         let personas = load_personas(&app).unwrap_or_default();
         (
             build_managed_agent_summary(

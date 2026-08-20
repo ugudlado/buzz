@@ -243,6 +243,7 @@ pub fn build_managed_agent_summary(
         persona_id: record.persona_id.clone(),
         runtime: record.runtime.clone(),
         team_id: record.team_id.clone(),
+        marketplace: record.marketplace.clone(),
         relay_url: record.relay_url.clone(),
         acp_command: record.acp_command.clone(),
         agent_command: descriptor.command,

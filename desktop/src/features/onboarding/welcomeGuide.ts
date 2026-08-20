@@ -106,24 +106,22 @@ export function pickWelcomeGuideAgentForRelay(
   );
 }
 
-/** Find the preferred managed instance for one starter persona and relay. */
-export function pickWelcomeTeamStarterAgentForRelay(
+/** Find the preferred managed instance for one global Welcome Team persona. */
+export function pickWelcomeTeamStarterAgent(
   agents: ManagedAgent[],
   starter: WelcomeTeamStarterDefinition,
-  relayUrl?: string | null,
 ) {
   return pickAgentByStatus(
     agents.filter(
       (agent) =>
         agent.teamId === WELCOME_TEAM_ID &&
-        agent.personaId === starter.personaId &&
-        isAgentScopedToRelay(agent, relayUrl),
+        agent.personaId === starter.personaId,
     ),
   );
 }
 
-/** Pubkeys belonging to any managed Welcome Team persona on this relay. */
-export async function getWelcomeTeamAgentPubkeys(relayUrl?: string | null) {
+/** Pubkeys belonging to any managed Welcome Team persona. */
+export async function getWelcomeTeamAgentPubkeys() {
   const personaIds = new Set<string>(
     WELCOME_TEAM_STARTERS.map(({ personaId }) => personaId),
   );
@@ -132,8 +130,7 @@ export async function getWelcomeTeamAgentPubkeys(relayUrl?: string | null) {
       (agent) =>
         agent.teamId === WELCOME_TEAM_ID &&
         agent.personaId !== null &&
-        personaIds.has(agent.personaId) &&
-        isAgentScopedToRelay(agent, relayUrl),
+        personaIds.has(agent.personaId),
     )
     .map((agent) => agent.pubkey);
 }
@@ -317,7 +314,7 @@ export function welcomeTeammateAccessUpdate(
 /**
  * Ensure the complete built-in Welcome Team is ready for kickoff.
  * The team itself is Rust-seeded; this only activates personas, creates any
- * missing relay-scoped instances, and adds all three to Welcome as bots.
+ * missing global instances, and adds all three to Welcome as bots.
  */
 async function provisionWelcomeTeam(
   channelId: string,
@@ -352,11 +349,7 @@ async function provisionWelcomeTeam(
       globalConfig.preferred_runtime,
       relayUrl,
     );
-    const existing = pickWelcomeTeamStarterAgentForRelay(
-      existingAgents,
-      starter,
-      relayUrl,
-    );
+    const existing = pickWelcomeTeamStarterAgent(existingAgents, starter);
     if (existing) {
       const runtimeUpdate = welcomeStarterRuntimeUpdate(existing, desired);
       agents.push(

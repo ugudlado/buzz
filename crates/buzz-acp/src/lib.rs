@@ -9,6 +9,7 @@ mod pool;
 mod pool_lifecycle;
 mod queue;
 mod relay;
+mod remote_jobs;
 mod repo_paths;
 mod setup_mode;
 mod usage;
@@ -2261,6 +2262,7 @@ async fn tokio_main() -> Result<()> {
         relay_pubkey,
         repo_cwd: pool::RepoCwdResolver::new(relay.rest_client(), repos_root),
     });
+    let mut remote_job_rx = Some(remote_jobs::spawn_poller(relay.rest_client()));
 
     if !config.memory_enabled {
         tracing::info!(
@@ -2655,6 +2657,44 @@ async fn tokio_main() -> Result<()> {
                         None => {
                             relay_observer_control_rx = None;
                             tracing::warn!("relay observer control channel closed");
+                        }
+                    }
+                    None
+                }
+                remote_job = async {
+                    match remote_job_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    let _ = result_rx;
+                    match remote_job {
+                        Some(remote_jobs::RemoteJobUpdate::Execute(remote_job)) => {
+                            let accepted = queue.push(QueuedEvent {
+                                channel_id: remote_job.channel_id,
+                                event: remote_job.event,
+                                received_at: std::time::Instant::now(),
+                                prompt_tag: "cross-community job".into(),
+                            });
+                            if accepted && pool_ready {
+                                for (channel_id, thread_tags) in
+                                    dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
+                                {
+                                    typing_channels.insert(channel_id, thread_tags);
+                                }
+                            }
+                        }
+                        Some(remote_jobs::RemoteJobUpdate::Cancel { channel_id }) => {
+                            queue.drain_channel(channel_id);
+                            signal_in_flight_task(
+                                &mut pool,
+                                channel_id,
+                                ControlSignal::Cancel,
+                            );
+                        }
+                        None => {
+                            remote_job_rx = None;
+                            tracing::warn!("cross-community agent-job poller stopped");
                         }
                     }
                     None
@@ -3955,6 +3995,45 @@ fn handle_prompt_result(
     // branch below records what actually happened; only the hard-timeout
     // match arm in the death_message construction reads it.
     let mut hard_timeout_fate_suffix: Option<&'static str> = None;
+
+    let remote_failure = result
+        .batch
+        .as_ref()
+        .and_then(|batch| batch.events.last())
+        .filter(|event| remote_jobs::context(&event.event).is_some())
+        .and_then(|event| {
+            let (outcome, error) = match &result.outcome {
+                PromptOutcome::Cancelled | PromptOutcome::CancelDrainTimeout(_) => {
+                    ("cancelled", "Agent job was cancelled".to_string())
+                }
+                PromptOutcome::Timeout(TimeoutKind::Idle) => {
+                    ("failed", "Agent job timed out while idle".to_string())
+                }
+                PromptOutcome::Timeout(TimeoutKind::Hard { .. }) => (
+                    "failed",
+                    "Agent job exceeded its maximum duration".to_string(),
+                ),
+                PromptOutcome::AgentExited => {
+                    ("failed", "Agent process exited unexpectedly".to_string())
+                }
+                PromptOutcome::Error(error) => ("failed", error.to_string()),
+                PromptOutcome::Ok(_) => return None,
+            };
+            Some((event.event.clone(), outcome, error))
+        });
+    if let Some((event, outcome, error)) = remote_failure {
+        if let Some(rest) = rest_client.cloned() {
+            tokio::spawn(async move {
+                if let Err(error) = remote_jobs::post_error(&rest, &event, outcome, error).await {
+                    tracing::error!(event_id = %event.id, %error, "failed to deliver remote agent-job error");
+                }
+            });
+        } else {
+            tracing::error!(event_id = %event.id, "remote agent-job failed without a relay client");
+        }
+        // The accepted request is terminal: never execute the same event twice.
+        result.batch = None;
+    }
 
     // Requeue BEFORE mark_complete: requeue() sets retry_after with a future
     // deadline, and mark_complete() checks for it to decide whether to preserve

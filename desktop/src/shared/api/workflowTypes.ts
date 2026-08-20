@@ -21,6 +21,7 @@ export type WorkflowRunStatus =
   | "running"
   | "completed"
   | "failed"
+  | "timed_out"
   | "cancelled"
   | "waiting_approval"
   | "waiting_agent";
@@ -32,6 +33,50 @@ export type TraceEntry = {
   startedAt: number | null;
   completedAt: number | null;
   error: string | null;
+  assignmentReceipt: AssignmentReceipt | null;
+};
+
+export type AssignmentOutcome =
+  | "pending"
+  | "completed"
+  | "failed"
+  | "timed_out"
+  | "cancelled"
+  | "not_started";
+
+export type AssignmentReviewState = "not_required" | "human_review_required";
+
+/**
+ * Usage an agent reported for itself on a step assignment. Self-reported and
+ * unverified — never fold `costMicrounits` into a relay-computed total.
+ */
+export type ReportedUsage = {
+  harness: string;
+  model: string | null;
+  inputTokens: number | null;
+  outputTokens: number | null;
+  costMicrounits: number | null;
+  currency: string | null;
+};
+
+export type AssignmentReceipt = {
+  agentPubkey: string;
+  agentOwnerPubkey: string | null;
+  originRelayPubkey: string | null;
+  agentRelayPubkey: string | null;
+  agentRelayUrl: string | null;
+  listingEventId: string | null;
+  promptEventId: string;
+  completionEventId: string | null;
+  promptPublishedAtMs: number | null;
+  terminalAtMs: number | null;
+  durationMs: number | null;
+  rateCurrency: string | null;
+  rateMicrounitsPerHour: number | null;
+  estimatedMicrounits: number | null;
+  outcome: AssignmentOutcome;
+  reviewState: AssignmentReviewState;
+  reportedUsage: ReportedUsage | null;
 };
 
 export type WorkflowRun = {
@@ -44,6 +89,9 @@ export type WorkflowRun = {
   completedAt: number | null;
   errorCode: string | null;
   errorMessage: string | null;
+  workflowAuthorPubkey: string | null;
+  fixedPriceCurrency: string | null;
+  fixedPriceMicrounits: number | null;
   createdAt: number;
 };
 

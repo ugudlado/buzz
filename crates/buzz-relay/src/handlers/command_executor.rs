@@ -1,6 +1,6 @@
 //! Command executor — transactional event processing for command kinds.
 //!
-//! Command kinds (41010–41012, 30620, 46020, 46030–46031) are processed
+//! Command kinds (41010–41012, 30620, 46007, 46020, 46030–46031) are processed
 //! transactionally: validate → begin tx → insert event → execute mutations → commit.
 //!
 //! SECURITY: This module is only reachable AFTER the ingest pipeline has verified:
@@ -68,6 +68,7 @@ pub async fn handle_command(
         KIND_DM_HIDE => handle_dm_hide(tenant, state, &event, &auth).await,
         KIND_WORKFLOW_DEF => handle_workflow_def(tenant, state, &event, &auth).await,
         KIND_WORKFLOW_TRIGGER => handle_workflow_trigger(tenant, state, &event, &auth).await,
+        KIND_WORKFLOW_CANCELLED => handle_workflow_cancel(tenant, state, &event, &auth).await,
         KIND_APPROVAL_GRANT => handle_approval_grant(tenant, state, &event, &auth).await,
         KIND_APPROVAL_DENY => handle_approval_deny(tenant, state, &event, &auth).await,
         _ => Err(IngestError::Rejected(format!(
@@ -859,7 +860,6 @@ async fn handle_workflow_trigger(
         .get_workflow(community_id, workflow_id)
         .await
         .map_err(|_| IngestError::Rejected("invalid: workflow not found".into()))?;
-
     // 3. Manual triggers execute with the workflow owner's authority, so only
     // the owner may start them. Channel membership alone is insufficient: a
     // member could otherwise invoke another user's webhook or message actions.
@@ -985,6 +985,7 @@ async fn handle_workflow_trigger(
             &trigger_ctx_clone,
             0,
             None,
+            None,
         )
         .await;
         engine
@@ -1001,6 +1002,124 @@ async fn handle_workflow_trigger(
             serde_json::json!({
                 "run_id": run_id.to_string(),
             })
+        ),
+    })
+}
+
+/// Cancel an in-flight agent assignment using the reserved workflow-cancelled kind.
+async fn handle_workflow_cancel(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    event: &Event,
+    auth: &IngestAuth,
+) -> Result<IngestResult, IngestError> {
+    let run_id = extract_d_tag(event)
+        .ok_or_else(|| IngestError::Rejected("invalid: missing d tag (run_id)".into()))?
+        .parse::<Uuid>()
+        .map_err(|_| IngestError::Rejected("invalid: bad run_id format".into()))?;
+    let community_id = tenant.community();
+    let run = state
+        .db
+        .get_workflow_run(community_id, run_id)
+        .await
+        .map_err(|_| IngestError::Rejected("invalid: workflow run not found".into()))?;
+    if run.status != RunStatus::WaitingAgent {
+        return Err(IngestError::Rejected(
+            "invalid: only a run waiting on an agent can be cancelled".into(),
+        ));
+    }
+    if run.workflow_author_pubkey.as_deref() != Some(auth.pubkey().to_bytes().as_slice()) {
+        return Err(IngestError::Rejected(
+            "forbidden: only the workflow author can cancel this run".into(),
+        ));
+    }
+    let workflow = state
+        .db
+        .get_workflow(community_id, run.workflow_id)
+        .await
+        .map_err(|_| IngestError::Rejected("invalid: workflow not found".into()))?;
+    let pending_step = state
+        .db
+        .list_agent_steps_for_run(community_id, run_id)
+        .await
+        .map_err(|e| IngestError::Internal(format!("error: load assignment: {e}")))?
+        .into_iter()
+        .find(|step| step.status == buzz_db::workflow::AgentStepStatus::Pending);
+
+    let mut tx = match persist_command_event(state, tenant, event, workflow.channel_id).await? {
+        PersistResult::Duplicate => {
+            return Ok(IngestResult {
+                event_id: event.id.to_hex(),
+                accepted: true,
+                message: "duplicate: already processed".into(),
+            });
+        }
+        PersistResult::Inserted(tx) => tx,
+    };
+
+    let cancelled_at = Utc::now();
+    let assignment_updated = sqlx::query(
+        r#"
+        UPDATE workflow_agent_steps
+        SET status = 'failed', resolved_at = $1,
+            terminal_at = GREATEST(prompt_published_at, LEAST($1, expires_at)),
+            duration_ms = GREATEST(0, FLOOR(EXTRACT(EPOCH FROM
+                (GREATEST(prompt_published_at, LEAST($1, expires_at)) - prompt_published_at)
+            ) * 1000)::BIGINT),
+            outcome = 'cancelled'
+        WHERE community_id = $2 AND run_id = $3 AND status = 'pending'
+        "#,
+    )
+    .bind(cancelled_at)
+    .bind(community_id.as_uuid())
+    .bind(run_id)
+    .execute(tx.as_mut())
+    .await
+    .map_err(|e| IngestError::Internal(format!("error: cancel assignment: {e}")))?
+    .rows_affected();
+    if assignment_updated != 1 {
+        return Err(IngestError::Rejected(
+            "invalid: agent assignment is no longer pending".into(),
+        ));
+    }
+
+    let run_updated = sqlx::query(
+        r#"
+        UPDATE workflow_runs
+        SET status = 'cancelled', completed_at = $1,
+            error_message = 'workflow cancelled by author'
+        WHERE community_id = $2 AND id = $3 AND status = 'waiting_agent'
+        "#,
+    )
+    .bind(cancelled_at)
+    .bind(community_id.as_uuid())
+    .bind(run_id)
+    .execute(tx.as_mut())
+    .await
+    .map_err(|e| IngestError::Internal(format!("error: cancel workflow run: {e}")))?
+    .rows_affected();
+    if run_updated != 1 {
+        return Err(IngestError::Rejected(
+            "invalid: workflow run is no longer waiting on an agent".into(),
+        ));
+    }
+
+    tx.commit()
+        .await
+        .map_err(|e| IngestError::Internal(format!("error: commit cancellation: {e}")))?;
+    if let Some(step) = pending_step {
+        if let Err(error) =
+            crate::remote_jobs::publish_cancellation(state, community_id, &step).await
+        {
+            tracing::warn!(run_id = %run_id, %error, "remote assignment cancellation delivery failed");
+        }
+    }
+    Ok(IngestResult {
+        event_id: event.id.to_hex(),
+        accepted: true,
+        message: format!(
+            "response:{}",
+            serde_json::json!({ "run_id": run_id, "status": "cancelled" })
         ),
     })
 }
@@ -1379,17 +1498,39 @@ async fn resume_workflow_after_approval(
         &trigger_ctx,
         resume_index,
         Some(initial_outputs),
+        existing_trace,
     )
     .await;
     engine
-        .finalize_run(
-            community_id,
-            run.workflow_id,
-            run_id,
-            result,
-            existing_trace,
-        )
+        .finalize_run(community_id, run.workflow_id, run_id, result, None)
         .await;
+}
+
+/// Read the agent's self-reported usage estimate from a completion reply's
+/// `buzz:usage` tag.
+///
+/// Unverified agent input: a missing, malformed, or invalid tag yields `None`
+/// (logged at WARN) so the step still resumes with no usage persisted. Usage
+/// is advisory receipt metadata and must never fail a resume.
+fn parse_reported_usage_tag(event: &Event) -> Option<buzz_core::marketplace::ReportedUsage> {
+    let raw = event.tags.iter().find_map(|tag| {
+        let parts = tag.as_slice();
+        (parts.len() >= 2 && parts[0] == buzz_core::thread::TAG_USAGE).then(|| parts[1].clone())
+    })?;
+    match serde_json::from_str::<buzz_core::marketplace::ReportedUsage>(&raw)
+        .map_err(|error| error.to_string())
+        .and_then(|usage| usage.normalized())
+    {
+        Ok(usage) => Some(usage),
+        Err(error) => {
+            tracing::warn!(
+                event_id = %event.id,
+                %error,
+                "Agent-step resume: ignoring invalid self-reported usage tag"
+            );
+            None
+        }
+    }
 }
 
 /// Check whether an incoming kind:9 event is a reply to a pending
@@ -1413,7 +1554,12 @@ async fn resume_workflow_after_approval(
 /// On a match, the row is CAS'd `pending -> done` *before* any further work
 /// (guards against a duplicate reply or a concurrent expiry-sweep resume).
 /// Only the CAS winner parses the completion block and resumes the run.
-pub async fn try_resume_agent_step(tenant: &TenantContext, state: &Arc<AppState>, event: &Event) {
+pub async fn try_resume_agent_step(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    event: &Event,
+    received_at: chrono::DateTime<chrono::Utc>,
+) {
     // buzz-acp posts completions as direct replies to the run's thread root
     // (so the run reads as one flat thread) and names the completed prompt
     // in a `buzz:completion-of` tag. Prefer that; fall back to the NIP-10
@@ -1513,15 +1659,24 @@ pub async fn try_resume_agent_step(tenant: &TenantContext, state: &Arc<AppState>
         event.created_at.as_secs() as i64,
         root_thread.as_ref(),
     );
+    let outcome = match completion.status {
+        buzz_workflow::CompletionStatus::Success => "completed",
+        buzz_workflow::CompletionStatus::Failed => "failed",
+    };
+    let usage = parse_reported_usage_tag(event);
 
     let updated = match state
         .db
-        .update_agent_step_by_prompt_event_id(
+        .complete_agent_step_by_prompt_event_id(buzz_db::workflow::CompleteAgentStepParams {
             community_id,
-            &prompt_event_id,
-            buzz_db::workflow::AgentStepStatus::Done,
-            Some(&output),
-        )
+            prompt_event_id: &prompt_event_id,
+            status: buzz_db::workflow::AgentStepStatus::Done,
+            output: Some(&output),
+            completion_event_id: Some(&event.id.to_hex()),
+            terminal_at: received_at,
+            outcome,
+            usage: usage.as_ref(),
+        })
         .await
     {
         Ok(updated) => updated,
@@ -1541,6 +1696,80 @@ pub async fn try_resume_agent_step(tenant: &TenantContext, state: &Arc<AppState>
     }
 
     resume_from_done_agent_step(state, community_id, &step, output, run.ok()).await;
+}
+
+/// Resume a durable assignment from an encrypted cross-community terminal event.
+pub async fn try_resume_remote_agent_step(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    event: &Event,
+    received_at: chrono::DateTime<chrono::Utc>,
+) {
+    let validated = match crate::remote_jobs::validate_incoming_terminal(
+        state,
+        tenant.community(),
+        event,
+    )
+    .await
+    {
+        Ok(validated) => validated,
+        Err(error) => {
+            tracing::warn!(event_id = %event.id, %error, "remote agent result failed correlation after storage");
+            return;
+        }
+    };
+    let status = if validated.payload.outcome == "completed" {
+        "success"
+    } else {
+        "failed"
+    };
+    let mut outputs = serde_json::Map::new();
+    // `result` is always present so downstream template steps (e.g. the
+    // installed-agent post step) resolve in both outcomes; failures carry
+    // the bounded error text.
+    let result_text = validated.payload.output.clone().unwrap_or_else(|| {
+        format!(
+            "Remote agent failed: {}",
+            validated
+                .payload
+                .error
+                .as_deref()
+                .unwrap_or("unknown error")
+        )
+    });
+    outputs.insert("result".into(), serde_json::Value::String(result_text));
+    let output = serde_json::json!({
+        "status": status,
+        "outputs": outputs,
+        "reason": validated.payload.error.as_ref().or(validated.payload.output.as_ref()),
+    });
+    let event_id = event.id.to_hex();
+    let updated = state
+        .db
+        .complete_agent_step_by_prompt_event_id(buzz_db::workflow::CompleteAgentStepParams {
+            community_id: tenant.community(),
+            prompt_event_id: &validated.step.prompt_event_id,
+            status: buzz_db::workflow::AgentStepStatus::Done,
+            output: Some(&output),
+            completion_event_id: Some(&event_id),
+            // The caller community owns accounting. Use its observed receipt
+            // time rather than an agent-controlled encrypted timestamp.
+            terminal_at: received_at,
+            outcome: &validated.payload.outcome,
+            // Already validated by `validate_result_payload` during decryption.
+            usage: validated.payload.usage.as_ref(),
+        })
+        .await;
+    match updated {
+        Ok(true) => {
+            resume_from_done_agent_step(state, tenant.community(), &validated.step, output, None)
+                .await;
+        }
+        Ok(false) => {}
+        Err(error) => {
+            tracing::error!(event_id = %event.id, %error, "failed to complete remote agent step");
+        }
+    }
 }
 
 /// Serialize a parsed [`buzz_workflow::AgentCompletion`] into the JSON shape
@@ -1589,11 +1818,6 @@ fn agent_completion_to_output_json(
         },
         "outputs": outputs,
         "reason": completion.reason,
-        "usage": completion.usage.as_ref().map(|u| serde_json::json!({
-            "input_tokens": u.input_tokens,
-            "output_tokens": u.output_tokens,
-            "cost": u.cost,
-        })),
     })
 }
 
@@ -1629,36 +1853,6 @@ async fn resume_from_done_agent_step(
             }
         },
     };
-
-    // CAS the run waiting_agent -> running before doing any resume work —
-    // this, not the earlier status check alone, is what prevents two
-    // concurrent resume attempts for the same run (e.g. the crash-recovery
-    // sweeper racing a still-in-flight live resume once both are past the
-    // grace period) from both calling `execute_from_step`. Only the CAS
-    // winner proceeds; the loser's run has already been (or is being)
-    // resumed by the other caller.
-    match state
-        .db
-        .try_mark_run_resuming(community_id, step.run_id)
-        .await
-    {
-        Ok(true) => {}
-        Ok(false) => {
-            tracing::warn!(
-                run_id = %step.run_id,
-                "Agent-step resume: run has status '{}', expected 'waiting_agent' (lost resume race or already resumed)",
-                run.status
-            );
-            return;
-        }
-        Err(e) => {
-            tracing::error!(
-                run_id = %step.run_id,
-                "Agent-step resume: failed to CAS run to running: {e}"
-            );
-            return;
-        }
-    }
 
     let workflow = match state.db.get_workflow(community_id, step.workflow_id).await {
         Ok(w) => w,
@@ -1759,14 +1953,59 @@ async fn resume_from_done_agent_step(
         None => trace.push(completed_entry),
     }
 
+    if completion_failed {
+        if let Err(e) = state
+            .db
+            .update_workflow_run(
+                community_id,
+                step.run_id,
+                RunStatus::Failed,
+                step.step_index,
+                &serde_json::Value::Array(trace),
+                // The engine worked; the agent reported it could not do the
+                // task. Distinct from the engine-fault codes in
+                // `WorkflowError::code` so operators can filter "Buzz broke"
+                // from "the agent couldn't".
+                Some(buzz_db::workflow::WorkflowRunFailure {
+                    code: "agent_reported_failure",
+                    message: output
+                        .get("reason")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("agent reported failure without a reason"),
+                }),
+            )
+            .await
+        {
+            tracing::error!(run_id = %step.run_id, "Agent-step resume: failed to persist failed completion: {e}");
+        }
+        return;
+    }
+
     let trigger_ctx: TriggerContext = run
         .trigger_context
         .as_ref()
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default();
 
+    // Claim only after every fallible preparation step. If a workflow read or
+    // decode fails, the run remains waiting and the existing sweeper can retry.
+    match state
+        .db
+        .try_mark_run_resuming(community_id, step.run_id, step.step_index)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(e) => {
+            tracing::error!(
+                run_id = %step.run_id,
+                "Agent-step resume: failed to CAS run to running: {e}"
+            );
+            return;
+        }
+    }
+
     let resume_index = step.step_index as usize + 1;
-    let existing_trace = Some(trace);
     let result = buzz_workflow::executor::execute_from_step(
         &state.workflow_engine,
         community_id,
@@ -1775,17 +2014,12 @@ async fn resume_from_done_agent_step(
         &trigger_ctx,
         resume_index,
         Some(initial_outputs),
+        Some(trace),
     )
     .await;
     state
         .workflow_engine
-        .finalize_run(
-            community_id,
-            step.workflow_id,
-            step.run_id,
-            result,
-            existing_trace,
-        )
+        .finalize_run(community_id, step.workflow_id, step.run_id, result, None)
         .await;
 }
 
@@ -1823,4 +2057,62 @@ pub async fn retry_stuck_agent_step_resume(
 
     let output = step.output.clone().unwrap_or_else(|| serde_json::json!({}));
     resume_from_done_agent_step(state, community_id, &step, output, None).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nostr::{EventBuilder, Keys, Kind};
+
+    fn completion_with_tags(tags: Vec<Vec<&str>>) -> Event {
+        let keys = Keys::generate();
+        EventBuilder::new(Kind::Custom(9), "Done.")
+            .tags(tags.into_iter().map(|t| nostr::Tag::parse(t).unwrap()))
+            .sign_with_keys(&keys)
+            .unwrap()
+    }
+
+    #[test]
+    fn reported_usage_tag_parses_a_valid_estimate() {
+        let json = r#"{"harness":"goose","model":"claude-fable-5","inputTokens":1200,"outputTokens":340,"costMicrounits":15000,"currency":"USD"}"#;
+        let usage = parse_reported_usage_tag(&completion_with_tags(vec![vec![
+            buzz_core::thread::TAG_USAGE,
+            json,
+        ]]))
+        .expect("usage parses");
+        assert_eq!(usage.harness, "goose");
+        assert_eq!(usage.input_tokens, Some(1_200));
+        assert_eq!(usage.cost_microunits, Some(15_000));
+        assert_eq!(usage.currency.as_deref(), Some("USD"));
+    }
+
+    /// A missing, malformed, or contract-violating tag must never fail the
+    /// resume — it just yields no persisted usage.
+    #[test]
+    fn reported_usage_tag_ignores_absent_and_invalid_values() {
+        assert!(parse_reported_usage_tag(&completion_with_tags(vec![])).is_none());
+        assert!(parse_reported_usage_tag(&completion_with_tags(vec![vec![
+            buzz_core::thread::TAG_USAGE,
+            "not json",
+        ]]))
+        .is_none());
+        // Unknown fields are rejected by `deny_unknown_fields`.
+        assert!(parse_reported_usage_tag(&completion_with_tags(vec![vec![
+            buzz_core::thread::TAG_USAGE,
+            r#"{"harness":"goose","apiKey":"secret"}"#,
+        ]]))
+        .is_none());
+        // A cost without a currency violates the pair rule.
+        assert!(parse_reported_usage_tag(&completion_with_tags(vec![vec![
+            buzz_core::thread::TAG_USAGE,
+            r#"{"harness":"goose","costMicrounits":10}"#,
+        ]]))
+        .is_none());
+        // An empty harness is not a usable self-report.
+        assert!(parse_reported_usage_tag(&completion_with_tags(vec![vec![
+            buzz_core::thread::TAG_USAGE,
+            r#"{"harness":"  "}"#,
+        ]]))
+        .is_none());
+    }
 }

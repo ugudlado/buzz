@@ -288,7 +288,7 @@ pub struct PromptResult {
     /// Identifies the completed turn for observer terminal events.
     pub turn_id: String,
     pub outcome: PromptOutcome,
-    /// Present on failure in Queue mode, for requeue.
+    /// Present on failure in Queue mode, or for remote terminalization.
     pub batch: Option<FlushBatch>,
 }
 
@@ -2492,7 +2492,7 @@ pub async fn run_prompt_task(
                         let usage = agent.acp.take_turn_usage();
                         publish_agent_turn_metric(
                             &ctx,
-                            usage,
+                            usage.clone(),
                             observer_channel_id,
                             &session_id,
                             &turn_id,
@@ -2503,6 +2503,7 @@ pub async fn run_prompt_task(
                             &ctx,
                             batch.as_ref(),
                             agent.acp.take_turn_text(),
+                            usage.as_ref(),
                         );
                         send_prompt_result(
                             &result_tx,
@@ -2570,7 +2571,7 @@ pub async fn run_prompt_task(
             let usage = agent.acp.take_turn_usage();
             publish_agent_turn_metric(
                 &ctx,
-                usage,
+                usage.clone(),
                 observer_channel_id,
                 &session_id,
                 &turn_id,
@@ -2582,6 +2583,7 @@ pub async fn run_prompt_task(
                 &ctx,
                 batch.as_ref(),
                 agent.acp.take_turn_text(),
+                usage.as_ref(),
             );
             send_prompt_result(
                 &result_tx,
@@ -4143,11 +4145,25 @@ fn spawn_workflow_completion_if_applicable(
     ctx: &PromptContext,
     batch: Option<&FlushBatch>,
     turn_text: String,
+    usage: Option<&crate::usage::TurnUsage>,
 ) {
     let Some(batch) = batch else { return };
     let Some(be) = batch.events.last() else {
         return;
     };
+    let reported = usage.map(|usage| build_reported_usage(&ctx.harness_name, usage));
+    if crate::remote_jobs::context(&be.event).is_some() {
+        let rest = ctx.rest_client.clone();
+        let event = be.event.clone();
+        tokio::spawn(async move {
+            if let Err(error) =
+                crate::remote_jobs::post_result(&rest, &event, turn_text, reported).await
+            {
+                tracing::error!(event_id = %event.id, %error, "failed to deliver remote agent-job result");
+            }
+        });
+        return;
+    }
     if !crate::is_relay_workflow_message(&be.event, ctx.relay_pubkey.as_ref()) {
         return;
     }
@@ -4163,14 +4179,28 @@ fn spawn_workflow_completion_if_applicable(
         .and_then(|hex| hex.parse().ok())
         .unwrap_or(prompt_event_id);
     tokio::spawn(async move {
-        post_workflow_completion(&rest, channel_id, root_event_id, prompt_event_id, turn_text)
-            .await;
+        post_workflow_completion(
+            &rest,
+            channel_id,
+            root_event_id,
+            prompt_event_id,
+            turn_text,
+            reported,
+        )
+        .await;
     });
 }
 
 /// Return the batch for requeue only in Queue mode; drop it in Drop mode.
 #[inline]
 fn requeue_batch_if_queue(ctx: &PromptContext, batch: Option<FlushBatch>) -> Option<FlushBatch> {
+    if batch
+        .as_ref()
+        .and_then(|batch| batch.events.last())
+        .is_some_and(|event| crate::remote_jobs::context(&event.event).is_some())
+    {
+        return batch;
+    }
     match ctx.dedup_mode {
         DedupMode::Queue => batch,
         DedupMode::Drop => None,
@@ -4188,6 +4218,13 @@ fn requeue_cancelled_batch(
     signal: ControlSignal,
     batch: Option<FlushBatch>,
 ) -> Option<FlushBatch> {
+    if batch
+        .as_ref()
+        .and_then(|batch| batch.events.last())
+        .is_some_and(|event| crate::remote_jobs::context(&event.event).is_some())
+    {
+        return batch;
+    }
     let reason = match signal {
         ControlSignal::Steer => CancelReason::Steer,
         ControlSignal::Interrupt | ControlSignal::SwitchModel(_) => CancelReason::Interrupt,
@@ -4583,6 +4620,39 @@ pub(crate) fn build_turn_metric_counts(
     (turn_counts, cumulative_counts)
 }
 
+/// Map a completed turn's usage onto the marketplace receipt's self-reported
+/// estimate.
+///
+/// Turn-level deltas only — cumulative session totals would double-count
+/// across a run's steps. When `delta_reliable` is false the tracker has
+/// already cleared every `turn_*` field, so the token fields pass through as
+/// `None` rather than being substituted.
+pub(crate) fn build_reported_usage(
+    harness: &str,
+    usage: &crate::usage::TurnUsage,
+) -> buzz_core::marketplace::ReportedUsage {
+    // ponytail: harnesses report cost in USD only, so the currency is fixed
+    // rather than carried through the usage pipeline.
+    let cost_microunits = usage.turn_cost_usd.and_then(|cost| {
+        (cost.is_finite() && cost >= 0.0)
+            .then(|| (cost * 1_000_000.0).floor())
+            .filter(|micro| *micro <= buzz_core::marketplace::MAX_MICROUNITS as f64)
+            .map(|micro| micro as u64)
+    });
+    buzz_core::marketplace::ReportedUsage {
+        harness: harness.to_string(),
+        model: usage
+            .pricing_identity
+            .as_ref()
+            .map(|identity| identity.model.clone())
+            .or_else(|| usage.model.clone()),
+        input_tokens: usage.turn_input_tokens,
+        output_tokens: usage.turn_output_tokens,
+        cost_microunits,
+        currency: cost_microunits.map(|_| "USD".to_string()),
+    }
+}
+
 /// Best-effort: build and publish a `kind:44200` NIP-AM agent turn metric event.
 ///
 /// Does nothing when `usage` is `None` (goose emitted no usage notification
@@ -4800,12 +4870,31 @@ pub(crate) async fn post_failure_notice(
 /// until a richer capture mechanism is built. Good enough to unblock a
 /// chain's *progression* even though per-step data handoff isn't captured
 /// yet.
+/// Build the `buzz:usage` tag carrying a validated, JSON-encoded estimate.
+///
+/// Returns `Ok(None)` when there is nothing to report; an invalid estimate is
+/// an error so the caller can drop the tag and log rather than publish a value
+/// the relay would reject on parse.
+pub(crate) fn usage_tag(
+    usage: Option<buzz_core::marketplace::ReportedUsage>,
+) -> Result<Option<nostr::Tag>, String> {
+    let Some(usage) = usage else {
+        return Ok(None);
+    };
+    let usage = usage.normalized()?;
+    let json = serde_json::to_string(&usage).map_err(|error| error.to_string())?;
+    nostr::Tag::parse([buzz_core::thread::TAG_USAGE, &json])
+        .map(Some)
+        .map_err(|error| error.to_string())
+}
+
 pub(crate) async fn post_workflow_completion(
     rest: &crate::relay::RestClient,
     channel_id: Uuid,
     root_event_id: nostr::EventId,
     prompt_event_id: nostr::EventId,
     turn_text: String,
+    usage: Option<buzz_core::marketplace::ReportedUsage>,
 ) {
     // The agent replies in its own words; the machine-readable part lives in
     // the `buzz:completion-of` tag (turn ended = step done, relay-side). An
@@ -4847,6 +4936,19 @@ pub(crate) async fn post_workflow_completion(
                 "workflow completion: completion-of tag failed: {e}"
             );
             return;
+        }
+    };
+    // Self-reported usage is advisory: a build failure drops the tag rather
+    // than the completion, which the run needs to progress.
+    let builder = match usage_tag(usage) {
+        Ok(Some(tag)) => builder.tag(tag),
+        Ok(None) => builder,
+        Err(e) => {
+            tracing::warn!(
+                prompt_event_id = %prompt_event_id,
+                "workflow completion: usage tag skipped: {e}"
+            );
+            builder
         }
     };
     let event = match builder.sign_with_keys(&rest.keys) {
@@ -7781,6 +7883,126 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             Some(buzz_core::agent_turn_metric::StopReason::EndTurn),
         )
         .await;
+    }
+
+    fn reported_usage_fixture() -> crate::usage::TurnUsage {
+        crate::usage::TurnUsage {
+            session_id: "sess-1".to_string(),
+            turn_seq: 1,
+            delta_reliable: true,
+            turn_input_tokens: Some(1_200),
+            turn_output_tokens: Some(340),
+            turn_total_tokens: Some(1_540),
+            turn_cost_usd: Some(0.015_5),
+            turn_cache_read_tokens: None,
+            turn_cache_write_tokens: None,
+            // Cumulative values must never reach the receipt.
+            cumulative_input_tokens: Some(99_999),
+            cumulative_output_tokens: Some(88_888),
+            cumulative_total_tokens: None,
+            cumulative_cost_usd: Some(9.5),
+            cumulative_cache_read_tokens: None,
+            cumulative_cache_write_tokens: None,
+            model: Some("session-alias".to_string()),
+            pricing_identity: None,
+        }
+    }
+
+    /// Turn deltas map through; cost floors to micro-units and pins USD.
+    #[test]
+    fn test_build_reported_usage_uses_turn_deltas() {
+        let reported = build_reported_usage("goose", &reported_usage_fixture());
+        assert_eq!(reported.harness, "goose");
+        assert_eq!(reported.model.as_deref(), Some("session-alias"));
+        assert_eq!(reported.input_tokens, Some(1_200));
+        assert_eq!(reported.output_tokens, Some(340));
+        assert_eq!(reported.cost_microunits, Some(15_500));
+        assert_eq!(reported.currency.as_deref(), Some("USD"));
+        assert!(reported.normalized().is_ok());
+    }
+
+    /// The billing identity's model wins over the session alias when present.
+    #[test]
+    fn test_build_reported_usage_prefers_pricing_identity_model() {
+        let usage = crate::usage::TurnUsage {
+            pricing_identity: Some(buzz_core::agent_turn_metric::PricingIdentity {
+                authority: "api.anthropic.com".to_string(),
+                model: "claude-fable-5".to_string(),
+                cache_class: None,
+            }),
+            ..reported_usage_fixture()
+        };
+        assert_eq!(
+            build_reported_usage("goose", &usage).model.as_deref(),
+            Some("claude-fable-5")
+        );
+    }
+
+    /// An unreliable delta reports no tokens rather than cumulative totals.
+    #[test]
+    fn test_build_reported_usage_omits_unreliable_deltas() {
+        let usage = crate::usage::TurnUsage {
+            delta_reliable: false,
+            turn_input_tokens: None,
+            turn_output_tokens: None,
+            turn_cost_usd: None,
+            ..reported_usage_fixture()
+        };
+        let reported = build_reported_usage("buzz-agent", &usage);
+        assert_eq!(reported.input_tokens, None);
+        assert_eq!(reported.output_tokens, None);
+        assert_eq!(reported.cost_microunits, None);
+        assert_eq!(reported.currency, None);
+        assert!(reported.normalized().is_ok());
+    }
+
+    /// Non-finite, negative, and unrepresentable costs are dropped, never
+    /// coerced into a bogus micro-unit value.
+    #[test]
+    fn test_build_reported_usage_rejects_unusable_costs() {
+        for cost in [f64::NAN, f64::INFINITY, -0.01, f64::MAX] {
+            let usage = crate::usage::TurnUsage {
+                turn_cost_usd: Some(cost),
+                ..reported_usage_fixture()
+            };
+            let reported = build_reported_usage("goose", &usage);
+            assert_eq!(
+                reported.cost_microunits, None,
+                "cost {cost} must be dropped"
+            );
+            assert_eq!(reported.currency, None);
+        }
+        // A sub-micro-unit cost floors to zero and still carries a currency.
+        let usage = crate::usage::TurnUsage {
+            turn_cost_usd: Some(0.000_000_1),
+            ..reported_usage_fixture()
+        };
+        let reported = build_reported_usage("goose", &usage);
+        assert_eq!(reported.cost_microunits, Some(0));
+        assert_eq!(reported.currency.as_deref(), Some("USD"));
+    }
+
+    /// The `buzz:usage` tag carries JSON that parses back to the same estimate.
+    #[test]
+    fn test_usage_tag_round_trips_through_json() {
+        let reported = build_reported_usage("goose", &reported_usage_fixture());
+        let tag = usage_tag(Some(reported.clone()))
+            .expect("build usage tag")
+            .expect("tag present");
+        let parts = tag.as_slice();
+        assert_eq!(parts[0], buzz_core::thread::TAG_USAGE);
+        assert_eq!(
+            serde_json::from_str::<buzz_core::marketplace::ReportedUsage>(&parts[1])
+                .expect("parse usage tag"),
+            reported
+        );
+
+        assert!(usage_tag(None).expect("no usage").is_none());
+        assert!(usage_tag(Some(buzz_core::marketplace::ReportedUsage {
+            harness: String::new(),
+            ..reported
+        }))
+        .is_err());
     }
 
     /// `publish_agent_turn_metric` is a no-op when `owner_pubkey` is absent.

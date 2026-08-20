@@ -11,7 +11,7 @@ use crate::{
     models::{ProfileInfo, SearchUsersResponse, UserNotesResponse, UsersBatchResponse},
     nostr_convert,
     relay::{
-        query_relay, query_relay_at_with_keys, relay_http_base_url, submit_event,
+        query_relay, query_relay_at, query_relay_at_with_keys, relay_http_base_url, submit_event,
         submit_event_at_with_keys,
     },
 };
@@ -337,6 +337,7 @@ pub async fn search_users(
 #[tauri::command]
 pub async fn get_presence(
     pubkeys: Vec<String>,
+    relay_url: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<HashMap<String, PresenceStatus>, String> {
     if pubkeys.is_empty() {
@@ -346,14 +347,14 @@ pub async fn get_presence(
     // Presence is published as kind:20001 ephemeral events. Query the most
     // recent per author. Some relays don't retain ephemeral events — we
     // best-effort and return what we get.
-    let events = query_relay(
-        &state,
-        &[serde_json::json!({
-            "kinds": [20001],
-            "authors": pubkeys,
-        })],
-    )
-    .await
+    let filters = [serde_json::json!({
+        "kinds": [20001],
+        "authors": pubkeys,
+    })];
+    let events = match relay_url {
+        Some(relay_url) => query_relay_at(&state, &relay_http_base_url(&relay_url), &filters).await,
+        None => query_relay(&state, &filters).await,
+    }
     .unwrap_or_default();
 
     let mut latest: HashMap<String, (u64, PresenceStatus)> = HashMap::new();

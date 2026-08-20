@@ -7,5 +7,6 @@ license = "Apache-2.0"
 repository = "https://github.com/block/buzz"
 
 [dependencies]
+buzz-core = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

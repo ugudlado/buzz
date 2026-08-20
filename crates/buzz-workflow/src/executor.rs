@@ -451,11 +451,15 @@ pub fn resolve_step_templates(
         AssignToAgent {
             agent,
             agent_pubkey,
+            agent_relay_pubkey,
+            agent_relay_url,
             instruction,
             timeout,
         } => Ok(AssignToAgent {
             agent: t(agent)?,
             agent_pubkey: agent_pubkey.clone(),
+            agent_relay_pubkey: agent_relay_pubkey.clone(),
+            agent_relay_url: agent_relay_url.clone(),
             instruction: t(instruction)?,
             timeout: timeout.clone(),
         }),
@@ -488,6 +492,16 @@ pub enum SuspendReason {
         root_created_at: i64,
         /// Compressed public key bytes of the mentioned agent.
         agent_pubkey: Vec<u8>,
+        /// Verified owner at dispatch.
+        agent_owner_pubkey: Vec<u8>,
+        /// Snapshotted rate currency, if priced.
+        rate_currency: Option<String>,
+        /// Snapshotted micro-units per hour, if priced.
+        rate_microunits_per_hour: Option<u64>,
+        /// Relay-observed publication instant in Unix milliseconds.
+        prompt_published_at_ms: i64,
+        /// Whether the prompt is an invisible cross-community job request.
+        remote: bool,
     },
 }
 
@@ -563,6 +577,7 @@ fn resolve_send_message_channel(
 ///
 /// `RequestApproval` returns `StepResult::Suspended` — the caller must
 /// persist state and stop the execution loop.
+#[allow(clippy::too_many_arguments)]
 pub async fn dispatch_action(
     step_id: &str,
     action: &ActionDef,
@@ -571,6 +586,10 @@ pub async fn dispatch_action(
     run_id: Uuid,
     trigger_ctx: &TriggerContext,
     thread_anchor: Option<&crate::action_sink::ThreadAnchor>,
+    marketplace_required: bool,
+    step_index: i32,
+    trace_prefix: &[JsonValue],
+    step_started_at: i64,
 ) -> Result<StepResult, WorkflowError> {
     use ActionDef::*;
 
@@ -643,6 +662,7 @@ pub async fn dispatch_action(
                     text,
                     &owner_pubkey_hex,
                     thread_anchor,
+                    None,
                 )
                 .await
                 .map_err(WorkflowError::from)?;
@@ -752,6 +772,8 @@ pub async fn dispatch_action(
         AssignToAgent {
             agent,
             agent_pubkey: agent_pubkey_hint,
+            agent_relay_pubkey,
+            agent_relay_url,
             instruction,
             timeout,
         } => {
@@ -792,8 +814,34 @@ pub async fn dispatch_action(
             // nobody"), which would otherwise let this step appear to
             // succeed while no agent was actually woken. Surface either
             // failure mode as a typed step failure instead.
-            let agent_pubkey = match agent_pubkey_hint {
-                Some(pk) => sink
+            let remote_coordinate = match (agent_relay_pubkey, agent_relay_url) {
+                (Some(relay_pubkey), Some(relay_url)) => Some(
+                    crate::action_sink::AgentRelayCoordinate {
+                        relay_pubkey: hex::decode(relay_pubkey).map_err(|error| {
+                            WorkflowError::InvalidDefinition(format!(
+                                "AssignToAgent: invalid agent_relay_pubkey: {error}"
+                            ))
+                        })?,
+                        relay_url: relay_url.clone(),
+                    },
+                ),
+                (None, None) => None,
+                _ => {
+                    return Err(WorkflowError::InvalidDefinition(
+                        "AssignToAgent: remote coordinates are incomplete".into(),
+                    ));
+                }
+            };
+            let agent_pubkey = match (agent_pubkey_hint, remote_coordinate.as_ref()) {
+                (Some(pk), Some(_)) => nostr::PublicKey::from_hex(pk)
+                    .map_err(|error| {
+                        WorkflowError::InvalidDefinition(format!(
+                            "AssignToAgent: invalid agent_pubkey: {error}"
+                        ))
+                    })?
+                    .to_bytes()
+                    .to_vec(),
+                (Some(pk), None) => sink
                     .verify_agent_membership(community_id, &channel_id, pk)
                     .await
                     .map_err(WorkflowError::from)?
@@ -802,7 +850,12 @@ pub async fn dispatch_action(
                             "AssignToAgent: agent_pubkey '{pk}' is not a member of channel {channel_id}"
                         ))
                     })?,
-                None => sink
+                (None, Some(_)) => {
+                    return Err(WorkflowError::InvalidDefinition(
+                        "AssignToAgent: remote assignments require agent_pubkey".into(),
+                    ));
+                }
+                (None, None) => sink
                     .resolve_agent(community_id, &channel_id, agent)
                     .await
                     .map_err(WorkflowError::from)?
@@ -814,6 +867,37 @@ pub async fn dispatch_action(
             };
 
             let text = format!("@{agent} {instruction}");
+
+            let marketplace = sink
+                .agent_marketplace_snapshot(
+                    community_id,
+                    &agent_pubkey,
+                    remote_coordinate.as_ref(),
+                )
+                .await
+                .map_err(WorkflowError::from)?
+                .ok_or_else(|| {
+                    WorkflowError::InvalidDefinition(format!(
+                        "AssignToAgent: agent '{agent}' has no verified owner"
+                    ))
+                })?;
+            if (marketplace_required || remote_coordinate.is_some()) && !marketplace.listed {
+                return Err(WorkflowError::InvalidDefinition(format!(
+                    "AssignToAgent: agent '{agent}' is not currently listed"
+                )));
+            }
+            let remote_assignment = match remote_coordinate {
+                Some(coordinate) => Some(crate::action_sink::RemoteAgentAssignment {
+                    coordinate,
+                    listing_event_id: marketplace.listing_event_id.clone().ok_or_else(|| {
+                        WorkflowError::InvalidDefinition(
+                            "AssignToAgent: remote listing snapshot has no event id".into(),
+                        )
+                    })?,
+                    instruction: instruction.clone(),
+                }),
+                None => None,
+            };
 
             info!(
                 run_id = %run_id,
@@ -834,9 +918,24 @@ pub async fn dispatch_action(
                     &text,
                     &owner_pubkey_hex,
                     thread_anchor,
+                    Some(crate::action_sink::AgentAssignmentArm {
+                        workflow_id: wf_run.workflow_id,
+                        run_id,
+                        step_id: step_id.to_owned(),
+                        step_index,
+                        agent_pubkey: agent_pubkey.clone(),
+                        agent_owner_pubkey: marketplace.owner_pubkey.clone(),
+                        rate_currency: marketplace.rate_currency.clone(),
+                        rate_microunits_per_hour: marketplace.rate_microunits_per_hour,
+                        timeout_secs: parse_duration_secs(timeout_str)?,
+                        trace_prefix: trace_prefix.to_vec(),
+                        step_started_at,
+                        remote: remote_assignment,
+                    }),
                 )
                 .await
                 .map_err(WorkflowError::from)?;
+            let prompt_published_at_ms = chrono::Utc::now().timestamp_millis();
             // Matches the relay's own `Timestamp::now()` at signing time
             // (same clock, moments apart) — avoids a broader ActionSink
             // return-type change just to carry this back from `send_message`.
@@ -857,6 +956,11 @@ pub async fn dispatch_action(
                     root_event_id,
                     root_created_at,
                     agent_pubkey,
+                    agent_owner_pubkey: marketplace.owner_pubkey,
+                    rate_currency: marketplace.rate_currency,
+                    rate_microunits_per_hour: marketplace.rate_microunits_per_hour,
+                    prompt_published_at_ms,
+                    remote: marketplace.listing_event_id.is_some(),
                 },
                 timeout: timeout_str.to_owned(),
             })
@@ -955,34 +1059,11 @@ pub(crate) fn parse_duration_secs(duration: &str) -> Result<u64, WorkflowError> 
 /// in the HTTP client, preventing DNS rebinding TOCTOU attacks.
 #[cfg(feature = "reqwest")]
 async fn check_ssrf(host: &str, port: u16) -> Result<std::net::IpAddr, WorkflowError> {
-    let addr_str = format!("{host}:{port}");
-    let addrs: Vec<std::net::IpAddr> = tokio::task::spawn_blocking(move || {
-        use std::net::ToSocketAddrs;
-        addr_str
-            .to_socket_addrs()
-            .map(|iter| iter.map(|sa| sa.ip()).collect::<Vec<_>>())
-    })
-    .await
-    .map_err(|e| WorkflowError::WebhookError(format!("SSRF check task failed: {e}")))?
-    .map_err(|e| WorkflowError::WebhookError(format!("DNS resolution failed: {e}")))?;
-
-    if addrs.is_empty() {
-        return Err(WorkflowError::WebhookError(
-            "DNS resolution returned no addresses".into(),
-        ));
-    }
-
-    debug!("Resolved webhook host '{}' → {:?}", host, addrs);
-
-    for ip in &addrs {
-        if buzz_core::network::is_private_ip(ip) {
-            return Err(WorkflowError::WebhookError(format!(
-                "SSRF blocked: '{host}' resolved to private/reserved address {ip}"
-            )));
-        }
-    }
-
-    Ok(addrs[0])
+    let host = host.to_owned();
+    tokio::task::spawn_blocking(move || buzz_core::network::resolve_public_host(&host, port))
+        .await
+        .map_err(|e| WorkflowError::WebhookError(format!("SSRF check task failed: {e}")))?
+        .map_err(|e| WorkflowError::WebhookError(format!("SSRF blocked: {e}")))
 }
 
 /// Maximum response body size for webhook calls (1 MiB).
@@ -1230,7 +1311,17 @@ pub async fn execute_run(
             )
         })?;
 
-    execute_steps(engine, community_id, run_id, def, trigger_ctx, 0, None).await
+    execute_steps(
+        engine,
+        community_id,
+        run_id,
+        def,
+        trigger_ctx,
+        0,
+        None,
+        vec![],
+    )
+    .await
 }
 
 /// Resume execution from a specific step index (used for approval resume).
@@ -1245,6 +1336,7 @@ pub async fn execute_run(
 /// `initial_outputs` should be reconstructed from the execution trace before
 /// calling this function on resume, so that steps after the resume point can
 /// reference `{{steps.PREV_STEP.output.X}}` correctly.
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_from_step(
     engine: &WorkflowEngine,
     community_id: CommunityId,
@@ -1253,6 +1345,7 @@ pub async fn execute_from_step(
     trigger_ctx: &TriggerContext,
     start_index: usize,
     initial_outputs: Option<HashMap<String, JsonValue>>,
+    initial_trace: Option<Vec<JsonValue>>,
 ) -> Result<ExecutionResult, (WorkflowError, crate::error::PartialProgress)> {
     // Fail fast if all concurrency permits are in use — no queuing.
     let _permit = engine.run_semaphore.try_acquire().map_err(|_| {
@@ -1264,15 +1357,15 @@ pub async fn execute_from_step(
 
     // Mark run as Running now that we have a permit (resume from approval).
     // Preserve the existing execution trace from pre-approval steps.
-    let existing_trace = match engine.db.get_workflow_run(community_id, run_id).await {
-        Ok(r) => r.execution_trace,
-        Err(e) => {
-            warn!(
-                run_id = %run_id,
-                "Failed to read existing trace for resume — pre-approval trace will be lost: {e}"
-            );
-            serde_json::json!([])
-        }
+    let existing_trace = match initial_trace {
+        Some(trace) => JsonValue::Array(trace),
+        None => match engine.db.get_workflow_run(community_id, run_id).await {
+            Ok(r) => r.execution_trace,
+            Err(e) => {
+                warn!(run_id = %run_id, "Failed to read existing trace for resume: {e}");
+                serde_json::json!([])
+            }
+        },
     };
     engine
         .db
@@ -1300,6 +1393,7 @@ pub async fn execute_from_step(
         trigger_ctx,
         start_index,
         initial_outputs,
+        existing_trace.as_array().cloned().unwrap_or_default(),
     )
     .await
 }
@@ -1328,6 +1422,7 @@ fn thread_anchor_from_step_output(output: &JsonValue) -> Option<crate::action_si
 ///
 /// On error, returns `(WorkflowError, PartialProgress)` so callers can persist
 /// the trace of steps completed before the failure.
+#[allow(clippy::too_many_arguments)]
 async fn execute_steps(
     engine: &WorkflowEngine,
     community_id: CommunityId,
@@ -1336,9 +1431,9 @@ async fn execute_steps(
     trigger_ctx: &TriggerContext,
     start_index: usize,
     initial_outputs: Option<HashMap<String, JsonValue>>,
+    mut trace: Vec<JsonValue>,
 ) -> Result<ExecutionResult, (WorkflowError, crate::error::PartialProgress)> {
     let mut step_outputs: HashMap<String, JsonValue> = initial_outputs.unwrap_or_default();
-    let mut trace: Vec<JsonValue> = Vec::new();
 
     // Running NIP-10 thread anchor for `assign_to_agent` steps, so a
     // multi-step run threads into one conversation instead of independent
@@ -1384,36 +1479,79 @@ async fn execute_steps(
                 }
                 Err(e) => {
                     warn!(run_id = %run_id, step = %step.id, "Condition error: {e}");
-                    return Err(fail_step(e, &step.id, step_started_at, i, trace));
+                    let status = if matches!(&step.action, ActionDef::AssignToAgent { .. }) {
+                        "not_started"
+                    } else {
+                        "failed"
+                    };
+                    return Err(fail_step_with_status(
+                        e,
+                        &step.id,
+                        step_started_at,
+                        i,
+                        trace,
+                        status,
+                    ));
                 }
             }
         }
 
         let resolved_action = match resolve_step_templates(step, trigger_ctx, &step_outputs) {
             Ok(a) => a,
-            Err(e) => return Err(fail_step(e, &step.id, step_started_at, i, trace)),
+            Err(e) => {
+                let status = if matches!(&step.action, ActionDef::AssignToAgent { .. }) {
+                    "not_started"
+                } else {
+                    "failed"
+                };
+                return Err(fail_step_with_status(
+                    e,
+                    &step.id,
+                    step_started_at,
+                    i,
+                    trace,
+                    status,
+                ));
+            }
         };
 
         let timeout_secs = step
             .timeout_secs
             .unwrap_or(engine.config.default_timeout_secs);
-        let dispatch_result = tokio::time::timeout(
-            std::time::Duration::from_secs(timeout_secs),
-            dispatch_action(
-                &step.id,
-                &resolved_action,
-                engine,
-                community_id,
-                run_id,
-                trigger_ctx,
-                thread_anchor.as_ref(),
-            ),
-        )
-        .await;
+        let dispatch = dispatch_action(
+            &step.id,
+            &resolved_action,
+            engine,
+            community_id,
+            run_id,
+            trigger_ctx,
+            thread_anchor.as_ref(),
+            def.marketplace.as_ref().is_some_and(|value| value.listed),
+            i as i32,
+            &trace,
+            step_started_at,
+        );
+
+        let dispatch_result =
+            tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), dispatch).await;
 
         let result = match dispatch_result {
             Ok(Ok(r)) => r,
-            Ok(Err(e)) => return Err(fail_step(e, &step.id, step_started_at, i, trace)),
+            Ok(Err(e)) => {
+                let status = if matches!(&resolved_action, ActionDef::AssignToAgent { .. }) {
+                    "not_started"
+                } else {
+                    "failed"
+                };
+                return Err(fail_step_with_status(
+                    e,
+                    &step.id,
+                    step_started_at,
+                    i,
+                    trace,
+                    status,
+                ));
+            }
             Err(_timeout) => {
                 let timeout_err = WorkflowError::StepTimeout {
                     step_id: step.id.clone(),
@@ -1453,6 +1591,7 @@ async fn execute_steps(
                     prompt_created_at,
                     root_event_id,
                     root_created_at,
+                    remote: false,
                     ..
                 } = &reason
                 {
@@ -1525,15 +1664,36 @@ fn fail_step(
     step_id: &str,
     started_at: i64,
     step_index: usize,
-    mut trace: Vec<JsonValue>,
+    trace: Vec<JsonValue>,
 ) -> (WorkflowError, crate::error::PartialProgress) {
-    trace.push(serde_json::json!({
-        "step_id": step_id,
-        "status": "failed",
-        "error": err.to_string(),
-        "started_at": started_at,
-        "completed_at": unix_now(),
-    }));
+    fail_step_with_status(err, step_id, started_at, step_index, trace, "failed")
+}
+
+fn fail_step_with_status(
+    err: WorkflowError,
+    step_id: &str,
+    started_at: i64,
+    step_index: usize,
+    mut trace: Vec<JsonValue>,
+    status: &str,
+) -> (WorkflowError, crate::error::PartialProgress) {
+    trace.push(if status == "not_started" {
+        serde_json::json!({
+            "step_id": step_id,
+            "status": status,
+            "error": err.to_string(),
+            "started_at": null,
+            "completed_at": null,
+        })
+    } else {
+        serde_json::json!({
+            "step_id": step_id,
+            "status": status,
+            "error": err.to_string(),
+            "started_at": started_at,
+            "completed_at": unix_now(),
+        })
+    });
     (err, crate::error::PartialProgress { step_index, trace })
 }
 
@@ -2185,6 +2345,7 @@ mod tests {
             text: &str,
             _author_pubkey: &str,
             _reply_to: Option<&crate::action_sink::ThreadAnchor>,
+            _assignment: Option<crate::action_sink::AgentAssignmentArm>,
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<String, ActionSinkError>> + Send + '_>,
         > {
@@ -2229,6 +2390,34 @@ mod tests {
         > {
             let result = self.members.get(pubkey_hex).cloned();
             Box::pin(async move { Ok(result) })
+        }
+
+        fn agent_marketplace_snapshot<'a>(
+            &'a self,
+            _community_id: CommunityId,
+            agent_pubkey: &'a [u8],
+            _coordinate: Option<&'a crate::action_sink::AgentRelayCoordinate>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            Option<crate::action_sink::AgentMarketplaceSnapshot>,
+                            ActionSinkError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            let owner_pubkey = agent_pubkey.to_vec();
+            Box::pin(async move {
+                Ok(Some(crate::action_sink::AgentMarketplaceSnapshot {
+                    owner_pubkey,
+                    listed: true,
+                    rate_currency: Some("USD".into()),
+                    rate_microunits_per_hour: Some(12_000_000),
+                    listing_event_id: None,
+                }))
+            })
         }
     }
 
@@ -2319,6 +2508,8 @@ mod tests {
         let action = ActionDef::AssignToAgent {
             agent: "Lep".to_owned(),
             agent_pubkey: None,
+            agent_relay_pubkey: None,
+            agent_relay_url: None,
             instruction: "please investigate".to_owned(),
             timeout: None,
         };
@@ -2331,6 +2522,10 @@ mod tests {
             run_id,
             &trigger_ctx,
             None,
+            false,
+            0,
+            &[],
+            0,
         )
         .await
         .expect("dispatch should succeed");
@@ -2390,6 +2585,8 @@ mod tests {
         let action = ActionDef::AssignToAgent {
             agent: "Lep".to_owned(),
             agent_pubkey: Some(pubkey_hex),
+            agent_relay_pubkey: None,
+            agent_relay_url: None,
             instruction: "please investigate".to_owned(),
             timeout: None,
         };
@@ -2402,6 +2599,10 @@ mod tests {
             run_id,
             &trigger_ctx,
             None,
+            false,
+            0,
+            &[],
+            0,
         )
         .await
         .expect("dispatch should succeed via pubkey verification");
@@ -2443,6 +2644,8 @@ mod tests {
         let action = ActionDef::AssignToAgent {
             agent: "Lep".to_owned(),
             agent_pubkey: Some(pubkey_hex),
+            agent_relay_pubkey: None,
+            agent_relay_url: None,
             instruction: "please investigate".to_owned(),
             timeout: None,
         };
@@ -2455,6 +2658,10 @@ mod tests {
             run_id,
             &trigger_ctx,
             None,
+            false,
+            0,
+            &[],
+            0,
         )
         .await
         .expect_err("dispatch should fail: pubkey is not a channel member");
@@ -2493,6 +2700,8 @@ mod tests {
         let action = ActionDef::AssignToAgent {
             agent: "Nobody".to_owned(),
             agent_pubkey: None,
+            agent_relay_pubkey: None,
+            agent_relay_url: None,
             instruction: "please investigate".to_owned(),
             timeout: None,
         };
@@ -2505,6 +2714,10 @@ mod tests {
             run_id,
             &trigger_ctx,
             None,
+            false,
+            0,
+            &[],
+            0,
         )
         .await
         .expect_err("unresolved agent name must be a typed failure");
@@ -2619,10 +2832,9 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires Postgres"]
-    async fn trace_entry_carries_timestamps_and_failed_status_on_dispatch_error() {
+    async fn trace_entry_marks_predispatch_assignment_error_not_started() {
         // Unresolved agent name → dispatch_action returns Err — execute_run
-        // must surface a `failed` trace entry with both timestamps, not an
-        // entry missing started_at/completed_at.
+        // must surface `not_started` with no fabricated duration.
         let sink = MockAgentSink {
             agents: HashMap::new(),
             sent: Mutex::new(Vec::new()),
@@ -2650,22 +2862,16 @@ mod tests {
             .expect_err("unresolved agent must fail the run");
 
         assert_eq!(progress.trace.len(), 1);
-        let failed = &progress.trace[0];
-        assert_eq!(failed["step_id"], "assign");
-        assert_eq!(failed["status"], "failed");
+        let not_started = &progress.trace[0];
+        assert_eq!(not_started["step_id"], "assign");
+        assert_eq!(not_started["status"], "not_started");
         assert!(
-            failed["error"]
+            not_started["error"]
                 .as_str()
                 .is_some_and(|s| s.contains("Nobody")),
-            "failed entry should carry the dispatch error: {failed}"
+            "entry should carry the dispatch error: {not_started}"
         );
-        assert!(
-            failed["started_at"].as_i64().is_some(),
-            "failed entry must have started_at: {failed}"
-        );
-        assert!(
-            failed["completed_at"].as_i64().is_some(),
-            "failed entry must have completed_at: {failed}"
-        );
+        assert!(not_started["started_at"].is_null());
+        assert!(not_started["completed_at"].is_null());
     }
 }

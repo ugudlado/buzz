@@ -12,7 +12,7 @@ use std::str::FromStr;
 
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
-use sqlx::{PgPool, Row};
+use sqlx::{PgPool, Postgres, Row, Transaction};
 use uuid::Uuid;
 
 use buzz_core::CommunityId;
@@ -227,6 +227,12 @@ pub struct WorkflowRunRecord {
     pub error_code: Option<String>,
     /// When the run record was created.
     pub created_at: DateTime<Utc>,
+    /// Workflow author snapshotted when this run was created.
+    pub workflow_author_pubkey: Option<Vec<u8>>,
+    /// Fixed display-price currency snapshotted at run creation.
+    pub fixed_price_currency: Option<String>,
+    /// Fixed display-price micro-units snapshotted at run creation.
+    pub fixed_price_microunits: Option<i64>,
 }
 
 /// A winning scheduled workflow fire claim.
@@ -811,11 +817,17 @@ pub async fn create_workflow_run(
 ) -> Result<Uuid> {
     let id = Uuid::new_v4();
 
-    sqlx::query(
+    let inserted = sqlx::query(
         r#"
         INSERT INTO workflow_runs
-            (community_id, id, workflow_id, status, trigger_event_id, current_step, execution_trace, trigger_context)
-        VALUES ($1, $2, $3, 'pending', $4, 0, '[]', $5)
+            (community_id, id, workflow_id, status, trigger_event_id, current_step,
+             execution_trace, trigger_context, workflow_author_pubkey,
+             fixed_price_currency, fixed_price_microunits)
+        SELECT $1, $2, w.id, 'pending', $4, 0, '[]', $5, w.owner_pubkey,
+               w.definition #>> '{marketplace,fixed_price,currency}',
+               (w.definition #>> '{marketplace,fixed_price,microunits}')::BIGINT
+        FROM workflows w
+        WHERE w.community_id = $1 AND w.id = $3
         "#,
     )
     .bind(community_id.as_uuid())
@@ -824,7 +836,12 @@ pub async fn create_workflow_run(
     .bind(trigger_event_id)
     .bind(trigger_context)
     .execute(pool)
-    .await?;
+    .await?
+    .rows_affected();
+
+    if inserted == 0 {
+        return Err(DbError::NotFound(format!("workflow {workflow_id}")));
+    }
 
     Ok(id)
 }
@@ -838,7 +855,8 @@ pub async fn get_workflow_run(
     let row = sqlx::query(
         r#"
         SELECT community_id, id, workflow_id, status::text AS status, trigger_event_id, current_step,
-               execution_trace, trigger_context, started_at, completed_at, error_message, error_code, created_at
+               execution_trace, trigger_context, started_at, completed_at, error_message, error_code, created_at,
+               workflow_author_pubkey, fixed_price_currency, fixed_price_microunits
         FROM workflow_runs
         WHERE community_id = $1 AND id = $2
         "#,
@@ -870,7 +888,8 @@ pub async fn list_workflow_runs_page(
     let rows = sqlx::query(
         r#"
         SELECT community_id, id, workflow_id, status::text AS status, trigger_event_id, current_step,
-               execution_trace, trigger_context, started_at, completed_at, error_message, error_code, created_at
+               execution_trace, trigger_context, started_at, completed_at, error_message, error_code, created_at,
+               workflow_author_pubkey, fixed_price_currency, fixed_price_microunits
         FROM workflow_runs
         WHERE community_id = $1 AND workflow_id = $2
           AND (
@@ -965,28 +984,65 @@ pub async fn update_workflow_run(
     Ok(())
 }
 
-/// CAS a run's status `waiting_approval|waiting_agent -> running` before
-/// resuming it from a completed agent step or approval. Guards against two
+/// Mark a run failed only while it is still actively executing.
+///
+/// This is the arbitration point between a step timeout and an assignment
+/// transaction: an already-armed `waiting_agent` run must retain its receipt.
+pub async fn fail_workflow_run_if_running(
+    pool: &PgPool,
+    community_id: CommunityId,
+    id: Uuid,
+    current_step: i32,
+    trace: &serde_json::Value,
+    failure: Option<WorkflowRunFailure<'_>>,
+) -> Result<bool> {
+    let (error_code, error) = failure
+        .map(|failure| (Some(failure.code), Some(failure.message)))
+        .unwrap_or((None, None));
+    Ok(sqlx::query(
+        r#"
+        UPDATE workflow_runs
+        SET status = 'failed'::run_status, current_step = $1,
+            execution_trace = $2, error_code = $3, error_message = $4,
+            completed_at = NOW()
+        WHERE community_id = $5 AND id = $6 AND status = 'running'::run_status
+        "#,
+    )
+    .bind(current_step)
+    .bind(trace)
+    .bind(error_code)
+    .bind(error)
+    .bind(community_id.as_uuid())
+    .bind(id)
+    .execute(pool)
+    .await?
+    .rows_affected()
+        > 0)
+}
+
+/// CAS a run's status `waiting_agent -> running` at the expected step. Guards against two
 /// concurrent resume attempts for the same run (e.g. a crash-recovery sweep
 /// racing a still-in-flight live resume) both proceeding to execute subsequent
-/// steps — only the CAS winner should call `execute_from_step`. Returns
+/// steps or a stale recovery worker claiming a newer suspension. Returns
 /// `Ok(false)` if the run was not in a waiting status (already resumed or
 /// otherwise transitioned); callers should treat that as a no-op.
 pub async fn try_mark_run_resuming(
     pool: &PgPool,
     community_id: CommunityId,
     id: Uuid,
+    expected_step: i32,
 ) -> Result<bool> {
     let affected = sqlx::query(
         r#"
         UPDATE workflow_runs
         SET status = 'running'::run_status
         WHERE community_id = $1 AND id = $2
-          AND status IN ('waiting_approval'::run_status, 'waiting_agent'::run_status)
+          AND status = 'waiting_agent'::run_status AND current_step = $3
         "#,
     )
     .bind(community_id.as_uuid())
     .bind(id)
+    .bind(expected_step)
     .execute(pool)
     .await?
     .rows_affected();
@@ -1354,6 +1410,46 @@ pub struct AgentStepRecord {
     /// When the CAS to a terminal status (e.g. `done`) committed. `None`
     /// while still `pending`.
     pub resolved_at: Option<DateTime<Utc>>,
+    /// Verified agent owner at dispatch.
+    pub agent_owner_pubkey: Option<Vec<u8>>,
+    /// Snapshotted rate currency.
+    pub rate_currency: Option<String>,
+    /// Snapshotted integer micro-units per hour.
+    pub rate_microunits_per_hour: Option<i64>,
+    /// Relay-observed successful prompt publication time.
+    pub prompt_published_at: Option<DateTime<Utc>>,
+    /// Matching completion event id, when present.
+    pub completion_event_id: Option<String>,
+    /// Observed or capped terminal time.
+    pub terminal_at: Option<DateTime<Utc>>,
+    /// Clamped elapsed assignment duration in milliseconds.
+    pub duration_ms: Option<i64>,
+    /// Marketplace outcome independent of the operational step status.
+    pub outcome: Option<String>,
+    /// Random correlation id for a cross-community request.
+    pub request_id: Option<String>,
+    /// Caller relay identity for a cross-community request.
+    pub origin_relay_pubkey: Option<Vec<u8>>,
+    /// Agent home-relay identity for a cross-community request.
+    pub agent_relay_pubkey: Option<Vec<u8>>,
+    /// Agent home-relay URL for delivery and retry.
+    pub agent_relay_url: Option<String>,
+    /// Exact remote listing accepted at dispatch.
+    pub listing_event_id: Option<String>,
+    /// When the target relay first accepted the request.
+    pub delivered_at: Option<DateTime<Utc>>,
+    /// Self-reported harness that executed the terminal turn.
+    pub usage_harness: Option<String>,
+    /// Self-reported model for the terminal turn.
+    pub usage_model: Option<String>,
+    /// Self-reported turn-level input tokens.
+    pub usage_input_tokens: Option<i64>,
+    /// Self-reported turn-level output tokens.
+    pub usage_output_tokens: Option<i64>,
+    /// Self-reported turn-level cost in integer micro-units.
+    pub usage_cost_microunits: Option<i64>,
+    /// Currency of the self-reported cost.
+    pub usage_cost_currency: Option<String>,
 }
 
 /// Parameters for creating a new agent-assignment step.
@@ -1373,12 +1469,43 @@ pub struct CreateAgentStepParams<'a> {
     pub step_index: i32,
     /// Compressed public key bytes of the mentioned agent.
     pub agent_pubkey: &'a [u8],
+    /// Verified owner at dispatch.
+    pub agent_owner_pubkey: &'a [u8],
+    /// Snapshotted rate currency.
+    pub rate_currency: Option<&'a str>,
+    /// Snapshotted integer micro-units per hour.
+    pub rate_microunits_per_hour: Option<u64>,
+    /// Relay-observed prompt publication time.
+    pub prompt_published_at: DateTime<Utc>,
     /// When this assignment expires if the agent has not replied.
     pub expires_at: DateTime<Utc>,
+    /// Complete executor checkpoint through the waiting assignment.
+    pub execution_trace: Option<&'a serde_json::Value>,
+    /// Remote request correlation id, absent for local assignments.
+    pub request_id: Option<&'a str>,
+    /// Caller relay identity, absent for local assignments.
+    pub origin_relay_pubkey: Option<&'a [u8]>,
+    /// Agent home-relay identity, absent for local assignments.
+    pub agent_relay_pubkey: Option<&'a [u8]>,
+    /// Agent home-relay URL, absent for local assignments.
+    pub agent_relay_url: Option<&'a str>,
+    /// Exact remote listing event, absent for local assignments.
+    pub listing_event_id: Option<&'a str>,
 }
 
-/// Insert a new agent-assignment step with `status = 'pending'`.
-pub async fn create_agent_step(pool: &PgPool, params: CreateAgentStepParams<'_>) -> Result<()> {
+/// Atomically insert a pending assignment and arm its run as `waiting_agent`.
+/// Returns `false` when the prompt was already armed.
+pub async fn create_agent_step(pool: &PgPool, params: CreateAgentStepParams<'_>) -> Result<bool> {
+    let mut tx = pool.begin().await?;
+    let inserted = create_agent_step_tx(&mut tx, params).await?;
+    tx.commit().await?;
+    Ok(inserted)
+}
+
+pub(crate) async fn create_agent_step_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    params: CreateAgentStepParams<'_>,
+) -> Result<bool> {
     let CreateAgentStepParams {
         community_id,
         prompt_event_id,
@@ -1387,14 +1514,29 @@ pub async fn create_agent_step(pool: &PgPool, params: CreateAgentStepParams<'_>)
         step_id,
         step_index,
         agent_pubkey,
+        agent_owner_pubkey,
+        rate_currency,
+        rate_microunits_per_hour,
+        prompt_published_at,
         expires_at,
+        execution_trace,
+        request_id,
+        origin_relay_pubkey,
+        agent_relay_pubkey,
+        agent_relay_url,
+        listing_event_id,
     } = params;
 
-    sqlx::query(
+    let inserted = sqlx::query(
         r#"
         INSERT INTO workflow_agent_steps
-            (community_id, prompt_event_id, workflow_id, run_id, step_id, step_index, agent_pubkey, status, expires_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8)
+            (community_id, prompt_event_id, workflow_id, run_id, step_id, step_index,
+             agent_pubkey, agent_owner_pubkey, rate_currency, rate_microunits_per_hour,
+             prompt_published_at, status, expires_at, request_id, origin_relay_pubkey,
+             agent_relay_pubkey, agent_relay_url, listing_event_id, next_delivery_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'pending', $12,
+                $13, $14, $15, $16, $17, CASE WHEN $13 IS NULL THEN NULL ELSE NOW() END)
+        ON CONFLICT (community_id, prompt_event_id) DO NOTHING
         "#,
     )
     .bind(community_id.as_uuid())
@@ -1404,11 +1546,143 @@ pub async fn create_agent_step(pool: &PgPool, params: CreateAgentStepParams<'_>)
     .bind(step_id)
     .bind(step_index)
     .bind(agent_pubkey)
+    .bind(agent_owner_pubkey)
+    .bind(rate_currency)
+    .bind(rate_microunits_per_hour.map(|value| value as i64))
+    .bind(prompt_published_at)
     .bind(expires_at)
-    .execute(pool)
-    .await?;
+    .bind(request_id)
+    .bind(origin_relay_pubkey)
+    .bind(agent_relay_pubkey)
+    .bind(agent_relay_url)
+    .bind(listing_event_id)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected()
+        > 0;
 
-    Ok(())
+    if inserted {
+        let armed = sqlx::query(
+            "UPDATE workflow_runs SET status = 'waiting_agent'::run_status, current_step = $1, \
+             execution_trace = COALESCE($2, execution_trace) \
+             WHERE community_id = $3 AND id = $4
+               AND status IN ('pending'::run_status, 'running'::run_status)",
+        )
+        .bind(step_index)
+        .bind(execution_trace)
+        .bind(community_id.as_uuid())
+        .bind(run_id)
+        .execute(&mut **tx)
+        .await?
+        .rows_affected();
+        if armed != 1 {
+            return Err(DbError::NotFound(format!(
+                "pending or running workflow_run {run_id} for agent assignment"
+            )));
+        }
+    }
+
+    Ok(inserted)
+}
+
+/// Attach the executor's waiting trace without overwriting a run that a fast
+/// completion has already resumed.
+pub async fn update_waiting_agent_trace(
+    pool: &PgPool,
+    community_id: CommunityId,
+    run_id: Uuid,
+    step_index: i32,
+    trace: &serde_json::Value,
+) -> Result<bool> {
+    Ok(sqlx::query(
+        "UPDATE workflow_runs SET execution_trace = $1 \
+         WHERE community_id = $2 AND id = $3 AND status = 'waiting_agent'::run_status \
+           AND current_step = $4",
+    )
+    .bind(trace)
+    .bind(community_id.as_uuid())
+    .bind(run_id)
+    .bind(step_index)
+    .execute(pool)
+    .await?
+    .rows_affected()
+        > 0)
+}
+
+/// A pending cross-community request that is due for relay-to-relay delivery.
+#[derive(Debug, Clone)]
+pub struct RemoteAgentDelivery {
+    /// Community that owns the request event.
+    pub community_id: CommunityId,
+    /// Request event id, also the durable assignment key.
+    pub prompt_event_id: String,
+    /// Expected NIP-11 identity of the target relay.
+    pub agent_relay_pubkey: Vec<u8>,
+    /// Target relay URL.
+    pub agent_relay_url: String,
+}
+
+/// List undelivered remote requests whose bounded backoff has elapsed.
+pub async fn list_due_remote_agent_deliveries(
+    pool: &PgPool,
+    limit: i64,
+) -> Result<Vec<RemoteAgentDelivery>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT community_id, prompt_event_id, agent_relay_pubkey, agent_relay_url
+        FROM workflow_agent_steps
+        WHERE status = 'pending'
+          AND request_id IS NOT NULL
+          AND delivered_at IS NULL
+          AND expires_at > NOW()
+          AND next_delivery_at <= NOW()
+        ORDER BY next_delivery_at
+        LIMIT $1
+        "#,
+    )
+    .bind(limit.clamp(1, LIST_MAX_LIMIT))
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            let community_id: Uuid = row.try_get("community_id")?;
+            Ok(RemoteAgentDelivery {
+                community_id: CommunityId::from_uuid(community_id),
+                prompt_event_id: row.try_get("prompt_event_id")?,
+                agent_relay_pubkey: row.try_get("agent_relay_pubkey")?,
+                agent_relay_url: row.try_get("agent_relay_url")?,
+            })
+        })
+        .collect()
+}
+
+/// Record one delivery attempt; failures use capped exponential backoff.
+pub async fn record_remote_agent_delivery(
+    pool: &PgPool,
+    community_id: CommunityId,
+    prompt_event_id: &str,
+    error: Option<&str>,
+) -> Result<bool> {
+    let error = error.map(|value| value.chars().take(1_024).collect::<String>());
+    Ok(sqlx::query(
+        r#"
+        UPDATE workflow_agent_steps
+        SET delivery_attempts = delivery_attempts + 1,
+            delivered_at = CASE WHEN $3::TEXT IS NULL THEN NOW() ELSE delivered_at END,
+            last_delivery_error = $3,
+            next_delivery_at = CASE WHEN $3::TEXT IS NULL THEN NULL
+                ELSE NOW() + POWER(2, LEAST(delivery_attempts, 8)) * INTERVAL '1 second' END
+        WHERE community_id = $1 AND prompt_event_id = $2
+          AND status = 'pending' AND request_id IS NOT NULL AND delivered_at IS NULL
+        "#,
+    )
+    .bind(community_id.as_uuid())
+    .bind(prompt_event_id)
+    .bind(error)
+    .execute(pool)
+    .await?
+    .rows_affected()
+        > 0)
 }
 
 /// Fetch an agent-assignment step by its prompt event id.
@@ -1420,7 +1694,13 @@ pub async fn get_agent_step(
     let row = sqlx::query(
         r#"
         SELECT prompt_event_id, workflow_id, run_id, step_id, step_index, agent_pubkey,
-               status::text AS status, output, expires_at, created_at, resolved_at
+               status::text AS status, output, expires_at, created_at, resolved_at,
+               agent_owner_pubkey, rate_currency, rate_microunits_per_hour,
+               prompt_published_at, completion_event_id, terminal_at, duration_ms, outcome,
+               request_id, origin_relay_pubkey, agent_relay_pubkey, agent_relay_url,
+               listing_event_id, delivered_at,
+               usage_harness, usage_model, usage_input_tokens, usage_output_tokens,
+               usage_cost_microunits, usage_cost_currency
         FROM workflow_agent_steps
         WHERE community_id = $1 AND prompt_event_id = $2
         "#,
@@ -1434,14 +1714,122 @@ pub async fn get_agent_step(
     row_to_agent_step_record(row)
 }
 
-/// Update an agent step's status and optional output.
+/// List durable assignment receipts for a workflow run in step order.
+pub async fn list_agent_steps_for_run(
+    pool: &PgPool,
+    community_id: CommunityId,
+    run_id: Uuid,
+) -> Result<Vec<AgentStepRecord>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT prompt_event_id, workflow_id, run_id, step_id, step_index, agent_pubkey,
+               status::text AS status, output, expires_at, created_at, resolved_at,
+               agent_owner_pubkey, rate_currency, rate_microunits_per_hour,
+               prompt_published_at, completion_event_id, terminal_at, duration_ms, outcome,
+               request_id, origin_relay_pubkey, agent_relay_pubkey, agent_relay_url,
+               listing_event_id, delivered_at,
+               usage_harness, usage_model, usage_input_tokens, usage_output_tokens,
+               usage_cost_microunits, usage_cost_currency
+        FROM workflow_agent_steps
+        WHERE community_id = $1 AND run_id = $2
+        ORDER BY step_index ASC
+        "#,
+    )
+    .bind(community_id.as_uuid())
+    .bind(run_id)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter().map(row_to_agent_step_record).collect()
+}
+
+/// Facts observed when an assignment reaches a terminal state.
+pub struct CompleteAgentStepParams<'a> {
+    /// Community containing the assignment.
+    pub community_id: CommunityId,
+    /// Prompt event used to correlate the assignment.
+    pub prompt_event_id: &'a str,
+    /// Operational step status.
+    pub status: AgentStepStatus,
+    /// Parsed completion output, if one exists.
+    pub output: Option<&'a serde_json::Value>,
+    /// Matching completion event, if the assignment replied.
+    pub completion_event_id: Option<&'a str>,
+    /// Observed terminal instant before timeout clamping.
+    pub terminal_at: DateTime<Utc>,
+    /// Marketplace receipt outcome.
+    pub outcome: &'a str,
+    /// Validated agent self-report, when the completion carried one.
+    pub usage: Option<&'a buzz_core::marketplace::ReportedUsage>,
+}
+
+/// Atomically complete an agent step and persist its receipt.
 ///
-/// # TOCTOU safety
-/// The WHERE clause includes `AND status = 'pending'` so that two concurrent
-/// resume attempts (e.g. a duplicate reply and the expiry sweeper) cannot both
-/// succeed. If the step was already resolved (status != 'pending'), the
-/// UPDATE touches 0 rows and this function returns `Ok(false)`. Callers should
-/// treat `false` as a conflict/no-op — this is the double-resume guard.
+/// The pending-status predicate is the double-resume guard shared by replies
+/// and the expiry sweeper.
+pub async fn complete_agent_step_by_prompt_event_id(
+    pool: &PgPool,
+    params: CompleteAgentStepParams<'_>,
+) -> Result<bool> {
+    let status_str = params.status.to_string();
+    // Bounds are enforced by the column CHECKs; a self-report that cannot fit
+    // an i64 is dropped rather than allowed to abort the terminal transition.
+    let usage_tokens = |value: Option<u64>| value.and_then(|value| i64::try_from(value).ok());
+    let usage_cost: Option<(i64, &str)> = params.usage.and_then(|usage| {
+        let cost = usage_tokens(usage.cost_microunits)?;
+        Some((cost, usage.currency.as_deref()?))
+    });
+    let affected = sqlx::query(
+        r#"
+        UPDATE workflow_agent_steps
+        SET status = $1::agent_step_status,
+            output = COALESCE($2, output),
+            resolved_at = NOW(),
+            completion_event_id = $3,
+            terminal_at = GREATEST(prompt_published_at, LEAST($4, expires_at)),
+            duration_ms = GREATEST(0, FLOOR(EXTRACT(EPOCH FROM
+                (GREATEST(prompt_published_at, LEAST($4, expires_at)) - prompt_published_at)
+            ) * 1000)::BIGINT),
+            outcome = $5,
+            usage_harness = $8,
+            usage_model = $9,
+            usage_input_tokens = $10,
+            usage_output_tokens = $11,
+            usage_cost_microunits = $12,
+            usage_cost_currency = $13
+        WHERE community_id = $6 AND prompt_event_id = $7 AND status = 'pending'
+        "#,
+    )
+    .bind(&status_str)
+    .bind(params.output)
+    .bind(params.completion_event_id)
+    .bind(params.terminal_at)
+    .bind(params.outcome)
+    .bind(params.community_id.as_uuid())
+    .bind(params.prompt_event_id)
+    .bind(params.usage.map(|usage| usage.harness.as_str()))
+    .bind(params.usage.and_then(|usage| usage.model.as_deref()))
+    .bind(
+        params
+            .usage
+            .and_then(|usage| usage_tokens(usage.input_tokens)),
+    )
+    .bind(
+        params
+            .usage
+            .and_then(|usage| usage_tokens(usage.output_tokens)),
+    )
+    // Cost and currency move together so the column pair CHECK always holds.
+    .bind(usage_cost.map(|(cost, _)| cost))
+    .bind(usage_cost.map(|(_, currency)| currency))
+    .execute(pool)
+    .await?
+    .rows_affected();
+
+    Ok(affected > 0)
+}
+
+/// Backwards-compatible operational CAS used by existing callers/tests that
+/// do not carry marketplace receipt metadata.
 pub async fn update_agent_step_by_prompt_event_id(
     pool: &PgPool,
     community_id: CommunityId,
@@ -1449,25 +1837,20 @@ pub async fn update_agent_step_by_prompt_event_id(
     status: AgentStepStatus,
     output: Option<&serde_json::Value>,
 ) -> Result<bool> {
-    let status_str = status.to_string();
-    let affected = sqlx::query(
-        r#"
-        UPDATE workflow_agent_steps
-        SET status = $1::agent_step_status,
-            output = COALESCE($2, output),
-            resolved_at = NOW()
-        WHERE community_id = $3 AND prompt_event_id = $4 AND status = 'pending'
-        "#,
+    complete_agent_step_by_prompt_event_id(
+        pool,
+        CompleteAgentStepParams {
+            community_id,
+            prompt_event_id,
+            status,
+            output,
+            completion_event_id: None,
+            terminal_at: Utc::now(),
+            outcome: "completed",
+            usage: None,
+        },
     )
-    .bind(&status_str)
-    .bind(output)
-    .bind(community_id.as_uuid())
-    .bind(prompt_event_id)
-    .execute(pool)
-    .await?
-    .rows_affected();
-
-    Ok(affected > 0)
+    .await
 }
 
 /// A `workflow_agent_steps` row that was swept from `pending` to `expired`
@@ -1481,6 +1864,8 @@ pub struct ExpiredAgentStep {
     pub run_id: Uuid,
     /// Zero-based index of the step that requested the assignment.
     pub step_index: i32,
+    /// Request event id, used to publish remote cancellation.
+    pub prompt_event_id: String,
 }
 
 /// Sweep overdue `workflow_agent_steps` rows (`status = 'pending' AND
@@ -1488,9 +1873,9 @@ pub struct ExpiredAgentStep {
 ///
 /// Mirrors [`sweep_expired_approvals`] exactly so the relay-side periodic
 /// sweeper task can extend to call both. Returns one [`ExpiredAgentStep`] per
-/// swept row so the caller can finalize each associated `workflow_runs` row
-/// as `Failed` — this function only touches `workflow_agent_steps`, never
-/// `workflow_runs`.
+/// swept row. The step and its still-waiting run are finalized by one SQL
+/// statement, so a relay crash cannot leave an expired step attached to a
+/// `waiting_agent` run.
 ///
 /// `LIMIT` bounds a single sweep tick so a large backlog is drained
 /// incrementally across ticks rather than in one unbounded UPDATE.
@@ -1498,15 +1883,40 @@ pub async fn sweep_expired_agent_steps(pool: &PgPool, limit: i64) -> Result<Vec<
     let limit = limit.clamp(1, LIST_MAX_LIMIT);
     let rows = sqlx::query(
         r#"
-        UPDATE workflow_agent_steps
-        SET status = 'expired'
-        WHERE (community_id, prompt_event_id) IN (
+        WITH candidates AS (
             SELECT community_id, prompt_event_id
             FROM workflow_agent_steps
             WHERE status = 'pending' AND expires_at < NOW()
+            FOR UPDATE SKIP LOCKED
             LIMIT $1
+        ), expired AS (
+            UPDATE workflow_agent_steps AS step
+            SET status = 'expired',
+                resolved_at = NOW(),
+                terminal_at = GREATEST(step.prompt_published_at, step.expires_at),
+                duration_ms = GREATEST(0, FLOOR(EXTRACT(EPOCH FROM
+                    (step.expires_at - step.prompt_published_at)
+                ) * 1000)::BIGINT),
+                outcome = 'timed_out'
+            FROM candidates
+            WHERE step.community_id = candidates.community_id
+              AND step.prompt_event_id = candidates.prompt_event_id
+              AND step.status = 'pending'
+            RETURNING step.community_id, step.run_id, step.step_index,
+                      step.prompt_event_id
         )
-        RETURNING community_id, run_id, step_index
+        UPDATE workflow_runs AS run
+        SET status = 'failed'::run_status,
+            current_step = expired.step_index,
+            error_message = 'agent assignment expired',
+            completed_at = NOW()
+        FROM expired
+        WHERE run.community_id = expired.community_id
+          AND run.id = expired.run_id
+          AND run.status = 'waiting_agent'
+          AND run.current_step = expired.step_index
+        RETURNING expired.community_id, expired.run_id, expired.step_index,
+                  expired.prompt_event_id
         "#,
     )
     .bind(limit)
@@ -1520,6 +1930,7 @@ pub async fn sweep_expired_agent_steps(pool: &PgPool, limit: i64) -> Result<Vec<
                 community_id: CommunityId::from_uuid(community_id),
                 run_id: row.try_get("run_id")?,
                 step_index: row.try_get("step_index")?,
+                prompt_event_id: row.try_get("prompt_event_id")?,
             })
         })
         .collect()
@@ -1643,6 +2054,9 @@ fn row_to_run_record(row: sqlx::postgres::PgRow) -> Result<WorkflowRunRecord> {
         error_message: row.try_get("error_message")?,
         error_code: row.try_get("error_code")?,
         created_at: row.try_get("created_at")?,
+        workflow_author_pubkey: row.try_get("workflow_author_pubkey")?,
+        fixed_price_currency: row.try_get("fixed_price_currency")?,
+        fixed_price_microunits: row.try_get("fixed_price_microunits")?,
     })
 }
 
@@ -1687,6 +2101,26 @@ fn row_to_agent_step_record(row: sqlx::postgres::PgRow) -> Result<AgentStepRecor
         expires_at: row.try_get("expires_at")?,
         created_at: row.try_get("created_at")?,
         resolved_at: row.try_get("resolved_at")?,
+        agent_owner_pubkey: row.try_get("agent_owner_pubkey")?,
+        rate_currency: row.try_get("rate_currency")?,
+        rate_microunits_per_hour: row.try_get("rate_microunits_per_hour")?,
+        prompt_published_at: row.try_get("prompt_published_at")?,
+        completion_event_id: row.try_get("completion_event_id")?,
+        terminal_at: row.try_get("terminal_at")?,
+        duration_ms: row.try_get("duration_ms")?,
+        outcome: row.try_get("outcome")?,
+        request_id: row.try_get("request_id")?,
+        origin_relay_pubkey: row.try_get("origin_relay_pubkey")?,
+        agent_relay_pubkey: row.try_get("agent_relay_pubkey")?,
+        agent_relay_url: row.try_get("agent_relay_url")?,
+        listing_event_id: row.try_get("listing_event_id")?,
+        delivered_at: row.try_get("delivered_at")?,
+        usage_harness: row.try_get("usage_harness")?,
+        usage_model: row.try_get("usage_model")?,
+        usage_input_tokens: row.try_get("usage_input_tokens")?,
+        usage_output_tokens: row.try_get("usage_output_tokens")?,
+        usage_cost_microunits: row.try_get("usage_cost_microunits")?,
+        usage_cost_currency: row.try_get("usage_cost_currency")?,
     })
 }
 
@@ -1972,6 +2406,9 @@ mod tests {
             error_message: None,
             error_code: None,
             created_at: now,
+            workflow_author_pubkey: None,
+            fixed_price_currency: None,
+            fixed_price_microunits: None,
         };
 
         assert_eq!(record.id, id);
@@ -2001,6 +2438,9 @@ mod tests {
             error_message: None,
             error_code: None,
             created_at: now,
+            workflow_author_pubkey: None,
+            fixed_price_currency: None,
+            fixed_price_microunits: None,
         };
 
         assert!(record.trigger_event_id.is_none());
@@ -2025,6 +2465,9 @@ mod tests {
             error_message: Some("step timeout exceeded".to_owned()),
             error_code: Some("step_timeout".to_owned()),
             created_at: now,
+            workflow_author_pubkey: None,
+            fixed_price_currency: None,
+            fixed_price_microunits: None,
         };
 
         assert_eq!(record.status, RunStatus::Failed);
@@ -2057,6 +2500,9 @@ mod tests {
             error_message: None,
             error_code: None,
             created_at: now,
+            workflow_author_pubkey: None,
+            fixed_price_currency: None,
+            fixed_price_microunits: None,
         };
 
         assert!(record.execution_trace.is_array());
@@ -2080,6 +2526,9 @@ mod tests {
             error_message: None,
             error_code: None,
             created_at: now,
+            workflow_author_pubkey: None,
+            fixed_price_currency: None,
+            fixed_price_microunits: None,
         };
 
         let mut cloned = record.clone();
@@ -2928,7 +3377,17 @@ mod tests {
                 step_id: "assign-1",
                 step_index: 0,
                 agent_pubkey,
+                agent_owner_pubkey: agent_pubkey,
+                rate_currency: Some("USD"),
+                rate_microunits_per_hour: Some(12_000_000),
+                prompt_published_at: Utc::now(),
                 expires_at,
+                execution_trace: None,
+                request_id: None,
+                origin_relay_pubkey: None,
+                agent_relay_pubkey: None,
+                agent_relay_url: None,
+                listing_event_id: None,
             },
         )
         .await
@@ -2969,8 +3428,107 @@ mod tests {
         assert_eq!(record.step_id, "assign-1");
         assert_eq!(record.step_index, 0);
         assert_eq!(record.agent_pubkey, agent_pubkey);
+        assert_eq!(record.agent_owner_pubkey, Some(agent_pubkey.clone()));
+        assert_eq!(record.rate_currency.as_deref(), Some("USD"));
+        assert_eq!(record.rate_microunits_per_hour, Some(12_000_000));
+        assert!(record.prompt_published_at.is_some());
         assert_eq!(record.status, AgentStepStatus::Pending);
         assert!(record.output.is_none());
+    }
+
+    /// The terminal transition persists the agent's self-reported usage
+    /// alongside the relay-observed elapsed-time receipt, and a completion
+    /// with no self-report leaves every usage column null.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn agent_step_completion_persists_reported_usage() {
+        let pool = setup_pool().await;
+        let community = make_community(&pool).await;
+        let (workflow_id, _) = make_workflow_in(&pool, community).await;
+        let expires_at = Utc::now() + chrono::Duration::minutes(30);
+
+        let reported = buzz_core::marketplace::ReportedUsage {
+            harness: "goose".into(),
+            model: Some("claude-fable-5".into()),
+            input_tokens: Some(1_200),
+            output_tokens: Some(340),
+            cost_microunits: Some(15_000),
+            currency: Some("USD".into()),
+        };
+        let with_usage = format!("evt-{}", Uuid::new_v4().simple());
+        make_pending_agent_step(
+            &pool,
+            community,
+            workflow_id,
+            &with_usage,
+            &[0x51; 32],
+            expires_at,
+        )
+        .await;
+        assert!(complete_agent_step_by_prompt_event_id(
+            &pool,
+            CompleteAgentStepParams {
+                community_id: community,
+                prompt_event_id: &with_usage,
+                status: AgentStepStatus::Done,
+                output: None,
+                completion_event_id: Some("completion-id"),
+                terminal_at: Utc::now(),
+                outcome: "completed",
+                usage: Some(&reported),
+            },
+        )
+        .await
+        .expect("complete with usage"));
+
+        let record = get_agent_step(&pool, community, &with_usage)
+            .await
+            .expect("get step with usage");
+        assert_eq!(record.usage_harness.as_deref(), Some("goose"));
+        assert_eq!(record.usage_model.as_deref(), Some("claude-fable-5"));
+        assert_eq!(record.usage_input_tokens, Some(1_200));
+        assert_eq!(record.usage_output_tokens, Some(340));
+        assert_eq!(record.usage_cost_microunits, Some(15_000));
+        assert_eq!(record.usage_cost_currency.as_deref(), Some("USD"));
+        // The elapsed-time receipt is unaffected by the self-report.
+        assert_eq!(record.rate_microunits_per_hour, Some(12_000_000));
+        assert_eq!(record.outcome.as_deref(), Some("completed"));
+
+        let without_usage = format!("evt-{}", Uuid::new_v4().simple());
+        make_pending_agent_step(
+            &pool,
+            community,
+            workflow_id,
+            &without_usage,
+            &[0x52; 32],
+            expires_at,
+        )
+        .await;
+        assert!(complete_agent_step_by_prompt_event_id(
+            &pool,
+            CompleteAgentStepParams {
+                community_id: community,
+                prompt_event_id: &without_usage,
+                status: AgentStepStatus::Done,
+                output: None,
+                completion_event_id: Some("completion-id"),
+                terminal_at: Utc::now(),
+                outcome: "completed",
+                usage: None,
+            },
+        )
+        .await
+        .expect("complete without usage"));
+
+        let record = get_agent_step(&pool, community, &without_usage)
+            .await
+            .expect("get step without usage");
+        assert_eq!(record.usage_harness, None);
+        assert_eq!(record.usage_model, None);
+        assert_eq!(record.usage_input_tokens, None);
+        assert_eq!(record.usage_output_tokens, None);
+        assert_eq!(record.usage_cost_microunits, None);
+        assert_eq!(record.usage_cost_currency, None);
     }
 
     /// A single successful CAS transition writes both the new status and the
@@ -3014,6 +3572,8 @@ mod tests {
             .expect("get after update");
         assert_eq!(record.status, AgentStepStatus::Done);
         assert_eq!(record.output.as_ref(), Some(&output));
+        assert_eq!(record.outcome.as_deref(), Some("completed"));
+        assert!(record.duration_ms.is_some());
 
         // Second attempt: row is no longer `pending`, so the CAS predicate
         // matches zero rows. Must report `false`, not error, and must not
@@ -3195,6 +3755,12 @@ mod tests {
             .await
             .expect("get overdue after sweep");
         assert_eq!(overdue_after.status, AgentStepStatus::Expired);
+        assert_eq!(overdue_after.outcome.as_deref(), Some("timed_out"));
+        assert_eq!(overdue_after.duration_ms, Some(0));
+        assert_eq!(
+            overdue_after.terminal_at, overdue_after.prompt_published_at,
+            "a timeout predating the recorded prompt clamps to zero elapsed time"
+        );
 
         let fresh_after = get_agent_step(&pool, community, &fresh_id)
             .await

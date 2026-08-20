@@ -47,6 +47,7 @@ fn bare_agent_record(
         last_error_code: None,
         respond_to: RespondTo::OwnerOnly,
         respond_to_allowlist: vec![],
+        marketplace: None,
         display_name: None,
         slug: None,
         runtime: None,

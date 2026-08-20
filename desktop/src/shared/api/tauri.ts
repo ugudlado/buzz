@@ -152,11 +152,10 @@ export type RawManagedAgent = {
   auto_restart_on_config_change?: boolean;
   backend: ManagedAgentBackend;
   backend_agent_id: string | null;
-  // Pre-feature fixtures may omit these; mapped to "owner-only"/[] in fromRawManagedAgent.
   respond_to?: ManagedAgent["respondTo"];
   respond_to_allowlist?: string[];
+  marketplace?: ManagedAgent["marketplace"];
 };
-
 type RawCreateManagedAgentResponse = {
   agent: RawManagedAgent;
   private_key_nsec: string;
@@ -339,9 +338,13 @@ function fromRawSearchHit(hit: RawSearchHit) {
   };
 }
 
-export async function getPresence(pubkeys: string[]): Promise<PresenceLookup> {
+export async function getPresence(
+  pubkeys: string[],
+  relayUrl?: string,
+): Promise<PresenceLookup> {
   const response = await invokeTauri<RawPresenceLookup>("get_presence", {
     pubkeys,
+    relayUrl,
   });
 
   return Object.fromEntries(
@@ -710,6 +713,7 @@ export function fromRawManagedAgent(agent: RawManagedAgent): ManagedAgent {
     backendAgentId: agent.backend_agent_id,
     respondTo: agent.respond_to ?? "owner-only",
     respondToAllowlist: agent.respond_to_allowlist ?? [],
+    marketplace: agent.marketplace ?? null,
   };
 }
 

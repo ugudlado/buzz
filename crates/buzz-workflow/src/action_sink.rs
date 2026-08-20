@@ -41,6 +41,70 @@ impl From<ActionSinkError> for crate::WorkflowError {
 type ResolveAgentFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, ActionSinkError>> + Send + 'a>>;
 
+/// Marketplace attribution snapshotted when an assignment is dispatched.
+#[derive(Debug, Clone)]
+pub struct AgentMarketplaceSnapshot {
+    /// Verified owner of the managed-agent identity.
+    pub owner_pubkey: Vec<u8>,
+    /// Whether the current owner has an active marketplace listing.
+    pub listed: bool,
+    /// Three-letter currency code, absent for an unpriced listing.
+    pub rate_currency: Option<String>,
+    /// Integer micro-units per hour, absent for an unpriced listing.
+    pub rate_microunits_per_hour: Option<u64>,
+    /// Exact managed-agent listing used for a remote dispatch.
+    pub listing_event_id: Option<String>,
+}
+
+/// Immutable home-relay coordinate for a remote managed agent.
+#[derive(Debug, Clone)]
+pub struct AgentRelayCoordinate {
+    /// NIP-11 `self` pubkey of the agent's home relay.
+    pub relay_pubkey: Vec<u8>,
+    /// Verified absolute `wss://` URL of the agent's home relay.
+    pub relay_url: String,
+}
+
+/// Extra wire data needed when an assignment leaves this community.
+#[derive(Debug, Clone)]
+pub struct RemoteAgentAssignment {
+    /// Agent home-relay coordinate.
+    pub coordinate: AgentRelayCoordinate,
+    /// Exact listing accepted at dispatch.
+    pub listing_event_id: String,
+    /// Plaintext instruction that will be encrypted for the target agent.
+    pub instruction: String,
+}
+
+/// Durable assignment data armed immediately before its prompt is published.
+#[derive(Debug, Clone)]
+pub struct AgentAssignmentArm {
+    /// Workflow containing the assignment.
+    pub workflow_id: uuid::Uuid,
+    /// Run waiting on the assignment.
+    pub run_id: uuid::Uuid,
+    /// Stable step identifier.
+    pub step_id: String,
+    /// Zero-based step index.
+    pub step_index: i32,
+    /// Assigned managed-agent identity.
+    pub agent_pubkey: Vec<u8>,
+    /// Verified owner at dispatch.
+    pub agent_owner_pubkey: Vec<u8>,
+    /// Snapshotted rate currency.
+    pub rate_currency: Option<String>,
+    /// Snapshotted integer micro-units per hour.
+    pub rate_microunits_per_hour: Option<u64>,
+    /// Assignment timeout in seconds.
+    pub timeout_secs: u64,
+    /// Trace entries completed before this assignment began.
+    pub trace_prefix: Vec<serde_json::Value>,
+    /// Unix-second timestamp captured when this step began.
+    pub step_started_at: i64,
+    /// Present only for a cross-community job request.
+    pub remote: Option<RemoteAgentAssignment>,
+}
+
 /// The NIP-10 thread root a new `assign_to_agent` prompt should reply to, so
 /// a multi-step run reads as one flat conversation (every prompt/announce
 /// replies directly to the root, depth 1) instead of independent top-level
@@ -91,6 +155,7 @@ pub trait ActionSink: Send + Sync {
         text: &str,
         author_pubkey: &str,
         reply_to: Option<&ThreadAnchor>,
+        assignment: Option<AgentAssignmentArm>,
     ) -> Pin<Box<dyn Future<Output = Result<String, ActionSinkError>> + Send + '_>>;
 
     /// Resolve a display name to the hex pubkey of exactly one active member
@@ -128,4 +193,21 @@ pub trait ActionSink: Send + Sync {
         channel_id: &'a str,
         pubkey_hex: &'a str,
     ) -> ResolveAgentFuture<'a>;
+
+    /// Load the current listed marketplace projection for an agent.
+    ///
+    /// Returns `Ok(None)` when the identity is missing or unlisted. The
+    /// executor refuses new marketplace workflow dispatches in that case.
+    fn agent_marketplace_snapshot<'a>(
+        &'a self,
+        community_id: CommunityId,
+        agent_pubkey: &'a [u8],
+        coordinate: Option<&'a AgentRelayCoordinate>,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<AgentMarketplaceSnapshot>, ActionSinkError>>
+                + Send
+                + 'a,
+        >,
+    >;
 }

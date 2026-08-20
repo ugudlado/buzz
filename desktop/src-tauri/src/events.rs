@@ -780,10 +780,14 @@ pub fn build_workflow_delete(
     Ok(EventBuilder::new(Kind::Custom(5), "").tags(tags))
 }
 
-/// Kind 46020 — trigger a workflow run by id.
-pub fn build_workflow_trigger(workflow_id: &str) -> Result<EventBuilder, String> {
+/// Kind 46020 — trigger a workflow run by id. Optional `content` is a JSON
+/// object whose fields the relay exposes as `{{trigger.<field>}}`.
+pub fn build_workflow_trigger(
+    workflow_id: &str,
+    content: Option<&str>,
+) -> Result<EventBuilder, String> {
     let tags = vec![tag(vec!["d", workflow_id])?];
-    Ok(EventBuilder::new(Kind::Custom(46020), "").tags(tags))
+    Ok(EventBuilder::new(Kind::Custom(46020), content.unwrap_or("")).tags(tags))
 }
 
 /// Kind 46030 — grant an approval token (with optional note).

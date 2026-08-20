@@ -35,6 +35,7 @@ use crate::connection::{ConnectionSubscriptions, RestartClose};
 use crate::subscription::SubscriptionRegistry;
 
 pub(crate) type ScopedPubkeyKey = (CommunityId, [u8; 32]);
+pub(crate) type RemoteJobRateLimitKey = (CommunityId, [u8; 32], [u8; 32]);
 
 /// Why a community-bound socket is being asked to stop.
 ///
@@ -724,6 +725,9 @@ pub struct AppState {
     pub nip98_replay: Arc<dyn Nip98ReplayGuard>,
     /// Shared Redis-backed admission limits for ordinary HTTP and WebSocket work.
     pub admission_rate_limiter: Arc<RedisRateLimiter>,
+    /// Fixed-window limit for remote requests by (community, caller relay, agent).
+    pub remote_job_rate_limiter:
+        Arc<moka::sync::Cache<RemoteJobRateLimitKey, Arc<std::sync::atomic::AtomicU32>>>,
 
     /// Per-agent sliding-window rate limiter for observer frames (kind 24200).
     /// Key: (community_id, agent pubkey bytes). Value: (count, window_start).
@@ -913,6 +917,12 @@ impl AppState {
             started_at: Instant::now(),
             nip98_replay,
             admission_rate_limiter,
+            remote_job_rate_limiter: Arc::new(
+                moka::sync::Cache::builder()
+                    .max_capacity(crate::remote_jobs::RATE_CACHE_CAPACITY)
+                    .time_to_live(crate::remote_jobs::RATE_WINDOW)
+                    .build(),
+            ),
             observer_rate_limiter: Arc::new(DashMap::new()),
             media_upload_rate_limiter: Arc::new(DashMap::new()),
             invite_claim_rate_limiter: Arc::new(

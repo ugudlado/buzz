@@ -6,6 +6,7 @@ export const TRIGGER_TYPES = [
   "diff_posted",
   "webhook",
   "schedule",
+  "manual",
 ] as const;
 export type TriggerType = (typeof TRIGGER_TYPES)[number];
 
@@ -56,6 +57,8 @@ export type StepFormState = {
   timeout?: string;
   agent?: string;
   agentPubkey?: string;
+  agentRelayPubkey?: string;
+  agentRelayUrl?: string;
   instruction?: string;
 };
 
@@ -76,6 +79,7 @@ export const DEFAULT_FORM_STATE: WorkflowFormState = {
 };
 
 export const TRIGGER_LABELS: Record<TriggerType, string> = {
+  manual: "Manual",
   message_posted: "Message Posted",
   reaction_added: "Reaction Added",
   diff_posted: "Diff Posted",
@@ -174,6 +178,9 @@ function actionFieldsForStep(step: StepFormState): Record<string, unknown> {
     case "assign_to_agent":
       if (step.agent) fields.agent = step.agent;
       if (step.agentPubkey) fields.agent_pubkey = step.agentPubkey;
+      if (step.agentRelayPubkey)
+        fields.agent_relay_pubkey = step.agentRelayPubkey;
+      if (step.agentRelayUrl) fields.agent_relay_url = step.agentRelayUrl;
       if (step.instruction) fields.instruction = step.instruction;
       if (step.timeout) fields.timeout = step.timeout;
       break;
@@ -242,6 +249,12 @@ export function yamlToFormState(
     if (!parsed || typeof parsed !== "object") {
       return { ok: false, error: "YAML must be an object" };
     }
+    if (parsed.marketplace !== undefined) {
+      return {
+        ok: false,
+        error: "Marketplace metadata is edited in the YAML editor",
+      };
+    }
 
     const triggerOn = parsed.trigger?.on;
     if (triggerOn && !TRIGGER_TYPES.includes(triggerOn as TriggerType)) {
@@ -300,6 +313,8 @@ export function yamlToFormState(
         timeout: step.timeout as string | undefined,
         agent: step.agent as string | undefined,
         agentPubkey: step.agent_pubkey as string | undefined,
+        agentRelayPubkey: step.agent_relay_pubkey as string | undefined,
+        agentRelayUrl: step.agent_relay_url as string | undefined,
         instruction: step.instruction as string | undefined,
       }),
     );

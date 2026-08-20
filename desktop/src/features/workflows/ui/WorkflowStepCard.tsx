@@ -289,14 +289,22 @@ function StepConfigFields({
         <div className="space-y-2">
           <div className="space-y-1.5">
             <FieldLabel htmlFor={`${prefix}-agent`}>
-              Agent (channel member)
+              {step.agentRelayPubkey
+                ? "Remote agent"
+                : "Agent (channel member)"}
             </FieldLabel>
             <AgentCombobox
               channelId={channelId}
               disabled={disabled}
               id={`${prefix}-agent`}
               onChange={({ displayName, pubkey }) =>
-                onUpdate({ ...step, agent: displayName, agentPubkey: pubkey })
+                onUpdate({
+                  ...step,
+                  agent: displayName,
+                  agentPubkey: pubkey,
+                  agentRelayPubkey: undefined,
+                  agentRelayUrl: undefined,
+                })
               }
               value={step.agent ?? ""}
             />
@@ -321,6 +329,45 @@ function StepConfigFields({
                 }
                 value={step.agentPubkey}
               />
+            </div>
+          ) : null}
+          {step.agentRelayPubkey || step.agentRelayUrl ? (
+            <div className="space-y-2 rounded-md border p-2">
+              <p className="text-xs text-muted-foreground">
+                Pinned to the agent's home community. Both values are checked
+                again when the workflow runs.
+              </p>
+              <div className="space-y-1.5">
+                <FieldLabel htmlFor={`${prefix}-agent-relay-pubkey`}>
+                  Relay pubkey
+                </FieldLabel>
+                <Input
+                  autoCapitalize="off"
+                  disabled={disabled}
+                  id={`${prefix}-agent-relay-pubkey`}
+                  onChange={(event) =>
+                    onUpdate({
+                      ...step,
+                      agentRelayPubkey: event.target.value,
+                    })
+                  }
+                  value={step.agentRelayPubkey ?? ""}
+                />
+              </div>
+              <div className="space-y-1.5">
+                <FieldLabel htmlFor={`${prefix}-agent-relay-url`}>
+                  Relay URL
+                </FieldLabel>
+                <Input
+                  autoCapitalize="off"
+                  disabled={disabled}
+                  id={`${prefix}-agent-relay-url`}
+                  onChange={(event) =>
+                    onUpdate({ ...step, agentRelayUrl: event.target.value })
+                  }
+                  value={step.agentRelayUrl ?? ""}
+                />
+              </div>
             </div>
           ) : null}
           <div className="space-y-1.5">

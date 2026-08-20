@@ -70,6 +70,17 @@ export function useAppNavigation() {
     [commitNavigation],
   );
 
+  const goMarketplace = React.useCallback(
+    (behavior?: NavigationBehavior) =>
+      commitNavigation(
+        {
+          to: "/marketplace",
+        },
+        behavior,
+      ),
+    [commitNavigation],
+  );
+
   const goPulse = React.useCallback(
     (behavior?: NavigationBehavior) =>
       commitNavigation(
@@ -332,6 +343,7 @@ export function useAppNavigation() {
     goChannel,
     goForumPost,
     goHome,
+    goMarketplace,
     goNewMessage,
     goProject,
     goProjects,

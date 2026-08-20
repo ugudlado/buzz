@@ -21,20 +21,21 @@ use buzz_core::kind::{
     KIND_GIT_STATUS_CLOSED, KIND_GIT_STATUS_DRAFT, KIND_GIT_STATUS_MERGED, KIND_GIT_STATUS_OPEN,
     KIND_HUDDLE_ENDED, KIND_HUDDLE_GUIDELINES, KIND_HUDDLE_PARTICIPANT_JOINED,
     KIND_HUDDLE_PARTICIPANT_LEFT, KIND_HUDDLE_STARTED, KIND_IA_ARCHIVE_REQUEST,
-    KIND_IA_UNARCHIVE_REQUEST, KIND_LONG_FORM, KIND_MANAGED_AGENT, KIND_MEMBER_ADDED_NOTIFICATION,
-    KIND_MEMBER_REMOVED_NOTIFICATION, KIND_MODERATION_BAN, KIND_MODERATION_RESOLVE_REPORT,
-    KIND_MODERATION_TIMEOUT, KIND_MODERATION_UNBAN, KIND_MODERATION_UNTIMEOUT, KIND_MUTE_LIST,
-    KIND_NIP29_CREATE_GROUP, KIND_NIP29_DELETE_EVENT, KIND_NIP29_DELETE_GROUP,
-    KIND_NIP29_EDIT_METADATA, KIND_NIP29_JOIN_REQUEST, KIND_NIP29_LEAVE_REQUEST,
-    KIND_NIP29_PUT_USER, KIND_NIP29_REMOVE_USER, KIND_NIP43_LEAVE_REQUEST,
-    KIND_NIP65_RELAY_LIST_METADATA, KIND_PERSONA, KIND_PIN_LIST, KIND_PRESENCE_UPDATE,
-    KIND_PRIVATE_MANAGED_AGENT, KIND_PRODUCT_FEEDBACK, KIND_PROFILE, KIND_PROJECT, KIND_REACTION,
-    KIND_READ_STATE, KIND_REPORT, KIND_STREAM_MESSAGE, KIND_STREAM_MESSAGE_BOOKMARKED,
-    KIND_STREAM_MESSAGE_DIFF, KIND_STREAM_MESSAGE_EDIT, KIND_STREAM_MESSAGE_PINNED,
-    KIND_STREAM_MESSAGE_SCHEDULED, KIND_STREAM_MESSAGE_V2, KIND_STREAM_REMINDER, KIND_TEAM,
-    KIND_TEAM_CATALOG, KIND_TEXT_NOTE, KIND_USER_STATUS, KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER,
-    RELAY_ADMIN_ADD_MEMBER, RELAY_ADMIN_CHANGE_ROLE, RELAY_ADMIN_REMOVE_MEMBER,
-    RELAY_ADMIN_SET_WORKSPACE_PROFILE,
+    KIND_IA_UNARCHIVE_REQUEST, KIND_JOB_ACCEPTED, KIND_JOB_CANCEL, KIND_JOB_ERROR,
+    KIND_JOB_PROGRESS, KIND_JOB_REQUEST, KIND_JOB_RESULT, KIND_LONG_FORM, KIND_MANAGED_AGENT,
+    KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION, KIND_MODERATION_BAN,
+    KIND_MODERATION_RESOLVE_REPORT, KIND_MODERATION_TIMEOUT, KIND_MODERATION_UNBAN,
+    KIND_MODERATION_UNTIMEOUT, KIND_MUTE_LIST, KIND_NIP29_CREATE_GROUP, KIND_NIP29_DELETE_EVENT,
+    KIND_NIP29_DELETE_GROUP, KIND_NIP29_EDIT_METADATA, KIND_NIP29_JOIN_REQUEST,
+    KIND_NIP29_LEAVE_REQUEST, KIND_NIP29_PUT_USER, KIND_NIP29_REMOVE_USER,
+    KIND_NIP43_LEAVE_REQUEST, KIND_NIP65_RELAY_LIST_METADATA, KIND_PERSONA, KIND_PIN_LIST,
+    KIND_PRESENCE_UPDATE, KIND_PRIVATE_MANAGED_AGENT, KIND_PRODUCT_FEEDBACK, KIND_PROFILE,
+    KIND_PROJECT, KIND_REACTION, KIND_READ_STATE, KIND_REPORT, KIND_STREAM_MESSAGE,
+    KIND_STREAM_MESSAGE_BOOKMARKED, KIND_STREAM_MESSAGE_DIFF, KIND_STREAM_MESSAGE_EDIT,
+    KIND_STREAM_MESSAGE_PINNED, KIND_STREAM_MESSAGE_SCHEDULED, KIND_STREAM_MESSAGE_V2,
+    KIND_STREAM_REMINDER, KIND_TEAM, KIND_TEAM_CATALOG, KIND_TEXT_NOTE, KIND_USER_STATUS,
+    KIND_WORKFLOW_CANCELLED, KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER, RELAY_ADMIN_ADD_MEMBER,
+    RELAY_ADMIN_CHANGE_ROLE, RELAY_ADMIN_REMOVE_MEMBER, RELAY_ADMIN_SET_WORKSPACE_PROFILE,
 };
 use buzz_core::tenant::TenantContext;
 use buzz_core::verification::verify_event;
@@ -130,6 +131,8 @@ pub enum IngestAuth {
         scopes: Vec<Scope>,
         /// How the HTTP request was authenticated.
         auth_method: HttpAuthMethod,
+        /// Membership was replaced by the stricter cross-community job gate.
+        cross_community: bool,
     },
 }
 
@@ -177,6 +180,17 @@ impl IngestAuth {
     /// Whether this auth context is an HTTP request (not WebSocket).
     pub fn is_http(&self) -> bool {
         matches!(self, Self::Http { .. })
+    }
+
+    /// Whether this HTTP request passed the cross-community job authorization gate.
+    pub fn is_cross_community(&self) -> bool {
+        matches!(
+            self,
+            Self::Http {
+                cross_community: true,
+                ..
+            }
+        )
     }
 }
 
@@ -390,6 +404,12 @@ fn required_scope_for_kind(kind: u32, event: &Event) -> Result<Scope, &'static s
         | KIND_FORUM_POST
         | KIND_FORUM_VOTE
         | KIND_FORUM_COMMENT => Ok(Scope::MessagesWrite),
+        KIND_JOB_REQUEST
+        | KIND_JOB_ACCEPTED
+        | KIND_JOB_PROGRESS
+        | KIND_JOB_RESULT
+        | KIND_JOB_CANCEL
+        | KIND_JOB_ERROR => Ok(Scope::MessagesWrite),
         KIND_NIP29_PUT_USER | KIND_NIP29_REMOVE_USER | KIND_NIP29_DELETE_GROUP => {
             Ok(Scope::AdminChannels)
         }
@@ -448,7 +468,9 @@ fn required_scope_for_kind(kind: u32, event: &Event) -> Result<Scope, &'static s
         | KIND_GIT_STATUS_DRAFT => Ok(Scope::MessagesWrite),
         // Command kinds — DM management, workflows, approvals
         KIND_DM_OPEN | KIND_DM_ADD_MEMBER | KIND_DM_HIDE => Ok(Scope::MessagesWrite),
-        KIND_WORKFLOW_DEF | KIND_WORKFLOW_TRIGGER => Ok(Scope::MessagesWrite),
+        KIND_WORKFLOW_DEF | KIND_WORKFLOW_TRIGGER | KIND_WORKFLOW_CANCELLED => {
+            Ok(Scope::MessagesWrite)
+        }
         KIND_APPROVAL_GRANT | KIND_APPROVAL_DENY => Ok(Scope::MessagesWrite),
         _ => Err("restricted: unknown event kind"),
     }
@@ -603,6 +625,13 @@ pub(crate) fn is_global_only_kind(kind: u32) -> bool {
             // NIP-AM: agent turn metrics are owner-scoped global events.
             // Channel identity is encrypted inside the payload — no `h` tag.
             | KIND_AGENT_TURN_METRIC
+            // Cross-community agent-job events are p-addressed global envelopes.
+            | KIND_JOB_REQUEST
+            | KIND_JOB_ACCEPTED
+            | KIND_JOB_PROGRESS
+            | KIND_JOB_RESULT
+            | KIND_JOB_CANCEL
+            | KIND_JOB_ERROR
             // NIP-PL leases are author-owned, addressable global state.
             | super::push_lease::KIND_PUSH_LEASE
     )
@@ -1299,6 +1328,63 @@ fn validate_team_catalog_envelope(event: &Event) -> Result<(), String> {
     const LABEL: &str = "team-catalog event";
     validate_shared_tag(event, LABEL)?;
     single_bounded_d_tag(event, LABEL)?;
+    Ok(())
+}
+
+async fn validate_managed_agent_marketplace(
+    community_id: CommunityId,
+    event: &Event,
+    state: &AppState,
+) -> Result<(), IngestError> {
+    let content: serde_json::Value = serde_json::from_str(&event.content)
+        .map_err(|e| IngestError::Rejected(format!("invalid: managed-agent content: {e}")))?;
+    let Some(value) = content.get("marketplace") else {
+        return Ok(());
+    };
+    let listing: buzz_core::marketplace::AgentMarketplace =
+        serde_json::from_value(value.clone())
+            .map_err(|e| IngestError::Rejected(format!("invalid: marketplace listing: {e}")))?;
+    let normalized = listing
+        .clone()
+        .normalized()
+        .map_err(|e| IngestError::Rejected(format!("invalid: marketplace listing: {e}")))?;
+    if normalized != listing {
+        return Err(IngestError::Rejected(
+            "invalid: marketplace listing must use canonical normalized values".into(),
+        ));
+    }
+
+    let d_tags: Vec<&str> = event
+        .tags
+        .iter()
+        .filter_map(|tag| {
+            let parts = tag.as_slice();
+            (parts.first().map(String::as_str) == Some("d"))
+                .then(|| parts.get(1).map(String::as_str))
+                .flatten()
+        })
+        .collect();
+    if d_tags.len() != 1
+        || d_tags[0].len() != 64
+        || !d_tags[0].bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(IngestError::Rejected(
+            "invalid: marketplace managed-agent event requires exactly one 64-hex d tag".into(),
+        ));
+    }
+    let agent_pubkey = hex::decode(d_tags[0])
+        .map_err(|e| IngestError::Rejected(format!("invalid: agent pubkey d tag: {e}")))?;
+    let owner_pubkey = event.pubkey.to_bytes().to_vec();
+    let is_owner = state
+        .db
+        .is_agent_owner(community_id, &agent_pubkey, &owner_pubkey)
+        .await
+        .map_err(|e| IngestError::Internal(format!("marketplace ownership lookup: {e}")))?;
+    if !is_owner {
+        return Err(IngestError::AuthFailed(
+            "restricted: marketplace listing author must be the verified agent owner".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -2027,6 +2113,29 @@ async fn ingest_event_inner(
         ));
     }
 
+    if kind_u32 == KIND_JOB_REQUEST {
+        buzz_core::agent_job::validate_request_envelope(&event, now as u64)
+            .map_err(|error| IngestError::Rejected(format!("invalid: {error}")))?;
+        if !auth.is_cross_community() {
+            return Err(IngestError::AuthFailed(
+                "restricted: job requests require verified cross-community relay authorization"
+                    .into(),
+            ));
+        }
+    } else if kind_u32 == KIND_JOB_CANCEL {
+        buzz_core::agent_job::validate_cancellation_event(&event)
+            .map_err(|error| IngestError::Rejected(format!("invalid: {error}")))?;
+        if !auth.is_cross_community() {
+            return Err(IngestError::AuthFailed(
+                "restricted: job cancellations require verified cross-community relay authorization"
+                    .into(),
+            ));
+        }
+    } else if buzz_core::agent_job::is_job_kind(kind_u32) {
+        buzz_core::agent_job::validate_response_envelope(&event)
+            .map_err(|error| IngestError::Rejected(format!("invalid: {error}")))?;
+    }
+
     let required = match required_scope_for_kind(kind_u32, &event) {
         Ok(scope) => scope,
         Err(msg) => return Err(IngestError::Rejected(msg.into())),
@@ -2554,6 +2663,10 @@ async fn ingest_event_inner(
     if kind_u32 == KIND_PERSONA {
         validate_persona_envelope(&event)
             .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
+    }
+
+    if kind_u32 == KIND_MANAGED_AGENT {
+        validate_managed_agent_marketplace(tenant.community(), &event, state).await?;
     }
 
     if kind_u32 == KIND_TEAM_CATALOG {
@@ -3343,6 +3456,7 @@ mod tests {
             pubkey: keys.public_key(),
             scopes: vec![Scope::MessagesWrite],
             auth_method: HttpAuthMethod::Nip98,
+            cross_community: false,
         };
         let tracer = Arc::new(VecTracer::default());
         let abstract_state = state_for_request(&tenant, auth.pubkey());
@@ -3774,6 +3888,7 @@ mod tests {
             pubkey: keys.public_key(),
             scopes: vec![],
             auth_method: HttpAuthMethod::Nip98,
+            cross_community: false,
         };
         assert!(
             http_auth.is_http(),

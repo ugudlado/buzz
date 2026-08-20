@@ -7,8 +7,9 @@ use std::{collections::BTreeMap, path::PathBuf, process::Child};
 // `crate::managed_agents::types::*` path in this codebase keeps resolving.
 pub use buzz_agent_record_pkg::{
     default_agent_parallelism, default_record_active, default_start_on_app_launch,
-    validate_respond_to_allowlist, BackendKind, CatalogSource, ManagedAgentRecord, RelayMeshConfig,
-    RespondTo, DEFAULT_ACP_COMMAND, DEFAULT_AGENT_PARALLELISM, DEFAULT_AGENT_TURN_TIMEOUT_SECONDS,
+    validate_respond_to_allowlist, AgentMarketplace, BackendKind, CatalogSource,
+    ManagedAgentRecord, RelayMeshConfig, RespondTo, DEFAULT_ACP_COMMAND, DEFAULT_AGENT_PARALLELISM,
+    DEFAULT_AGENT_TURN_TIMEOUT_SECONDS,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -137,6 +138,7 @@ impl AgentDefinition {
             last_error_code: None,
             respond_to: RespondTo::default(),
             respond_to_allowlist: Vec::new(),
+            marketplace: None,
             display_name: Some(self.display_name),
             slug: Some(self.id),
             runtime: self.runtime,
@@ -214,6 +216,7 @@ pub struct RelayAgentInfo {
     pub respond_to: Option<RespondTo>,
     #[serde(default)]
     pub respond_to_allowlist: Vec<String>,
+    pub marketplace: Option<AgentMarketplace>,
 }
 
 #[derive(Debug)]
@@ -324,6 +327,7 @@ pub struct ManagedAgentSummary {
     pub log_path: String,
     pub respond_to: RespondTo,
     pub respond_to_allowlist: Vec<String>,
+    pub marketplace: Option<AgentMarketplace>,
 }
 
 #[derive(Debug, Serialize)]

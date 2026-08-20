@@ -5,6 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use buzz_core::marketplace::WorkflowMarketplace;
 use serde::{Deserialize, Serialize};
 
 use crate::error::WorkflowError;
@@ -24,6 +25,15 @@ pub struct WorkflowDef {
     /// Whether this workflow is active. Defaults to `true`.
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Optional community marketplace listing metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub marketplace: Option<WorkflowMarketplace>,
+    /// Marks the hidden single-assignment workflow created by "Add to
+    /// community" on a remote marketplace agent. UIs surface it in the
+    /// agents catalog instead of the workflows list; execution semantics
+    /// are unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub installed_agent: bool,
 }
 
 fn default_true() -> bool {
@@ -165,6 +175,13 @@ pub enum ActionDef {
         /// matching against channel members, as before.
         #[serde(default)]
         agent_pubkey: Option<String>,
+        /// NIP-11 `self` pubkey of the agent's home community. When omitted,
+        /// assignment keeps the existing local-channel semantics.
+        #[serde(default)]
+        agent_relay_pubkey: Option<String>,
+        /// `wss` routing hint for the agent's home community.
+        #[serde(default)]
+        agent_relay_url: Option<String>,
         /// Instruction text appended after the `@mention`.
         instruction: String,
         /// Duration string (e.g. `"24h"`) after which the assignment expires.
@@ -203,6 +220,13 @@ impl WorkflowDef {
             ));
         }
 
+        if let Some(marketplace) = &self.marketplace {
+            marketplace
+                .clone()
+                .normalized()
+                .map_err(WorkflowError::InvalidDefinition)?;
+        }
+
         // Validate step IDs are safe for use in evalexpr variable names.
         // Step IDs become variable names like `steps_{id}_output_{field}`,
         // so they must only contain alphanumeric chars and underscores.
@@ -235,6 +259,8 @@ impl WorkflowDef {
             if let ActionDef::AssignToAgent {
                 agent,
                 agent_pubkey,
+                agent_relay_pubkey,
+                agent_relay_url,
                 instruction,
                 ..
             } = &step.action
@@ -259,6 +285,42 @@ impl WorkflowDef {
                     {
                         return Err(WorkflowError::InvalidDefinition(format!(
                             "step '{}': assign_to_agent 'agent_pubkey' must be a 64-char hex pubkey",
+                            step.id
+                        )));
+                    }
+                }
+                match (agent_relay_pubkey, agent_relay_url) {
+                    (None, None) => {}
+                    (Some(relay_pubkey), Some(relay_url)) => {
+                        let relay_pubkey = relay_pubkey.trim();
+                        if relay_pubkey.len() != 64
+                            || !relay_pubkey.chars().all(|c| c.is_ascii_hexdigit())
+                        {
+                            return Err(WorkflowError::InvalidDefinition(format!(
+                                "step '{}': assign_to_agent 'agent_relay_pubkey' must be a 64-char hex pubkey",
+                                step.id
+                            )));
+                        }
+                        let url = url::Url::parse(relay_url).map_err(|_| {
+                            WorkflowError::InvalidDefinition(format!(
+                                "step '{}': assign_to_agent 'agent_relay_url' must be an absolute wss URL",
+                                step.id
+                            ))
+                        })?;
+                        if url.scheme() != "wss"
+                            || url.host_str().is_none()
+                            || url.username() != ""
+                            || url.password().is_some()
+                        {
+                            return Err(WorkflowError::InvalidDefinition(format!(
+                                "step '{}': assign_to_agent 'agent_relay_url' must be an absolute wss URL without userinfo",
+                                step.id
+                            )));
+                        }
+                    }
+                    _ => {
+                        return Err(WorkflowError::InvalidDefinition(format!(
+                            "step '{}': assign_to_agent remote coordinates require both 'agent_relay_pubkey' and 'agent_relay_url'",
                             step.id
                         )));
                     }
@@ -334,8 +396,13 @@ pub(crate) fn normalize_cron(expr: &str) -> String {
 ///
 /// Returns `(WorkflowDef, canonical_json)` on success.
 pub fn parse_yaml(yaml: &str) -> Result<(WorkflowDef, String), WorkflowError> {
-    let def: WorkflowDef = serde_yaml::from_str(yaml)?;
+    let mut def: WorkflowDef = serde_yaml::from_str(yaml)?;
     def.validate()?;
+    def.marketplace = def
+        .marketplace
+        .map(WorkflowMarketplace::normalized)
+        .transpose()
+        .map_err(WorkflowError::InvalidDefinition)?;
     let json =
         serde_json::to_string(&def).map_err(|e| WorkflowError::InvalidDefinition(e.to_string()))?;
     Ok((def, json))
@@ -344,6 +411,22 @@ pub fn parse_yaml(yaml: &str) -> Result<(WorkflowDef, String), WorkflowError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn marketplace_metadata_is_validated_and_normalized() {
+        let (def, _) = parse_yaml(
+            "name: Listed\ntrigger:\n  on: manual\nmarketplace:\n  listed: true\n  summary: '  Review release notes  '\n  fixed_price:\n    currency: USD\n    microunits: 5000000\nsteps:\n  - id: send\n    action: send_message\n    text: done\n",
+        )
+        .unwrap();
+        let listing = def.marketplace.unwrap();
+        assert_eq!(listing.summary, "Review release notes");
+        assert_eq!(listing.fixed_price.unwrap().microunits, 5_000_000);
+
+        assert!(parse_yaml(
+            "name: Bad\ntrigger:\n  on: manual\nmarketplace:\n  listed: true\n  summary: bad\n  fixed_price:\n    currency: usd\n    microunits: 1\nsteps:\n  - id: send\n    action: send_message\n    text: done\n",
+        )
+        .is_err());
+    }
 
     #[test]
     fn parse_simple_message_posted_workflow() {
@@ -391,6 +474,21 @@ mod tests {
 
         let reparsed: WorkflowDef = serde_json::from_str(&json).expect("json round-trip");
         assert!(matches!(reparsed.trigger, TriggerDef::Manual));
+    }
+
+    #[test]
+    fn installed_agent_marker_round_trips_and_defaults_off() {
+        let yaml = "name: Bumble\ninstalled_agent: true\ntrigger:\n  on: manual\nsteps:\n  - id: ask\n    action: assign_to_agent\n    agent: Bumble\n    agent_pubkey: 'aa11111111111111111111111111111111111111111111111111111111111111'\n    agent_relay_pubkey: 'bb22222222222222222222222222222222222222222222222222222222222222'\n    agent_relay_url: wss://relay-a.example\n    instruction: '{{trigger.prompt}}'\n";
+        let (def, json) = parse_yaml(yaml).expect("parse failed");
+        assert!(def.installed_agent);
+        let reparsed: WorkflowDef = serde_json::from_str(&json).expect("json round-trip");
+        assert!(reparsed.installed_agent);
+
+        let plain = "name: Plain\ntrigger:\n  on: manual\nsteps:\n  - id: s1\n    action: send_message\n    text: hi\n";
+        let (def, json) = parse_yaml(plain).expect("parse failed");
+        assert!(!def.installed_agent);
+        // Absent marker stays absent in canonical JSON.
+        assert!(!json.contains("installed_agent"));
     }
 
     #[test]
@@ -1004,6 +1102,8 @@ mod tests {
             ActionDef::AssignToAgent {
                 agent,
                 agent_pubkey,
+                agent_relay_pubkey,
+                agent_relay_url,
                 instruction,
                 timeout,
             } => {
@@ -1011,6 +1111,8 @@ mod tests {
                 assert_eq!(instruction, "Please investigate the failing build");
                 assert_eq!(timeout.as_deref(), Some("4h"));
                 assert!(agent_pubkey.is_none());
+                assert!(agent_relay_pubkey.is_none());
+                assert!(agent_relay_url.is_none());
             }
             other => panic!("unexpected action: {other:?}"),
         }

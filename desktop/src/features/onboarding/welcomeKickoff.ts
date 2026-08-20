@@ -13,7 +13,7 @@ import { welcomeKickoffMarker } from "@/features/onboarding/devFreshOnboarding";
 import { resolveAgentReadiness } from "@/features/onboarding/ui/agentReadiness";
 import {
   ensureWelcomeTeam,
-  pickWelcomeTeamStarterAgentForRelay,
+  pickWelcomeTeamStarterAgent,
   WELCOME_TEAM_STARTERS,
   type WelcomeTeamStarterDefinition,
   welcomeTeammateHasExpectedAccess,
@@ -135,31 +135,13 @@ export function resolveWelcomeAgentSet(
   agents: readonly ManagedAgent[],
 ): WelcomeAgentSet | null {
   const ordered = WELCOME_TEAM_STARTERS.map((starter) =>
-    pickWelcomeTeamStarterAgentForRelay([...agents], starter),
+    pickWelcomeTeamStarterAgent([...agents], starter),
   );
   if (ordered.some((agent) => !agent)) return null;
   return {
     lead: ordered[0] as ManagedAgent,
     teammates: [ordered[1] as ManagedAgent, ordered[2] as ManagedAgent],
   };
-}
-
-function normalizeRelayUrl(relayUrl?: string | null) {
-  return relayUrl?.trim().replace(/\/+$/, "") ?? null;
-}
-
-function resolveWelcomeAgentSetForRelay(
-  agents: readonly ManagedAgent[],
-  relayUrl?: string | null,
-) {
-  const normalizedRelayUrl = normalizeRelayUrl(relayUrl);
-  return resolveWelcomeAgentSet(
-    agents.filter(
-      (agent) =>
-        !normalizedRelayUrl ||
-        normalizeRelayUrl(agent.relayUrl) === normalizedRelayUrl,
-    ),
-  );
 }
 
 export function buildWelcomeKickoffOpener(
@@ -336,17 +318,15 @@ export function classifyWelcomeKickoffResolution(
 async function resolveLatestWelcomeAgentSet({
   fallback,
   queryClient,
-  relayUrl,
 }: {
   fallback: WelcomeAgentSet;
   queryClient: ReturnType<typeof useQueryClient>;
-  relayUrl?: string | null;
 }) {
   const agents = await queryClient.fetchQuery({
     queryKey: managedAgentsQueryKey,
     queryFn: listManagedAgents,
   });
-  return resolveWelcomeAgentSetForRelay(agents, relayUrl) ?? fallback;
+  return resolveWelcomeAgentSet(agents) ?? fallback;
 }
 
 async function markerExists(channelId: string, marker: string) {
@@ -546,12 +526,8 @@ export function useWelcomeKickoff(
   const channelEventsRef = React.useRef(kickoffEvents);
   channelEventsRef.current = kickoffEvents;
   const agentSet = React.useMemo(
-    () =>
-      resolveWelcomeAgentSetForRelay(
-        managedAgentsQuery.data ?? [],
-        activeCommunity?.relayUrl,
-      ),
-    [activeCommunity?.relayUrl, managedAgentsQuery.data],
+    () => resolveWelcomeAgentSet(managedAgentsQuery.data ?? []),
+    [managedAgentsQuery.data],
   );
   const readiness = React.useMemo(
     () => resolveAgentReadiness(runtimesQuery.data ?? [], globalConfig),
@@ -775,7 +751,6 @@ export function useWelcomeKickoff(
             const latestAgentSet = await resolveLatestWelcomeAgentSet({
               fallback: agentSet,
               queryClient,
-              relayUrl: activeCommunity?.relayUrl,
             });
             const latestResolution = classifyWelcomeKickoffResolution(
               latestEvents,
@@ -830,7 +805,6 @@ export function useWelcomeKickoff(
       const latestAgentSet = await resolveLatestWelcomeAgentSet({
         fallback: agentSet,
         queryClient,
-        relayUrl: activeCommunity?.relayUrl,
       });
       const latestResolution = classifyWelcomeKickoffResolution(
         latestEvents,
@@ -856,7 +830,6 @@ export function useWelcomeKickoff(
         closerInFlight.delete(channelId);
       });
   }, [
-    activeCommunity?.relayUrl,
     agentSet,
     kickoffEvents,
     kickoffResolved,

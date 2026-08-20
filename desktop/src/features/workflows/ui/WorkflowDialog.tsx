@@ -28,13 +28,16 @@ type WorkflowDialogProps = {
   onOpenChange: (open: boolean) => void;
   open: boolean;
   workflow?: Workflow | null;
+  initialDefinition?: Record<string, unknown> | null;
 };
 
 function getInitialYaml(
   mode: DialogMode,
   workflow: Workflow | null | undefined,
+  initialDefinition: Record<string, unknown> | null | undefined,
 ): string {
-  if (!workflow) return "";
+  if (!workflow)
+    return initialDefinition ? yamlStringify(initialDefinition) : "";
   const def = { ...workflow.definition };
   if (mode === "duplicate") {
     def.name = `${def.name ?? workflow.name} (copy)`;
@@ -66,6 +69,7 @@ export function WorkflowDialog({
   onOpenChange,
   open,
   workflow,
+  initialDefinition,
 }: WorkflowDialogProps) {
   const channelId =
     mode === "edit" && workflow?.channelId
@@ -74,7 +78,7 @@ export function WorkflowDialog({
 
   const [selectedChannelId, setSelectedChannelId] = React.useState(channelId);
   const [yamlDefinition, setYamlDefinition] = React.useState(() =>
-    getInitialYaml(mode, workflow),
+    getInitialYaml(mode, workflow, initialDefinition),
   );
   const [savedWebhookInfo, setSavedWebhookInfo] = React.useState<{
     relayHttpUrl: string;
@@ -102,7 +106,7 @@ export function WorkflowDialog({
           ? workflowChannelId
           : defaultChannelId;
       setSelectedChannelId(newChannelId);
-      setYamlDefinition(getInitialYaml(mode, workflow));
+      setYamlDefinition(getInitialYaml(mode, workflow, initialDefinition));
       setSavedWebhookInfo(null);
       resetCreate();
       resetUpdate();
@@ -111,6 +115,7 @@ export function WorkflowDialog({
     open,
     mode,
     workflow,
+    initialDefinition,
     workflowChannelId,
     defaultChannelId,
     resetCreate,

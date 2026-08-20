@@ -1,4 +1,10 @@
 {
   "identifier": "xyz.block.buzz.app.dev",
-  "productName": "Buzz Dev"
+  "productName": "Buzz Dev",
+  "bundle": {
+    "targets": ["app"],
+    "macOS": {
+      "signingIdentity": "Buzz Dev Signing"
+    }
+  }
 }

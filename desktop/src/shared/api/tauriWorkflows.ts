@@ -8,6 +8,12 @@ import type {
   WorkflowSaveResult,
   TraceEntry,
 } from "@/shared/api/types";
+import type {
+  AssignmentReceipt,
+  ReportedUsage,
+} from "@/shared/api/workflowTypes";
+
+const CURRENCY = /^[A-Z]{3}$/;
 
 // ── Raw types (snake_case from backend) ───────────────────────────────────
 
@@ -33,6 +39,27 @@ type RawTraceEntry = {
   started_at?: number | null;
   completed_at?: number | null;
   error?: string | null;
+  assignment_receipt?: RawAssignmentReceipt | null;
+};
+
+type RawAssignmentReceipt = {
+  agent_pubkey: string;
+  agent_owner_pubkey: string | null;
+  origin_relay_pubkey?: string | null;
+  agent_relay_pubkey?: string | null;
+  agent_relay_url?: string | null;
+  listing_event_id?: string | null;
+  prompt_event_id: string;
+  completion_event_id: string | null;
+  prompt_published_at_ms: number | null;
+  terminal_at_ms: number | null;
+  duration_ms: number | null;
+  rate_currency: string | null;
+  rate_microunits_per_hour: number | null;
+  estimated_microunits: number | null;
+  outcome: AssignmentReceipt["outcome"];
+  review_state: AssignmentReceipt["reviewState"];
+  reported_usage?: unknown;
 };
 
 type RawWorkflowRun = {
@@ -45,6 +72,9 @@ type RawWorkflowRun = {
   completed_at: number | null;
   error_code?: string | null;
   error_message: string | null;
+  workflow_author_pubkey?: string | null;
+  fixed_price_currency?: string | null;
+  fixed_price_microunits?: number | null;
   created_at: number;
 };
 
@@ -111,7 +141,73 @@ function fromRawWorkflowSave(raw: RawWorkflowSaveResponse): WorkflowSaveResult {
   };
 }
 
-function fromRawTraceEntry(raw: RawTraceEntry): TraceEntry {
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+/** Non-negative safe integer, or null for anything else (including undefined). */
+function safeCount(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : null;
+}
+
+/**
+ * Parse an agent's self-reported usage. Anything malformed degrades to `null`
+ * rather than throwing: the receipt itself is still worth showing. `harness` is
+ * required for the object to count, and cost is only kept when it comes with a
+ * well-formed currency.
+ */
+function fromRawReportedUsage(raw: unknown): ReportedUsage | null {
+  if (!isRecord(raw)) return null;
+  const harness = raw.harness;
+  if (typeof harness !== "string" || harness.trim().length === 0) return null;
+
+  const currency =
+    typeof raw.currency === "string" && CURRENCY.test(raw.currency)
+      ? raw.currency
+      : null;
+  const cost = safeCount(raw.cost_microunits);
+  const hasCost = currency !== null && cost !== null;
+
+  return {
+    harness: harness.trim(),
+    model:
+      typeof raw.model === "string" && raw.model.trim().length > 0
+        ? raw.model.trim()
+        : null,
+    inputTokens: safeCount(raw.input_tokens),
+    outputTokens: safeCount(raw.output_tokens),
+    costMicrounits: hasCost ? cost : null,
+    currency: hasCost ? currency : null,
+  };
+}
+
+function fromRawAssignmentReceipt(
+  raw: RawAssignmentReceipt,
+): AssignmentReceipt {
+  return {
+    agentPubkey: raw.agent_pubkey,
+    agentOwnerPubkey: raw.agent_owner_pubkey,
+    originRelayPubkey: raw.origin_relay_pubkey ?? null,
+    agentRelayPubkey: raw.agent_relay_pubkey ?? null,
+    agentRelayUrl: raw.agent_relay_url ?? null,
+    listingEventId: raw.listing_event_id ?? null,
+    promptEventId: raw.prompt_event_id,
+    completionEventId: raw.completion_event_id,
+    promptPublishedAtMs: raw.prompt_published_at_ms,
+    terminalAtMs: raw.terminal_at_ms,
+    durationMs: raw.duration_ms,
+    rateCurrency: raw.rate_currency,
+    rateMicrounitsPerHour: raw.rate_microunits_per_hour,
+    estimatedMicrounits: raw.estimated_microunits,
+    outcome: raw.outcome,
+    reviewState: raw.review_state,
+    reportedUsage: fromRawReportedUsage(raw.reported_usage),
+  };
+}
+
+export function fromRawTraceEntry(raw: RawTraceEntry): TraceEntry {
   return {
     stepId: raw.step_id,
     status: raw.status,
@@ -119,6 +215,9 @@ function fromRawTraceEntry(raw: RawTraceEntry): TraceEntry {
     startedAt: raw.started_at ?? null,
     completedAt: raw.completed_at ?? null,
     error: raw.error ?? null,
+    assignmentReceipt: raw.assignment_receipt
+      ? fromRawAssignmentReceipt(raw.assignment_receipt)
+      : null,
   };
 }
 
@@ -133,6 +232,9 @@ function fromRawWorkflowRun(raw: RawWorkflowRun): WorkflowRun {
     completedAt: raw.completed_at,
     errorCode: raw.error_code ?? null,
     errorMessage: raw.error_message,
+    workflowAuthorPubkey: raw.workflow_author_pubkey ?? null,
+    fixedPriceCurrency: raw.fixed_price_currency ?? null,
+    fixedPriceMicrounits: raw.fixed_price_microunits ?? null,
     createdAt: raw.created_at,
   };
 }
@@ -243,6 +345,110 @@ export async function getWorkflowRuns(
   return raw.runs.map(fromRawWorkflowRun);
 }
 
+export type AgentJob = {
+  requestEventId: string;
+  requestId: string;
+  agentPubkey: string;
+  callerRelayPubkey: string;
+  callerRelayUrl: string;
+  listingEventId: string;
+  rateCurrency: string | null;
+  rateMicrounitsPerHour: number | null;
+  requestedAtMs: number;
+  terminalAtMs: number | null;
+  durationMs: number | null;
+  estimatedMicrounits: number | null;
+  outcome: "completed" | "failed" | "pending";
+};
+
+export type AgentJobCallerTotal = {
+  callerRelayPubkey: string;
+  currency: string | null;
+  jobCount: number;
+  estimatedMicrounits: number;
+  totalDurationMs: number;
+};
+
+export type AgentJobsLedger = {
+  jobs: AgentJob[];
+  totals: { byCaller: AgentJobCallerTotal[]; jobCount: number };
+};
+
+type RawAgentJob = {
+  request_event_id: string;
+  request_id: string;
+  agent_pubkey: string;
+  caller_relay_pubkey: string;
+  caller_relay_url: string;
+  listing_event_id: string;
+  rate_currency: string | null;
+  rate_microunits_per_hour: number | null;
+  requested_at_ms: number;
+  terminal_at_ms: number | null;
+  duration_ms: number | null;
+  estimated_microunits: number | null;
+  outcome: string;
+};
+
+type RawAgentJobsLedger = {
+  jobs: RawAgentJob[];
+  totals: {
+    by_caller: Array<{
+      caller_relay_pubkey: string;
+      currency: string | null;
+      job_count: number;
+      estimated_microunits: number;
+      total_duration_ms: number;
+    }>;
+    job_count: number;
+  };
+};
+
+/**
+ * Provider-side job ledger for one of this community's agents: which caller
+ * communities invoked it, duration, and estimated cost. Owner-gated by the
+ * relay (returns 403 if the caller doesn't own the agent).
+ */
+export async function getAgentJobs(
+  agentPubkey: string,
+  limit?: number,
+): Promise<AgentJobsLedger> {
+  const raw = await invokeTauri<RawAgentJobsLedger>("get_agent_jobs", {
+    agentPubkey,
+    limit: limit ?? null,
+  });
+  return {
+    jobs: raw.jobs.map((job) => ({
+      requestEventId: job.request_event_id,
+      requestId: job.request_id,
+      agentPubkey: job.agent_pubkey,
+      callerRelayPubkey: job.caller_relay_pubkey,
+      callerRelayUrl: job.caller_relay_url,
+      listingEventId: job.listing_event_id,
+      rateCurrency: job.rate_currency,
+      rateMicrounitsPerHour: job.rate_microunits_per_hour,
+      requestedAtMs: job.requested_at_ms,
+      terminalAtMs: job.terminal_at_ms,
+      durationMs: job.duration_ms,
+      estimatedMicrounits: job.estimated_microunits,
+      outcome:
+        job.outcome === "completed" || job.outcome === "failed"
+          ? job.outcome
+          : "pending",
+    })),
+    totals: {
+      jobCount: raw.totals.job_count,
+      byCaller: raw.totals.by_caller.map((row) => ({
+        callerRelayPubkey: row.caller_relay_pubkey,
+        currency: row.currency,
+        jobCount: row.job_count,
+        estimatedMicrounits: row.estimated_microunits,
+        totalDurationMs: row.total_duration_ms,
+      })),
+    },
+  };
+}
+
 export async function getRunApprovals(
   workflowId: string,
   runId: string,
@@ -259,10 +465,11 @@ export async function getRunApprovals(
 
 export async function triggerWorkflow(
   workflowId: string,
+  fields?: Record<string, string>,
 ): Promise<TriggerWorkflowResponse> {
   const raw = await invokeTauri<RawTriggerWorkflowResponse>(
     "trigger_workflow",
-    { workflowId },
+    { workflowId, fields: fields ?? null },
   );
   return fromRawTriggerResponse(raw);
 }
