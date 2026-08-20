@@ -28,6 +28,12 @@ pub struct WorkflowDef {
     /// Optional community marketplace listing metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub marketplace: Option<WorkflowMarketplace>,
+    /// Marks the hidden single-assignment workflow created by "Add to
+    /// community" on a remote marketplace agent. UIs surface it in the
+    /// agents catalog instead of the workflows list; execution semantics
+    /// are unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub installed_agent: bool,
 }
 
 fn default_true() -> bool {
@@ -468,6 +474,21 @@ mod tests {
 
         let reparsed: WorkflowDef = serde_json::from_str(&json).expect("json round-trip");
         assert!(matches!(reparsed.trigger, TriggerDef::Manual));
+    }
+
+    #[test]
+    fn installed_agent_marker_round_trips_and_defaults_off() {
+        let yaml = "name: Bumble\ninstalled_agent: true\ntrigger:\n  on: manual\nsteps:\n  - id: ask\n    action: assign_to_agent\n    agent: Bumble\n    agent_pubkey: 'aa11111111111111111111111111111111111111111111111111111111111111'\n    agent_relay_pubkey: 'bb22222222222222222222222222222222222222222222222222222222222222'\n    agent_relay_url: wss://relay-a.example\n    instruction: '{{trigger.prompt}}'\n";
+        let (def, json) = parse_yaml(yaml).expect("parse failed");
+        assert!(def.installed_agent);
+        let reparsed: WorkflowDef = serde_json::from_str(&json).expect("json round-trip");
+        assert!(reparsed.installed_agent);
+
+        let plain = "name: Plain\ntrigger:\n  on: manual\nsteps:\n  - id: s1\n    action: send_message\n    text: hi\n";
+        let (def, json) = parse_yaml(plain).expect("parse failed");
+        assert!(!def.installed_agent);
+        // Absent marker stays absent in canonical JSON.
+        assert!(!json.contains("installed_agent"));
     }
 
     #[test]

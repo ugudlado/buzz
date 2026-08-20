@@ -1715,9 +1715,20 @@ pub async fn try_resume_remote_agent_step(
         "failed"
     };
     let mut outputs = serde_json::Map::new();
-    if let Some(result) = &validated.payload.output {
-        outputs.insert("result".into(), serde_json::Value::String(result.clone()));
-    }
+    // `result` is always present so downstream template steps (e.g. the
+    // installed-agent post step) resolve in both outcomes; failures carry
+    // the bounded error text.
+    let result_text = validated.payload.output.clone().unwrap_or_else(|| {
+        format!(
+            "Remote agent failed: {}",
+            validated
+                .payload
+                .error
+                .as_deref()
+                .unwrap_or("unknown error")
+        )
+    });
+    outputs.insert("result".into(), serde_json::Value::String(result_text));
     let output = serde_json::json!({
         "status": status,
         "outputs": outputs,

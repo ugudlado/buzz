@@ -269,6 +269,7 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         update_workflow,
         delete_workflow,
         get_workflow_runs,
+        get_agent_jobs,
         get_run_approvals,
         trigger_workflow,
         grant_approval,

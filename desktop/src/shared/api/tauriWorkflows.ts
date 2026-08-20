@@ -329,6 +329,110 @@ export async function getWorkflowRuns(
   return raw.map(fromRawWorkflowRun);
 }
 
+export type AgentJob = {
+  requestEventId: string;
+  requestId: string;
+  agentPubkey: string;
+  callerRelayPubkey: string;
+  callerRelayUrl: string;
+  listingEventId: string;
+  rateCurrency: string | null;
+  rateMicrounitsPerHour: number | null;
+  requestedAtMs: number;
+  terminalAtMs: number | null;
+  durationMs: number | null;
+  estimatedMicrounits: number | null;
+  outcome: "completed" | "failed" | "pending";
+};
+
+export type AgentJobCallerTotal = {
+  callerRelayPubkey: string;
+  currency: string | null;
+  jobCount: number;
+  estimatedMicrounits: number;
+  totalDurationMs: number;
+};
+
+export type AgentJobsLedger = {
+  jobs: AgentJob[];
+  totals: { byCaller: AgentJobCallerTotal[]; jobCount: number };
+};
+
+type RawAgentJob = {
+  request_event_id: string;
+  request_id: string;
+  agent_pubkey: string;
+  caller_relay_pubkey: string;
+  caller_relay_url: string;
+  listing_event_id: string;
+  rate_currency: string | null;
+  rate_microunits_per_hour: number | null;
+  requested_at_ms: number;
+  terminal_at_ms: number | null;
+  duration_ms: number | null;
+  estimated_microunits: number | null;
+  outcome: string;
+};
+
+type RawAgentJobsLedger = {
+  jobs: RawAgentJob[];
+  totals: {
+    by_caller: Array<{
+      caller_relay_pubkey: string;
+      currency: string | null;
+      job_count: number;
+      estimated_microunits: number;
+      total_duration_ms: number;
+    }>;
+    job_count: number;
+  };
+};
+
+/**
+ * Provider-side job ledger for one of this community's agents: which caller
+ * communities invoked it, duration, and estimated cost. Owner-gated by the
+ * relay (returns 403 if the caller doesn't own the agent).
+ */
+export async function getAgentJobs(
+  agentPubkey: string,
+  limit?: number,
+): Promise<AgentJobsLedger> {
+  const raw = await invokeTauri<RawAgentJobsLedger>("get_agent_jobs", {
+    agentPubkey,
+    limit: limit ?? null,
+  });
+  return {
+    jobs: raw.jobs.map((job) => ({
+      requestEventId: job.request_event_id,
+      requestId: job.request_id,
+      agentPubkey: job.agent_pubkey,
+      callerRelayPubkey: job.caller_relay_pubkey,
+      callerRelayUrl: job.caller_relay_url,
+      listingEventId: job.listing_event_id,
+      rateCurrency: job.rate_currency,
+      rateMicrounitsPerHour: job.rate_microunits_per_hour,
+      requestedAtMs: job.requested_at_ms,
+      terminalAtMs: job.terminal_at_ms,
+      durationMs: job.duration_ms,
+      estimatedMicrounits: job.estimated_microunits,
+      outcome:
+        job.outcome === "completed" || job.outcome === "failed"
+          ? job.outcome
+          : "pending",
+    })),
+    totals: {
+      jobCount: raw.totals.job_count,
+      byCaller: raw.totals.by_caller.map((row) => ({
+        callerRelayPubkey: row.caller_relay_pubkey,
+        currency: row.currency,
+        jobCount: row.job_count,
+        estimatedMicrounits: row.estimated_microunits,
+        totalDurationMs: row.total_duration_ms,
+      })),
+    },
+  };
+}
+
 export async function getRunApprovals(
   workflowId: string,
   runId: string,
@@ -342,10 +446,11 @@ export async function getRunApprovals(
 
 export async function triggerWorkflow(
   workflowId: string,
+  fields?: Record<string, string>,
 ): Promise<TriggerWorkflowResponse> {
   const raw = await invokeTauri<RawTriggerWorkflowResponse>(
     "trigger_workflow",
-    { workflowId },
+    { workflowId, fields: fields ?? null },
   );
   return fromRawTriggerResponse(raw);
 }

@@ -12,6 +12,7 @@ import {
 } from "@/features/agents/hooks";
 import { useCommunities } from "@/features/communities/useCommunities";
 import { AgentMarketplaceDialog } from "@/features/workflows/ui/AgentMarketplaceDialog";
+import { AgentJobsDialog } from "@/features/workflows/ui/AgentJobsDialog";
 import { WorkflowCard } from "@/features/workflows/ui/WorkflowCard";
 import { WorkflowDeleteDialog } from "@/features/workflows/ui/WorkflowDeleteDialog";
 import { WorkflowDetailPanel } from "@/features/workflows/ui/WorkflowDetailPanel";
@@ -19,8 +20,10 @@ import { WorkflowDialog } from "@/features/workflows/ui/WorkflowDialog";
 import { MarketplaceWorkflowCard } from "@/features/workflows/ui/MarketplaceWorkflowCard";
 import {
   formatMicrounits,
+  getInstalledRemoteAgent,
   getWorkflowMarketplace,
   installMarketplaceWorkflowSnapshot,
+  installedRemoteAgentDefinition,
 } from "@/features/workflows/marketplace";
 import {
   PRESENCE_REFETCH_INTERVAL_MS,
@@ -48,10 +51,21 @@ import type {
 } from "@/shared/api/types";
 import type { ManagedAgentMarketplace } from "@/shared/api/marketplace";
 import {
+  createWorkflow,
   deleteWorkflow,
   getChannelsWorkflows,
   triggerWorkflow,
 } from "@/shared/api/tauriWorkflows";
+import { stringify as yamlStringify } from "yaml";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/shared/ui/dialog";
+import { Textarea } from "@/shared/ui/textarea";
+import { ChannelCombobox } from "./ChannelCombobox";
 import { getPresence } from "@/shared/api/tauri";
 import { Button } from "@/shared/ui/button";
 import { Badge } from "@/shared/ui/badge";
@@ -78,7 +92,6 @@ type DialogState =
   | {
       mode: "create";
       initialDefinition?: Record<string, unknown>;
-      runAfterCreate?: boolean;
     }
   | { mode: "edit"; workflow: Workflow }
   | { mode: "duplicate"; workflow: Workflow };
@@ -144,27 +157,9 @@ function remotePolicyAllows(
   );
 }
 
-function remoteAgentWorkflowDefinition(
-  agent: MarketplaceAgent,
-): Record<string, unknown> | null {
-  const source = agent.sourceCommunity;
-  if (!source?.relayPubkey) return null;
-  return {
-    name: `Use ${agent.name}`,
-    description: `Invoke ${agent.name} in ${source.name}.`,
-    trigger: { on: "manual" },
-    steps: [
-      {
-        id: "invoke_agent",
-        action: "assign_to_agent",
-        agent: agent.name,
-        agent_pubkey: agent.pubkey,
-        agent_relay_pubkey: source.relayPubkey,
-        agent_relay_url: source.relayUrl,
-        instruction: "Describe what you want the agent to do.",
-      },
-    ],
-  };
+/** Coordinate key for matching a marketplace listing to an installed agent. */
+function agentCoordinateKey(relayPubkey: string, pubkey: string): string {
+  return `${relayPubkey.toLowerCase()}:${pubkey.toLowerCase()}`;
 }
 
 function WorkflowsListSkeleton() {
@@ -200,17 +195,27 @@ function AgentCatalogCard({
   agent,
   presenceStatus,
   localAgent,
-  canUseHere,
+  canInstall,
+  installedWorkflow,
   onEdit,
-  onUseHere,
+  onInstall,
+  onAsk,
+  onRemove,
+  onShowRuns,
+  onShowEarnings,
   onUnpublish,
 }: {
   agent: MarketplaceAgent;
   presenceStatus: PresenceStatus | null;
   localAgent?: ManagedAgent;
-  canUseHere: boolean;
+  canInstall: boolean;
+  installedWorkflow: Workflow | null;
   onEdit: (agent: ManagedAgent) => void;
-  onUseHere: (agent: MarketplaceAgent) => void;
+  onInstall: (agent: MarketplaceAgent) => void;
+  onAsk: (workflow: Workflow, agentName: string) => void;
+  onRemove: (workflow: Workflow) => void;
+  onShowRuns: (workflowId: string) => void;
+  onShowEarnings: (agentPubkey: string, agentName: string) => void;
   onUnpublish: (agent: ManagedAgent) => void;
 }) {
   return (
@@ -293,6 +298,13 @@ function AgentCatalogCard({
                 Edit listing
               </Button>
               <Button
+                onClick={() => onShowEarnings(agent.pubkey, agent.name)}
+                size="sm"
+                variant="outline"
+              >
+                Jobs &amp; earnings
+              </Button>
+              <Button
                 onClick={() => onUnpublish(localAgent)}
                 size="sm"
                 variant="ghost"
@@ -300,10 +312,34 @@ function AgentCatalogCard({
                 Unpublish
               </Button>
             </div>
-          ) : canUseHere ? (
+          ) : installedWorkflow ? (
+            <div className="mt-3 flex items-center gap-2">
+              <Button
+                onClick={() => onAsk(installedWorkflow, agent.name)}
+                size="sm"
+              >
+                Ask
+              </Button>
+              <Button
+                onClick={() => onShowRuns(installedWorkflow.id)}
+                size="sm"
+                variant="outline"
+              >
+                Runs
+              </Button>
+              <Button
+                onClick={() => onRemove(installedWorkflow)}
+                size="sm"
+                variant="ghost"
+              >
+                Remove from community
+              </Button>
+              <Badge variant="secondary">Added</Badge>
+            </div>
+          ) : canInstall ? (
             <div className="mt-3">
-              <Button onClick={() => onUseHere(agent)} size="sm">
-                Use here
+              <Button onClick={() => onInstall(agent)} size="sm">
+                Add to community
               </Button>
             </div>
           ) : null}
@@ -333,6 +369,20 @@ export function WorkflowsView({
   const isMarketplace = surface === "marketplace";
   const [listingAgent, setListingAgent] = React.useState<ManagedAgent | null>(
     null,
+  );
+  const [installTarget, setInstallTarget] =
+    React.useState<MarketplaceAgent | null>(null);
+  const [askTarget, setAskTarget] = React.useState<{
+    workflow: Workflow;
+    agentName: string;
+  } | null>(null);
+  const [earningsTarget, setEarningsTarget] = React.useState<{
+    pubkey: string;
+    name: string;
+  } | null>(null);
+  const showEarnings = React.useCallback(
+    (pubkey: string, name: string) => setEarningsTarget({ pubkey, name }),
+    [],
   );
   const queryClient = useQueryClient();
   const { activeCommunity, communities } = useCommunities();
@@ -501,21 +551,38 @@ export function WorkflowsView({
       }
       return results;
     },
-    enabled: !isMarketplace && memberChannels.length > 0,
+    // The marketplace surface needs the workflow list too — installed
+    // remote agents are represented by hidden workflows.
+    enabled: memberChannels.length > 0,
     ...workflowListFocusRefetchPolicy,
   });
 
   const allWorkflows = allWorkflowsQuery.data ?? [];
+  // Hidden installed-agent workflows surface as agent cards, not workflows.
+  const installedAgentWorkflows = React.useMemo(() => {
+    const byCoordinate = new Map<string, Workflow>();
+    for (const { workflow } of allWorkflows) {
+      const installed = getInstalledRemoteAgent(workflow.definition);
+      if (installed) {
+        byCoordinate.set(
+          agentCoordinateKey(installed.relayPubkey, installed.pubkey),
+          workflow,
+        );
+      }
+    }
+    return byCoordinate;
+  }, [allWorkflows]);
   const workflowSearchTerm = workflowSearch.trim().toLowerCase();
   const filteredVisibleWorkflows = allWorkflows.filter(
     ({ workflow, channelName }) =>
-      !workflowSearchTerm ||
-      [
-        workflow.name,
-        workflow.ownerPubkey,
-        channelName,
-        getWorkflowMarketplace(workflow.definition)?.summary ?? "",
-      ].some((value) => value.toLowerCase().includes(workflowSearchTerm)),
+      getInstalledRemoteAgent(workflow.definition) === null &&
+      (!workflowSearchTerm ||
+        [
+          workflow.name,
+          workflow.ownerPubkey,
+          channelName,
+          getWorkflowMarketplace(workflow.definition)?.summary ?? "",
+        ].some((value) => value.toLowerCase().includes(workflowSearchTerm))),
   );
   const marketplaceWorkflows = marketplaceWorkflowsQuery.data ?? [];
   const filteredMarketplaceWorkflows = marketplaceWorkflows.filter(
@@ -597,16 +664,12 @@ export function WorkflowsView({
     }
   }, []);
 
-  const useAgentHere = React.useCallback((agent: MarketplaceAgent) => {
-    const initialDefinition = remoteAgentWorkflowDefinition(agent);
-    if (initialDefinition) {
-      setDialogState({
-        mode: "create",
-        initialDefinition,
-        runAfterCreate: true,
-      });
-    }
-  }, []);
+  const askAgent = React.useCallback(
+    (workflow: Workflow, agentName: string) => {
+      setAskTarget({ workflow, agentName });
+    },
+    [],
+  );
 
   const useWorkflowHere = React.useCallback((workflow: MarketplaceWorkflow) => {
     const initialDefinition = installMarketplaceWorkflowSnapshot(workflow);
@@ -789,11 +852,21 @@ export function WorkflowsView({
                   {filteredMarketplaceAgents.map((agent) => (
                     <AgentCatalogCard
                       agent={agent}
-                      canUseHere={
+                      canInstall={
                         agent.sourceCommunity?.relayUrl !==
                           activeCommunity?.relayUrl &&
                         Boolean(agent.sourceCommunity?.relayPubkey) &&
                         remotePolicyAllows(agent, activeRelaySelf)
+                      }
+                      installedWorkflow={
+                        agent.sourceCommunity?.relayPubkey
+                          ? (installedAgentWorkflows.get(
+                              agentCoordinateKey(
+                                agent.sourceCommunity.relayPubkey,
+                                agent.pubkey,
+                              ),
+                            ) ?? null)
+                          : null
                       }
                       key={`${agent.sourceCommunity?.relayUrl}:${agent.ownerPubkey}:${agent.pubkey}`}
                       localAgent={
@@ -814,7 +887,11 @@ export function WorkflowsView({
                           : undefined
                       }
                       onEdit={setListingAgent}
-                      onUseHere={useAgentHere}
+                      onInstall={setInstallTarget}
+                      onAsk={askAgent}
+                      onRemove={handleDelete}
+                      onShowRuns={onSelectWorkflow}
+                      onShowEarnings={showEarnings}
                       onUnpublish={unpublishAgent}
                       presenceStatus={marketplacePresenceStatus(agent)}
                     />
@@ -957,9 +1034,6 @@ export function WorkflowsView({
         mode={dialogState.mode === "closed" ? "create" : dialogState.mode}
         onOpenChange={handleDialogOpenChange}
         open={dialogState.mode !== "closed"}
-        runAfterCreate={
-          dialogState.mode === "create" && dialogState.runAfterCreate === true
-        }
         workflow={
           dialogState.mode === "edit" || dialogState.mode === "duplicate"
             ? dialogState.workflow
@@ -984,6 +1058,178 @@ export function WorkflowsView({
         open={listingAgent !== null}
         pending={updateManagedAgent.isPending}
       />
+      <InstallAgentDialog
+        agent={installTarget}
+        channels={memberChannels}
+        onInstalled={() => {
+          setInstallTarget(null);
+          void queryClient.invalidateQueries({
+            predicate: (query) =>
+              query.queryKey[0] === "workflows" ||
+              query.queryKey[0] === "workflows-all",
+          });
+        }}
+        onOpenChange={(open) => {
+          if (!open) setInstallTarget(null);
+        }}
+      />
+      <AskAgentDialog
+        onAsked={() => {
+          setAskTarget(null);
+          void queryClient.invalidateQueries({
+            predicate: (query) => query.queryKey[0] === "workflow-runs",
+          });
+        }}
+        onOpenChange={(open) => {
+          if (!open) setAskTarget(null);
+        }}
+        target={askTarget}
+      />
+      <AgentJobsDialog
+        agentName={earningsTarget?.name ?? ""}
+        agentPubkey={earningsTarget?.pubkey ?? null}
+        onOpenChange={(open) => {
+          if (!open) setEarningsTarget(null);
+        }}
+      />
     </div>
+  );
+}
+
+function InstallAgentDialog({
+  agent,
+  channels,
+  onInstalled,
+  onOpenChange,
+}: {
+  agent: MarketplaceAgent | null;
+  channels: Channel[];
+  onInstalled: () => void;
+  onOpenChange: (open: boolean) => void;
+}) {
+  const [channelId, setChannelId] = React.useState("");
+  React.useEffect(() => {
+    if (agent) setChannelId(channels[0]?.id ?? "");
+  }, [agent, channels]);
+
+  const installMutation = useMutation({
+    mutationFn: async () => {
+      if (!agent) throw new Error("no agent selected");
+      const definition = installedRemoteAgentDefinition(agent);
+      if (!definition) throw new Error("listing is missing its home community");
+      return createWorkflow(channelId, yamlStringify(definition));
+    },
+    onSuccess: onInstalled,
+  });
+  const install = installMutation.mutate;
+
+  return (
+    <Dialog
+      onOpenChange={(open) => {
+        if (!open) installMutation.reset();
+        onOpenChange(open);
+      }}
+      open={agent !== null}
+    >
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>Add {agent?.name} to this community</DialogTitle>
+          <DialogDescription>
+            The agent keeps running in {agent?.sourceCommunity?.name}. Answers
+            to your requests are posted in the channel you pick.
+          </DialogDescription>
+        </DialogHeader>
+        <ChannelCombobox
+          channels={channels}
+          disabled={installMutation.isPending}
+          onChange={setChannelId}
+          value={channelId}
+        />
+        {installMutation.error instanceof Error ? (
+          <p className="text-sm text-destructive">
+            {installMutation.error.message}
+          </p>
+        ) : null}
+        <div className="flex justify-end gap-2">
+          <Button onClick={() => onOpenChange(false)} variant="outline">
+            Cancel
+          </Button>
+          <Button
+            disabled={!channelId || installMutation.isPending}
+            onClick={() => install()}
+          >
+            {installMutation.isPending ? "Adding..." : "Add to community"}
+          </Button>
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function AskAgentDialog({
+  onAsked,
+  onOpenChange,
+  target,
+}: {
+  onAsked: () => void;
+  onOpenChange: (open: boolean) => void;
+  target: { workflow: Workflow; agentName: string } | null;
+}) {
+  const [prompt, setPrompt] = React.useState("");
+  React.useEffect(() => {
+    if (target) setPrompt("");
+  }, [target]);
+
+  const askMutation = useMutation({
+    mutationFn: async () => {
+      if (!target) throw new Error("no agent selected");
+      return triggerWorkflow(target.workflow.id, { prompt: prompt.trim() });
+    },
+    onSuccess: onAsked,
+  });
+  const ask = askMutation.mutate;
+
+  return (
+    <Dialog
+      onOpenChange={(open) => {
+        if (!open) askMutation.reset();
+        onOpenChange(open);
+      }}
+      open={target !== null}
+    >
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>Ask {target?.agentName}</DialogTitle>
+          <DialogDescription>
+            Runs on the agent&apos;s home community; the answer is posted in
+            this community when it completes.
+          </DialogDescription>
+        </DialogHeader>
+        <Textarea
+          aria-label="Prompt"
+          disabled={askMutation.isPending}
+          onChange={(event) => setPrompt(event.target.value)}
+          placeholder="What do you want the agent to do?"
+          rows={4}
+          value={prompt}
+        />
+        {askMutation.error instanceof Error ? (
+          <p className="text-sm text-destructive">
+            {askMutation.error.message}
+          </p>
+        ) : null}
+        <div className="flex justify-end gap-2">
+          <Button onClick={() => onOpenChange(false)} variant="outline">
+            Cancel
+          </Button>
+          <Button
+            disabled={!prompt.trim() || askMutation.isPending}
+            onClick={() => ask()}
+          >
+            {askMutation.isPending ? "Sending..." : "Send"}
+          </Button>
+        </div>
+      </DialogContent>
+    </Dialog>
   );
 }

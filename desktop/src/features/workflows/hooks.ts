@@ -10,6 +10,7 @@ import {
   createWorkflow,
   deleteWorkflow,
   denyApproval,
+  getAgentJobs,
   getChannelWorkflows,
   getRunApprovals,
   getWorkflow,
@@ -253,5 +254,19 @@ export function useApprovalMutation() {
           query.queryKey[0] === "run-approvals",
       });
     },
+  });
+}
+
+/**
+ * Provider-side job ledger for one of your own listed agents — which caller
+ * communities invoked it, and the estimated cost. Owner-gated by the relay.
+ */
+export function useAgentJobsQuery(agentPubkey: string | null) {
+  return useQuery({
+    queryKey: ["agent-jobs", agentPubkey ?? ""],
+    queryFn: ({ queryKey: [, resolvedAgentPubkey] }) =>
+      getAgentJobs(resolvedAgentPubkey),
+    enabled: agentPubkey !== null,
+    staleTime: 15_000,
   });
 }

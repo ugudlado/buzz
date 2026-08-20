@@ -134,6 +134,11 @@ desktop-typecheck:
 desktop-build:
     cd {{desktop_dir}} && pnpm build
 
+# Build + stable-sign + relaunch "Buzz Dev.app" for local/computer-use testing
+# (pass --build-only to skip the launch). No keychain re-prompt across rebuilds.
+desktop-dev-app *ARGS:
+    ./scripts/build-buzz-dev-app.sh {{ARGS}}
+
 # Format desktop Tauri Rust code
 desktop-tauri-fmt:
     cargo fmt --manifest-path {{desktop_tauri_manifest}} --all

@@ -102,6 +102,71 @@ export function installMarketplaceWorkflowSnapshot(
   return definition;
 }
 
+export type InstalledRemoteAgent = {
+  name: string;
+  pubkey: string;
+  relayPubkey: string;
+  relayUrl: string;
+};
+
+/**
+ * Hidden single-assignment workflow representing a remote marketplace agent
+ * installed into this community ("Add to community"). Triggering it with a
+ * `prompt` field asks the agent; the second step posts the answer into the
+ * workflow's channel.
+ */
+export function installedRemoteAgentDefinition(
+  agent: MarketplaceAgent,
+): Record<string, unknown> | null {
+  const source = agent.sourceCommunity;
+  if (!source?.relayPubkey) return null;
+  return {
+    name: agent.name,
+    description: `Remote agent from ${source.name}.`,
+    installed_agent: true,
+    trigger: { on: "manual" },
+    steps: [
+      {
+        id: "ask",
+        action: "assign_to_agent",
+        agent: agent.name,
+        agent_pubkey: agent.pubkey,
+        agent_relay_pubkey: source.relayPubkey,
+        agent_relay_url: source.relayUrl,
+        instruction: "{{trigger.prompt}}",
+      },
+      {
+        id: "post",
+        action: "send_message",
+        text: "{{steps.ask.output.result}}",
+      },
+    ],
+  };
+}
+
+/** Coordinate of an installed remote agent, or null for ordinary workflows. */
+export function getInstalledRemoteAgent(
+  definition: Record<string, unknown>,
+): InstalledRemoteAgent | null {
+  if (definition.installed_agent !== true) return null;
+  const steps = Array.isArray(definition.steps) ? definition.steps : [];
+  const step = steps.map(asRecord).find((s) => s?.action === "assign_to_agent");
+  if (
+    !step ||
+    typeof step.agent_pubkey !== "string" ||
+    typeof step.agent_relay_pubkey !== "string" ||
+    typeof step.agent_relay_url !== "string"
+  ) {
+    return null;
+  }
+  return {
+    name: typeof step.agent === "string" ? step.agent : "Agent",
+    pubkey: step.agent_pubkey.toLowerCase(),
+    relayPubkey: step.agent_relay_pubkey.toLowerCase(),
+    relayUrl: step.agent_relay_url,
+  };
+}
+
 export function getWorkflowAgentDependencies(
   definition: Record<string, unknown>,
   agents: readonly MarketplaceAgent[],

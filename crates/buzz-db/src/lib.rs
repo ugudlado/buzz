@@ -37,6 +37,8 @@ pub mod moderation;
 pub mod partition;
 /// Buzz product-feedback sidecar persistence.
 pub mod product_feedback;
+/// Provider-side cross-community job ledger (BUZZ-10).
+pub mod provider_jobs;
 /// Community-scoped push lease and durable wake-outbox persistence.
 pub mod push;
 /// Reaction persistence.
@@ -4319,6 +4321,44 @@ impl Db {
         params: workflow::CompleteAgentStepParams<'_>,
     ) -> Result<bool> {
         workflow::complete_agent_step_by_prompt_event_id(&self.pool, params).await
+    }
+
+    /// Record a provider-side job at accept time (home community's ledger).
+    pub async fn record_provider_job_accepted(
+        &self,
+        params: provider_jobs::RecordJobAcceptedParams<'_>,
+    ) -> Result<()> {
+        provider_jobs::record_job_accepted(&self.pool, params).await
+    }
+
+    /// Stamp a provider-side job terminal (duration derived in SQL).
+    pub async fn record_provider_job_terminal(
+        &self,
+        community_id: CommunityId,
+        request_event_id: &str,
+        outcome: &str,
+        completion_event_id: &str,
+        terminal_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        provider_jobs::record_job_terminal(
+            &self.pool,
+            community_id,
+            request_event_id,
+            outcome,
+            completion_event_id,
+            terminal_at,
+        )
+        .await
+    }
+
+    /// List provider-side jobs for one of our agents (home community's ledger).
+    pub async fn list_provider_jobs_for_agent(
+        &self,
+        community_id: CommunityId,
+        agent_pubkey: &[u8],
+        limit: i64,
+    ) -> Result<Vec<provider_jobs::ProviderJobRecord>> {
+        provider_jobs::list_jobs_for_agent(&self.pool, community_id, agent_pubkey, limit).await
     }
 
     /// Sweep overdue `workflow_agent_steps` rows to `status = 'expired'`.

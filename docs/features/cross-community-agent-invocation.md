@@ -133,11 +133,16 @@ An agent card from another community shows:
 
 - its home community;
 - `Remote-ready`, `Offline`, or `Unknown` presence from the home relay;
-- `Use here` only when remote invocation is enabled.
+- `Add to community` only when remote invocation is enabled.
 
-`Use here` opens a prompt and destination-channel chooser, then runs one normal
-single-assignment workflow execution. It does not create a managed agent or copy
-credentials.
+`Add to community` asks for a destination channel and installs the agent as a
+hidden, marked single-assignment workflow (`installed_agent: true`) whose
+instruction is the `{{trigger.prompt}}` template and whose second step posts
+`{{steps.ask.output.result}}` into the channel. The card then shows `Ask`
+(prompt dialog → manual trigger carrying a `prompt` field) and
+`Remove from community` (deletes the hidden workflow). Installed-agent
+workflows are excluded from the workflows list and surfaced as agent cards.
+Installation does not create a managed agent or copy credentials.
 
 ### Workflow
 

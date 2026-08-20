@@ -594,22 +594,54 @@ async fn dispatch_persistent_event_inner(
     if matches!(
         kind_u32,
         buzz_core::kind::KIND_JOB_RESULT | buzz_core::kind::KIND_JOB_ERROR
-    ) && buzz_core::agent_job::validate_response_envelope(&stored_event.event)
-        .is_ok_and(|envelope| envelope.relay_pubkey == state.relay_keypair.public_key())
-    {
-        let state = Arc::clone(state);
-        let tenant = tenant.clone();
-        let event = stored_event.event.clone();
-        let received_at = stored_event.received_at;
-        tokio::spawn(async move {
-            crate::handlers::command_executor::try_resume_remote_agent_step(
-                &tenant,
-                &state,
-                &event,
-                received_at,
-            )
-            .await;
-        });
+    ) {
+        if let Ok(envelope) = buzz_core::agent_job::validate_response_envelope(&stored_event.event)
+        {
+            if envelope.relay_pubkey == state.relay_keypair.public_key() {
+                // Caller side: a terminal for a run we own — resume it.
+                let state = Arc::clone(state);
+                let tenant = tenant.clone();
+                let event = stored_event.event.clone();
+                let received_at = stored_event.received_at;
+                tokio::spawn(async move {
+                    crate::handlers::command_executor::try_resume_remote_agent_step(
+                        &tenant,
+                        &state,
+                        &event,
+                        received_at,
+                    )
+                    .await;
+                });
+            } else {
+                // Provider side: one of our own agents posted its result back to
+                // a foreign caller relay — stamp the provider ledger terminal.
+                let outcome = if kind_u32 == buzz_core::kind::KIND_JOB_RESULT {
+                    "completed"
+                } else {
+                    "failed"
+                };
+                let state = Arc::clone(state);
+                let community = tenant.community();
+                let request_event_id = envelope.request_event_id.to_hex();
+                let completion_event_id = stored_event.event.id.to_hex();
+                let received_at = stored_event.received_at;
+                tokio::spawn(async move {
+                    if let Err(error) = state
+                        .db
+                        .record_provider_job_terminal(
+                            community,
+                            &request_event_id,
+                            outcome,
+                            &completion_event_id,
+                            received_at,
+                        )
+                        .await
+                    {
+                        tracing::warn!(%error, %request_event_id, "provider job-ledger terminal write failed");
+                    }
+                });
+            }
+        }
     }
 
     matches.len()

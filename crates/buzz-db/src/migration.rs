@@ -630,7 +630,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
-            (1..=34).collect::<Vec<_>>()
+            (1..=35).collect::<Vec<_>>()
         );
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");

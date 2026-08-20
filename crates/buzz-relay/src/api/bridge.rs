@@ -819,10 +819,27 @@ async fn submit_event_authed(
         buzz_core::kind::KIND_JOB_RESULT | buzz_core::kind::KIND_JOB_ERROR
     ) && event.pubkey == pubkey
     {
-        match crate::remote_jobs::validate_incoming_terminal(state, tenant.community(), &event)
-            .await
-        {
-            Ok(_) => true,
+        // Two distinct terminal cases, keyed on the `p` (recipient relay) tag:
+        //
+        //  - p == this relay: a cross-community result arriving for a run we
+        //    own as the *caller*. Correlate it against the pending assignment
+        //    before admitting the non-member author.
+        //  - p == a different relay: one of our *own* listed agents posting its
+        //    result back to the foreign caller that dispatched to it. Admit it
+        //    when the author is a remote-invocable local agent — otherwise a
+        //    stray non-member could inject a terminal addressed to a third
+        //    party. (Correlation is the caller's job, not the origin's.)
+        let targets_self = buzz_core::agent_job::validate_response_envelope(&event)
+            .is_ok_and(|envelope| envelope.relay_pubkey == state.relay_keypair.public_key());
+        let result = if targets_self {
+            crate::remote_jobs::validate_incoming_terminal(state, tenant.community(), &event)
+                .await
+                .map(|_| ())
+        } else {
+            crate::remote_jobs::validate_outgoing_terminal(state, tenant.community(), &event).await
+        };
+        match result {
+            Ok(()) => true,
             Err(reason) => {
                 return SubmitOutcome::Err {
                     status: StatusCode::FORBIDDEN,

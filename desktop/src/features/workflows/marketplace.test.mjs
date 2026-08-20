@@ -3,9 +3,11 @@ import test from "node:test";
 
 import {
   formatReportedTokens,
+  getInstalledRemoteAgent,
   getWorkflowAgentDependencies,
   getWorkflowMarketplace,
   installMarketplaceWorkflowSnapshot,
+  installedRemoteAgentDefinition,
   resolveAssignmentTelemetryCorrelation,
   summarizeContributorEstimates,
 } from "./marketplace.ts";
@@ -250,4 +252,62 @@ test("reported token counts render as a grouped in/out pair", () => {
   assert.equal(formatReportedTokens(null, 2_000), "2,000 out");
   assert.equal(formatReportedTokens(null, null), null);
   assert.equal(formatReportedTokens(0, 0), "0 in / 0 out");
+});
+
+test("installed remote agent definition round-trips through the detector", () => {
+  const definition = installedRemoteAgentDefinition({
+    pubkey: A,
+    name: "Bumble",
+    sourceCommunity: {
+      id: "c1",
+      name: "Relay A",
+      relayUrl: "wss://relay-a.example",
+      relayPubkey: B,
+    },
+  });
+  assert.equal(definition.installed_agent, true);
+  assert.deepEqual(getInstalledRemoteAgent(definition), {
+    name: "Bumble",
+    pubkey: A,
+    relayPubkey: B,
+    relayUrl: "wss://relay-a.example",
+  });
+});
+
+test("installed remote agent definition requires a home relay pubkey", () => {
+  assert.equal(
+    installedRemoteAgentDefinition({
+      pubkey: A,
+      name: "Bumble",
+      sourceCommunity: {
+        id: "c1",
+        name: "Relay A",
+        relayUrl: "wss://relay-a.example",
+      },
+    }),
+    null,
+  );
+});
+
+test("ordinary workflows are not detected as installed agents", () => {
+  assert.equal(
+    getInstalledRemoteAgent({
+      name: "Plain",
+      trigger: { on: "manual" },
+      steps: [
+        {
+          id: "ask",
+          action: "assign_to_agent",
+          agent: "Local",
+          agent_pubkey: A,
+          instruction: "hi",
+        },
+      ],
+    }),
+    null,
+  );
+  assert.equal(
+    getInstalledRemoteAgent({ installed_agent: true, steps: [] }),
+    null,
+  );
 });

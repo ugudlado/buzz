@@ -366,10 +366,10 @@ impl RestClient {
                     )));
                 }
                 Ok(resp) => {
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
                     return Err(RelayError::Http(format!(
-                        "{method} {} returned HTTP {}",
-                        path,
-                        resp.status()
+                        "{method} {path} returned HTTP {status}: {body}"
                     )));
                 }
                 Err(e) if e.is_timeout() || e.is_connect() => {

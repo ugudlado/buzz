@@ -241,24 +241,47 @@ async fn poll_once(
             );
             continue;
         }
-        verify_listing(rest, &envelope.relay_pubkey, &payload).await?;
-        let _ = safe_remote_rest(&envelope.relay_url, &envelope.relay_pubkey, &rest.keys).await?;
-        let accepted_event = build_accepted_event(
+        // Per-request error isolation: one request with a stale listing, an
+        // unreachable caller relay, or a transient failure must not abort the
+        // whole poll pass and starve every other pending request. Only a
+        // closed queue (the harness is shutting down) ends the pass.
+        if let Err(error) = verify_listing(rest, &envelope.relay_pubkey, &payload).await {
+            tracing::warn!(event_id = %request.id, %error, "skipping remote job: listing check failed");
+            continue;
+        }
+        if let Err(error) =
+            safe_remote_rest(&envelope.relay_url, &envelope.relay_pubkey, &rest.keys).await
+        {
+            tracing::warn!(event_id = %request.id, %error, "skipping remote job: caller relay unreachable");
+            continue;
+        }
+        let accepted_event = match build_accepted_event(
             &rest.keys,
             &envelope.relay_pubkey,
             &request.id,
             &envelope.request_id,
-        )
-        .map_err(|error| error.to_string())?;
-        rest.submit_event(&accepted_event)
-            .await
-            .map_err(|error| error.to_string())?;
+        ) {
+            Ok(event) => event,
+            Err(error) => {
+                tracing::warn!(event_id = %request.id, %error, "skipping remote job: cannot build acceptance");
+                continue;
+            }
+        };
+        if let Err(error) = rest.submit_event(&accepted_event).await {
+            tracing::warn!(event_id = %request.id, %error, "skipping remote job: acceptance submit failed");
+            continue;
+        }
         accepted.insert(request_hex);
-        tx.send(RemoteJobUpdate::Execute(Box::new(synthetic_job(
-            &rest.keys, &request, &envelope, &payload,
-        )?)))
-        .await
-        .map_err(|_| "remote job queue is closed".to_string())?;
+        let job = match synthetic_job(&rest.keys, &request, &envelope, &payload) {
+            Ok(job) => job,
+            Err(error) => {
+                tracing::warn!(event_id = %request.id, %error, "accepted remote job but could not build queue entry");
+                continue;
+            }
+        };
+        tx.send(RemoteJobUpdate::Execute(Box::new(job)))
+            .await
+            .map_err(|_| "remote job queue is closed".to_string())?;
     }
     Ok(())
 }
@@ -388,9 +411,13 @@ async fn post_terminal(
         &payload,
     )
     .map_err(|error| error.to_string())?;
-    rest.submit_event(&terminal)
-        .await
-        .map_err(|error| error.to_string())?;
+    // Delivery to the caller relay is the essential step and runs first: the
+    // terminal is p-addressed to the caller, and it is the caller that resumes
+    // the workflow. Persisting a home copy (the agent's own receipt + the
+    // `delivered` idempotence marker) is best-effort — the home relay may
+    // refuse to store an event addressed to a foreign caller relay, and that
+    // must not strand the caller's result. `deliver_to` handles both the
+    // remote submit and the home `delivered` marker.
     deliver_to(
         rest,
         &context.relay_url,
@@ -399,7 +426,13 @@ async fn post_terminal(
         &context.request_id,
         &terminal,
     )
-    .await
+    .await?;
+    // Best-effort home receipt; a rejection here is already covered by the
+    // `delivered` marker written inside `deliver_to`.
+    if let Err(error) = rest.submit_event(&terminal).await {
+        tracing::debug!(%error, "home receipt persist skipped (non-fatal)");
+    }
+    Ok(())
 }
 
 fn fit_result_payload(mut payload: JobResultPayload) -> Result<JobResultPayload, String> {
@@ -465,6 +498,10 @@ async fn deliver_to(
         .submit_event(terminal)
         .await
         .map_err(|error| error.to_string())?;
+    // Home `delivered` marker suppresses re-delivery on the next poll. It is
+    // p-addressed to the caller relay, so the home relay may refuse it — that
+    // is non-fatal: the caller already has the terminal, and at worst a
+    // duplicate delivery is idempotent on the caller side.
     let delivered = build_progress_event(
         &rest.keys,
         relay_pubkey,
@@ -473,9 +510,9 @@ async fn deliver_to(
         "delivered",
     )
     .map_err(|error| error.to_string())?;
-    rest.submit_event(&delivered)
-        .await
-        .map_err(|error| error.to_string())?;
+    if let Err(error) = rest.submit_event(&delivered).await {
+        tracing::debug!(%error, "home delivered-marker persist skipped (non-fatal)");
+    }
     Ok(())
 }
 

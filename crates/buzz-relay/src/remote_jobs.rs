@@ -138,6 +138,40 @@ pub async fn validate_incoming_request(
     if incoming_request_rate_limited(state, community_id, &envelope) {
         return Err("rate-limited: too many remote requests for this agent".into());
     }
+    // Provider-side ledger: record that a caller community dispatched to one of
+    // our listed agents, snapshotting our own rate. Best-effort — a ledger
+    // write failure must not reject an otherwise-valid job.
+    let (rate_currency, rate_microunits) = listing
+        .marketplace
+        .pricing
+        .as_ref()
+        .map(|rate| {
+            (
+                Some(rate.currency.clone()),
+                Some(rate.microunits_per_hour as i64),
+            )
+        })
+        .unwrap_or((None, None));
+    if let Err(error) = state
+        .db
+        .record_provider_job_accepted(buzz_db::provider_jobs::RecordJobAcceptedParams {
+            community_id,
+            request_event_id: &event.id.to_hex(),
+            request_id: &envelope.request_id,
+            agent_pubkey: &envelope.agent_pubkey.to_bytes(),
+            agent_owner_pubkey: Some(&listing.owner_pubkey),
+            caller_relay_pubkey: &envelope.relay_pubkey.to_bytes(),
+            caller_relay_url: &envelope.relay_url,
+            listing_event_id: &listing.event_id,
+            rate_currency: rate_currency.as_deref(),
+            rate_microunits_per_hour: rate_microunits,
+            requested_at: chrono::DateTime::from_timestamp(event.created_at.as_secs() as i64, 0)
+                .unwrap_or_else(chrono::Utc::now),
+        })
+        .await
+    {
+        tracing::warn!(%error, request_id = %envelope.request_id, "provider job-ledger accept write failed");
+    }
     Ok(envelope)
 }
 
@@ -192,6 +226,38 @@ pub async fn validate_incoming_terminal(
     let (_, payload) =
         decrypt_terminal_event(event, &state.relay_keypair).map_err(|error| error.to_string())?;
     Ok(ValidatedTerminalJob { step, payload })
+}
+
+/// Authorize a terminal that one of THIS relay's own agents is posting back to
+/// a foreign caller relay (the `p` recipient is not us).
+///
+/// This is the origin-relay side of result delivery: when a local agent
+/// finishes a cross-community job, it persists a home receipt whose `p` tag is
+/// the caller relay. That event must be admitted even though its recipient is
+/// not a member here — but only when the author is genuinely one of our listed,
+/// remote-invocable agents, so a stray non-member cannot inject a terminal
+/// addressed to some third-party relay. Structural envelope validity is checked
+/// too; correlation against a pending assignment is the *caller's* job, not the
+/// origin's.
+pub async fn validate_outgoing_terminal(
+    state: &AppState,
+    community_id: CommunityId,
+    event: &Event,
+) -> Result<(), String> {
+    buzz_core::verify_event(event).map_err(|error| format!("invalid event: {error}"))?;
+    let kind = buzz_core::kind::event_kind_u32(event);
+    if !matches!(kind, KIND_JOB_RESULT | KIND_JOB_ERROR) {
+        return Err("event is not a terminal agent-job response".into());
+    }
+    validate_response_envelope(event).map_err(|error| error.to_string())?;
+    // The author must be one of our own listed, remote-invocable agents.
+    let listing = local_listing(state, community_id, &event.pubkey).await?;
+    listing
+        .marketplace
+        .remote_invocation
+        .as_ref()
+        .ok_or_else(|| "author agent is not remote-invocable in this community".to_string())?;
+    Ok(())
 }
 
 /// Fetch and verify an agent listing from its home relay.

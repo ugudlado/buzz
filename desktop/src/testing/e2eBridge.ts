@@ -53,6 +53,7 @@ import {
   KIND_SYSTEM_MESSAGE,
   KIND_TEXT_NOTE,
   KIND_USER_STATUS,
+  KIND_WORKFLOW_DEF,
 } from "@/shared/constants/kinds";
 import type {
   RawAcpAuthMethodsResult,
@@ -9922,6 +9923,27 @@ function sendToMockSocket(args: {
       for (const event of mockReminderEvents) {
         if (authors && !authors.includes(event.pubkey.toLowerCase())) continue;
         sendWsText(socket.handler, ["EVENT", subId, event]);
+      }
+      sendWsText(socket.handler, ["EOSE", subId]);
+      return;
+    }
+
+    // Published workflow definitions (kind:30620): the real backend publishes
+    // one per workflow whose definition opts into the marketplace. Serve every
+    // mock workflow as JSON (valid YAML) — the parser drops unlisted ones.
+    if (filter.kinds?.includes(KIND_WORKFLOW_DEF)) {
+      for (const workflow of mockWorkflows) {
+        sendWsText(socket.handler, [
+          "EVENT",
+          subId,
+          createMockEvent(
+            KIND_WORKFLOW_DEF,
+            JSON.stringify(workflow.definition),
+            [["d", workflow.id]],
+            workflow.owner_pubkey,
+            workflow.created_at,
+          ),
+        ]);
       }
       sendWsText(socket.handler, ["EOSE", subId]);
       return;
